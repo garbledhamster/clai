@@ -261,6 +261,9 @@ pub struct WorkspaceDetails {
     pub schedule_kind: Option<crate::config::workspace_config::ScheduleKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_in_seconds: Option<u64>,
+    // A due enhanced check waiting for this workspace to become available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_waiting_reason: Option<String>,
 }
 
 /// The one expensive extra the details payload can carry: `includeFiles`
@@ -1377,7 +1380,7 @@ async fn workspace_details(
         .and_then(|root| workspace_config::load(&root).ok())
         .map(|config| config.schedule.surface())
         .unwrap_or_default();
-    let (next_run_in_seconds, schedule_blocked_reason) = {
+    let (next_run_in_seconds, schedule_blocked_reason, schedule_waiting_reason) = {
         let scheduler = state.scheduler.lock().await;
         let reason = scheduler
             .pending_cancellation_reason(&descriptor.workspace_id)
@@ -1390,7 +1393,11 @@ async fn workspace_details(
             }
             _ => None,
         };
-        (next, reason)
+        let waiting = default_workspace_agent_id
+            .as_deref()
+            .and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
+            .map(str::to_owned);
+        (next, reason, waiting)
     };
 
     Ok(WorkspaceDetails {
@@ -1417,6 +1424,7 @@ async fn workspace_details(
         schedule_enabled: schedule.enabled,
         schedule_paused: schedule.paused,
         schedule_blocked_reason,
+        schedule_waiting_reason,
         schedule_kind: schedule.kind,
         next_run_in_seconds,
     })
@@ -2740,6 +2748,9 @@ pub struct WorkspaceListEntry {
     /// section. Derived from `WorkspaceConfig::starred_at > 0`.
     pub starred: bool,
     pub updated_at: i64,
+    // A due enhanced check waiting for this workspace to become available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_waiting_reason: Option<String>,
 }
 
 /// Create a new general workspace with a UUID and filesystem root.
@@ -2963,8 +2974,9 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
     // for workspaces, that's the manager workspace_agent's row id
     // (init.rs:populate_scheduler_from_workspace_agents registers with
     // workspace_agents.id as both the definition id and instance agent_id).
-    let (scheduler_seconds, pending_cancellations, wake_monitor_available): (
+    let (scheduler_seconds, scheduler_waiting, pending_cancellations, wake_monitor_available): (
         HashMap<String, u64>,
+        HashMap<String, String>,
         _,
         _,
     ) = {
@@ -2976,6 +2988,14 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
                     scheduler
                         .seconds_until_next_run(&instance.instance_id)
                         .map(|seconds| (instance.agent_id.clone(), seconds))
+                })
+                .collect(),
+            scheduler
+                .all_instances()
+                .filter_map(|instance| {
+                    scheduler
+                        .waiting_reason(&instance.instance_id)
+                        .map(|reason| (instance.agent_id.clone(), reason.to_string()))
                 })
                 .collect(),
             scheduler.pending_cancellations(),
@@ -3018,6 +3038,7 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
             schedule_enabled: schedule.enabled,
             schedule_paused: schedule.paused,
             schedule_blocked_reason,
+            schedule_waiting_reason: scheduler_waiting.get(&locator.default_agent_id).cloned(),
             schedule_kind: schedule.kind,
             next_run_in_seconds,
             unread: locator.last_run_completed_at > 0
@@ -5344,6 +5365,61 @@ mod tests {
                 assert_eq!(details.next_run_in_seconds.is_some(), enabled && available);
                 assert_eq!(entry.next_run_in_seconds.is_some(), enabled && available);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_status_reports_one_waiting_check_and_clears_it_after_pause_or_disable() {
+        use crate::config::workspace_config::ScheduleKind;
+        let workspace = DetailsWorkspace::new().await;
+        crate::agents::init::update_schedule_and_reconcile(
+            &workspace.state,
+            DETAILS_WORKSPACE_ID,
+            true,
+            |config| {
+                config.schedule.enabled = true;
+                config.schedule.kind = ScheduleKind::EnhancedInterval {
+                    interval_seconds: 15,
+                };
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let mut scheduler = workspace.state.scheduler.lock().await;
+            scheduler.set_wake_monitor_available(true, 0, std::time::Instant::now());
+            scheduler.wait_for_session(DETAILS_MANAGER_ID);
+        }
+        let details = workspace.details(WITHOUT_FILES).await;
+        assert!(!details.schedule_paused);
+        assert!(details.schedule_blocked_reason.is_none());
+        assert_eq!(
+            details.schedule_waiting_reason.as_deref(),
+            Some("Waiting for the workspace to become available.")
+        );
+        let entries = workspace_list_entries(&workspace.state).await.unwrap();
+        assert_eq!(
+            entries[0].schedule_waiting_reason,
+            details.schedule_waiting_reason
+        );
+        for enabled in [true, false] {
+            crate::agents::init::update_schedule_and_reconcile(
+                &workspace.state,
+                DETAILS_WORKSPACE_ID,
+                true,
+                |config| {
+                    config.schedule.enabled = enabled;
+                    config.schedule.paused = enabled;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            let details = workspace.details(WITHOUT_FILES).await;
+            assert!(details.schedule_waiting_reason.is_none());
+            assert_eq!(details.schedule_enabled, enabled);
+            assert_eq!(details.schedule_paused, enabled);
         }
     }
 

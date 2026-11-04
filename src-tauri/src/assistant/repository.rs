@@ -783,6 +783,33 @@ pub async fn create_run_if_idle(
     insert_run_if_idle(&mut conn, params).await
 }
 
+/// Scheduled admission shares SQLite's writer ordering with queued user input.
+/// Insert first to acquire the write lock, then decline the entire transaction
+/// if a manual request is already pending. No scheduled row leaks on decline.
+pub async fn create_scheduled_run_if_idle(
+    pool: &DbPool,
+    params: CreateRunParams,
+) -> Result<Option<AssistantRun>, String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let session_id = params.session_id.clone();
+    let run = insert_run_if_idle(&mut tx, params).await?;
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM session_signals WHERE target_session_id = ? AND kind = 'user_message' AND status = 'pending')"
+    ).bind(&session_id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+    if pending {
+        tx.rollback().await.map_err(|e| e.to_string())?;
+        return Ok(None);
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(run)
+}
+
+pub async fn has_pending_user_message(pool: &DbPool, session_id: &str) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM session_signals WHERE target_session_id = ? AND kind = 'user_message' AND status = 'pending')"
+    ).bind(session_id).fetch_one(pool).await.map_err(|e| e.to_string())
+}
+
 pub async fn create_run(pool: &DbPool, params: CreateRunParams) -> Result<AssistantRun, String> {
     let session_id = params.session_id.clone();
     create_run_if_idle(pool, params)

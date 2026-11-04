@@ -129,6 +129,15 @@ async fn dispatch(
         .await?
         .ok_or_else(|| format!("Assistant session not found: {}", session_id))?;
     let app_state = deps.app.state::<AppState>();
+    // Queued manual input revokes an uncommitted scheduled claim. Committed
+    // model work finishes normally; its end dispatches the pending request.
+    if repository::has_pending_user_message(&deps.pool, session_id).await? {
+        app_state
+            .scheduler
+            .lock()
+            .await
+            .yield_to_manual(&deps.workspace_id);
+    }
     let outcome = claim_with_cleanup_gate(
         &app_state.scheduler,
         &deps.workspace_id,

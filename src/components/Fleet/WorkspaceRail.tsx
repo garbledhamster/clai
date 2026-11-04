@@ -405,11 +405,11 @@ const WorkspaceRail = ({
               {(ws.scheduleEnabled || ws.scheduleBlockedReason) && (
                 <span
                   className={`${styles.rowMeta} ${isPaused || ws.scheduleBlockedReason ? styles.rowMetaPaused : ''}`}
-                  title={ws.scheduleBlockedReason || undefined}
+                  title={ws.scheduleBlockedReason || ws.scheduleWaitingReason || undefined}
                 >
                   {ws.scheduleBlockedReason || (isPaused
                     ? `Paused${scheduleLabel ? ` · ${scheduleLabel}` : ''}`
-                    : scheduleLabel || 'Scheduled')}
+                    : ws.scheduleWaitingReason ? `Waiting${scheduleLabel ? ` · ${scheduleLabel}` : ''}` : scheduleLabel || 'Scheduled')}
                 </span>
               )}
             </span>

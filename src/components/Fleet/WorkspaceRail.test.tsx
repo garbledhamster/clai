@@ -23,6 +23,7 @@ const entry = (
   scheduleEnabled: false,
   schedulePaused: false,
   scheduleBlockedReason: null,
+  scheduleWaitingReason: null,
   scheduleKind: null,
   nextRunInSeconds: null,
   unread: false,
@@ -72,6 +73,14 @@ describe('WorkspaceRail sections', () => {
     renderRail([entry('a', 'Alpha', { scheduleEnabled: enabled,
       scheduleBlockedReason: 'Cancellation failed; messages may wait while cleanup retries.' })]);
     expect(screen.getByText('Cancellation failed; messages may wait while cleanup retries.')).toHaveAttribute('title', 'Cancellation failed; messages may wait while cleanup retries.');
+  });
+
+  it('shows a due check waiting without marking its enabled schedule paused', () => {
+    renderRail([entry('a', 'Alpha', { scheduleEnabled: true,
+      scheduleKind: { type: 'enhancedInterval', intervalSeconds: 15 },
+      scheduleWaitingReason: 'Waiting for the workspace to become available.' })]);
+    expect(screen.getByText('Waiting · every 15s')).toHaveAttribute('title', 'Waiting for the workspace to become available.');
+    expect(screen.queryByText(/^Paused/)).not.toBeInTheDocument();
   });
 
   it('does not display schedule unavailability for an ordinary disabled schedule', () => {

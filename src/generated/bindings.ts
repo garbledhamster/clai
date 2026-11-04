@@ -681,7 +681,7 @@ queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boole
  * "every Nm" / "Cron: …" label and to populate the workspace
  * settings modal.
  */
-scheduleKind: ScheduleKind | null, nextRunInSeconds: bigint | null, };
+scheduleKind: ScheduleKind | null, nextRunInSeconds: bigint | null, scheduleWaitingReason: string | null, };
 
 /**
  * The one expensive extra the details payload can carry: `includeFiles`
@@ -749,7 +749,7 @@ unread: boolean,
  * User starred this workspace — the rail pins it in the "Starred"
  * section. Derived from `WorkspaceConfig::starred_at > 0`.
  */
-starred: boolean, updatedAt: bigint, };
+starred: boolean, updatedAt: bigint, scheduleWaitingReason: string | null, };
 
 export type WorkspaceSessionBinding = { session: AssistantSession, providerConnectionId: string | null, };
 

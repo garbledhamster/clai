@@ -249,6 +249,7 @@ export const SchedulePage = ({
 
   const paused = !!details?.schedulePaused;
   const blockedReason = details?.scheduleBlockedReason;
+  const waitingReason = details?.scheduleWaitingReason;
   const savedOn = !!details?.scheduleEnabled;
 
   useReportDirty(
@@ -470,7 +471,7 @@ export const SchedulePage = ({
                       className={`${styles.dot} ${paused || blockedReason ? styles.dotPaused : styles.dotRunning}`}
                       aria-hidden="true"
                     />
-                    {paused || blockedReason ? 'Paused' : 'Running'}
+                    {paused || blockedReason ? 'Paused' : waitingReason ? 'Waiting' : 'Running'}
                   </span>
                   <span className={styles.statusActions}>
                     {!paused && (
@@ -501,7 +502,7 @@ export const SchedulePage = ({
                   Not scheduled. The main agent runs when you message it.
                 </p>
               ) : null}
-              {blockedReason && <p className={form.lede}>{blockedReason}</p>}
+              {(blockedReason || (!paused && waitingReason)) && <p className={form.lede}>{blockedReason || waitingReason}</p>}
             </div>
           </section>
 

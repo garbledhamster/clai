@@ -1,7 +1,7 @@
 //! Agent scheduler.
 //!
 //! A simple scheduler that manages agent instances and determines
-//! when they should run. Only one agent runs at a time.
+//! when they should run. Enhanced workspaces progress independently.
 //!
 //! # Architecture
 //!
@@ -64,6 +64,7 @@ pub struct DispatchLease {
     generation: u64,
     cron_clock_generation: Option<u64>,
     committed: Arc<AtomicBool>,
+    claim_valid: Arc<AtomicBool>,
 }
 
 impl DispatchLease {
@@ -75,7 +76,8 @@ impl DispatchLease {
         if self.committed.load(Ordering::Relaxed) {
             return true;
         }
-        if state.sleeping
+        if !self.claim_valid.load(Ordering::Relaxed)
+            || state.sleeping
             || state.generation != self.generation
             || self
                 .cron_clock_generation
@@ -87,10 +89,24 @@ impl DispatchLease {
         true
     }
 
-    /// Whether sleep has invalidated this scheduled claim.
-    pub fn is_current(&self) -> bool {
+    /// Whether this claim still belongs to the current wake/cron-clock timing.
+    /// Manual revocation does not itself discard a due check; a wake or clock
+    /// change must rearm it even when manual input is also waiting.
+    pub fn timing_is_current(&self) -> bool {
         self.signal.0.lock().is_ok_and(|state| {
             !state.sleeping
+                && state.generation == self.generation
+                && self
+                    .cron_clock_generation
+                    .is_none_or(|generation| state.clock_generation == generation)
+        })
+    }
+
+    /// Whether wake, schedule changes or manual priority invalidated the claim.
+    pub fn is_current(&self) -> bool {
+        self.signal.0.lock().is_ok_and(|state| {
+            self.claim_valid.load(Ordering::Relaxed)
+                && !state.sleeping
                 && state.generation == self.generation
                 && self
                     .cron_clock_generation
@@ -111,6 +127,7 @@ impl WakeSignal {
             generation: state.generation,
             cron_clock_generation: None,
             committed: Arc::new(AtomicBool::new(false)),
+            claim_valid: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -150,7 +167,7 @@ pub struct PendingCancellation {
 /// The agent scheduler.
 ///
 /// Manages agent definitions and instances. Finds the next agent
-/// that is ready to run. Only one agent can run at a time.
+/// that is ready to run, with one claim per workspace.
 pub struct Scheduler {
     /// Current scheduler state.
     state: SchedulerState,
@@ -161,14 +178,15 @@ pub struct Scheduler {
     /// Agent instances (per space/room).
     instances: HashMap<String, AgentInstance>,
 
-    /// Currently running instance ID (only one at a time).
-    running: Option<String>,
+    /// Claimed attempts, keyed by instance; admission excludes the owning workspace.
+    running: HashSet<String>,
+    waiting: HashSet<String>,
     enhanced: HashMap<String, super::schedule::EnhancedTiming>,
     wake_monitor_available: bool,
     wake_signal: WakeSignal,
     observed_wake_generation: u64,
     observed_clock_generation: u64,
-    claimed_dispatch_lease: Option<DispatchLease>,
+    claimed_dispatch_leases: HashMap<String, DispatchLease>,
     pending_cancellations: HashMap<String, PendingCancellation>,
     pending_reconcile: HashSet<String>,
     invalidated_completions: HashSet<String>,
@@ -181,13 +199,14 @@ impl Scheduler {
             state: SchedulerState::Running,
             definitions: HashMap::new(),
             instances: HashMap::new(),
-            running: None,
+            running: HashSet::new(),
+            waiting: HashSet::new(),
             enhanced: HashMap::new(),
             wake_monitor_available: false,
             wake_signal: WakeSignal::default(),
             observed_wake_generation: 0,
             observed_clock_generation: 0,
-            claimed_dispatch_lease: None,
+            claimed_dispatch_leases: HashMap::new(),
             pending_cancellations: HashMap::new(),
             pending_reconcile: HashSet::new(),
             invalidated_completions: HashSet::new(),
@@ -233,10 +252,10 @@ impl Scheduler {
         self.enhanced.remove(instance_id);
         self.pending_reconcile.remove(instance_id);
         self.invalidated_completions.remove(instance_id);
-        if self.running.as_ref() == Some(&instance_id.to_string()) {
-            self.running = None;
-            self.claimed_dispatch_lease = None;
-        }
+        self.invalidate_claim(instance_id);
+        self.running.remove(instance_id);
+        self.waiting.remove(instance_id);
+        self.claimed_dispatch_leases.remove(instance_id);
     }
 
     /// Removes all instances for a given agent ID.
@@ -286,7 +305,7 @@ impl Scheduler {
     ///
     /// Returns `None` if:
     /// - Scheduler is paused/stopped
-    /// - An agent is already running
+    /// - A claim already owns this workspace (or legacy admission is busy)
     /// - No agents are ready
     pub fn next_ready(&mut self) -> Option<String> {
         self.next_ready_with_clock(|| (chrono::Utc::now().timestamp_millis(), Instant::now()))
@@ -333,13 +352,20 @@ impl Scheduler {
             return None;
         }
 
-        // Only one agent at a time
-        if self.running.is_some() {
-            return None;
-        }
-
+        // Legacy schedules retain their global admission gate. An enhanced
+        // workspace can progress independently, but never beside its own claim.
+        let busy_workspaces: HashSet<_> = self
+            .running
+            .iter()
+            .filter_map(|id| self.instances.get(id).map(|i| i.workspace_id.clone()))
+            .collect();
         // Find first ready instance
         for instance in self.instances.values_mut() {
+            if busy_workspaces.contains(&instance.workspace_id)
+                || (!self.enhanced.contains_key(&instance.instance_id) && !self.running.is_empty())
+            {
+                continue;
+            }
             if self
                 .pending_cancellations
                 .contains_key(&instance.workspace_id)
@@ -357,24 +383,26 @@ impl Scheduler {
                 instance.is_ready(now)
             };
             if ready {
-                self.claimed_dispatch_lease = if self.enhanced.contains_key(&instance.instance_id)
-                    && !instance.manual_run_pending
+                if self.enhanced.contains_key(&instance.instance_id) && !instance.manual_run_pending
                 {
-                    Some(DispatchLease {
-                        signal: signal.clone(),
-                        generation,
-                        cron_clock_generation: self
-                            .enhanced
-                            .get(&instance.instance_id)
-                            .filter(|timing| timing.is_cron())
-                            .map(|_| clock_generation),
-                        committed: Arc::new(AtomicBool::new(false)),
-                    })
-                } else {
-                    None
-                };
+                    self.claimed_dispatch_leases.insert(
+                        instance.instance_id.clone(),
+                        DispatchLease {
+                            signal: signal.clone(),
+                            generation,
+                            cron_clock_generation: self
+                                .enhanced
+                                .get(&instance.instance_id)
+                                .filter(|timing| timing.is_cron())
+                                .map(|_| clock_generation),
+                            committed: Arc::new(AtomicBool::new(false)),
+                            claim_valid: Arc::new(AtomicBool::new(true)),
+                        },
+                    );
+                }
+                self.waiting.remove(&instance.instance_id);
                 instance.is_running = true;
-                self.running = Some(instance.instance_id.clone());
+                self.running.insert(instance.instance_id.clone());
                 return Some(instance.instance_id.clone());
             }
         }
@@ -382,8 +410,57 @@ impl Scheduler {
         None
     }
 
-    pub fn take_claimed_dispatch_lease(&mut self) -> Option<DispatchLease> {
-        self.claimed_dispatch_lease.take()
+    pub fn take_claimed_dispatch_lease(&self, instance_id: &str) -> Option<DispatchLease> {
+        self.claimed_dispatch_leases.get(instance_id).cloned()
+    }
+
+    fn invalidate_claim(&self, instance_id: &str) {
+        if let Some(lease) = self.claimed_dispatch_leases.get(instance_id) {
+            // Order revocation with provider commitment, exactly as wake events.
+            if let Ok(_gate) = self.wake_signal.0.lock() {
+                lease.claim_valid.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn is_instance_running(&self, instance_id: &str) -> bool {
+        self.running.contains(instance_id)
+    }
+
+    pub fn is_enhanced(&self, instance_id: &str) -> bool {
+        self.enhanced.contains_key(instance_id)
+    }
+
+    /// Keep one due attempt rather than advancing its completion-based cadence.
+    pub fn wait_for_session(&mut self, instance_id: &str) {
+        self.running.remove(instance_id);
+        self.claimed_dispatch_leases.remove(instance_id);
+        if let Some(instance) = self.instances.get_mut(instance_id) {
+            instance.is_running = false;
+            if instance.enabled {
+                self.waiting.insert(instance_id.to_string());
+            }
+        }
+    }
+
+    pub fn waiting_reason(&self, instance_id: &str) -> Option<&'static str> {
+        (self.state == SchedulerState::Running
+            && self.instances.get(instance_id).is_some_and(|i| i.enabled)
+            && self.waiting.contains(instance_id))
+        .then_some("Waiting for the workspace to become available.")
+    }
+
+    /// Future script/approval phases use the same revocation boundary.
+    pub fn yield_to_manual(&self, workspace_id: &str) {
+        for id in &self.running {
+            if self
+                .instances
+                .get(id)
+                .is_some_and(|i| i.workspace_id == workspace_id)
+            {
+                self.invalidate_claim(id);
+            }
+        }
     }
 
     /// Drop an invalidated scheduled attempt without recording its occurrence
@@ -399,15 +476,16 @@ impl Scheduler {
         instance_id: &str,
         clock: impl FnOnce() -> (i64, Instant),
     ) {
-        if self.running.as_deref() != Some(instance_id) {
+        if !self.running.contains(instance_id) {
             return;
         }
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.is_running = false;
             instance.manual_run_pending = false;
         }
-        self.running = None;
-        self.claimed_dispatch_lease = None;
+        self.running.remove(instance_id);
+        self.claimed_dispatch_leases.remove(instance_id);
+        self.waiting.remove(instance_id);
         let signal = self.wake_signal.clone();
         match signal.0.lock() {
             Ok(state) if !state.sleeping => {
@@ -508,7 +586,7 @@ impl Scheduler {
     }
 
     pub fn invalidate_running_completion(&mut self, agent_id: &str) {
-        if self.running.as_deref() == Some(agent_id) {
+        if self.running.contains(agent_id) {
             self.invalidated_completions.insert(agent_id.to_string());
         }
     }
@@ -611,10 +689,9 @@ impl Scheduler {
             instance.is_running = false;
             instance.manual_run_pending = false;
         }
-        if self.running.as_deref() == Some(instance_id) {
-            self.running = None;
-            self.claimed_dispatch_lease = None;
-        }
+        self.running.remove(instance_id);
+        self.waiting.remove(instance_id);
+        self.claimed_dispatch_leases.remove(instance_id);
     }
 
     /// Marks an agent as completed and schedules its next run.
@@ -653,10 +730,10 @@ impl Scheduler {
         // catch-up semantic.
         self.set_instance_next_run_at(instance_id, Some(next_run_at_unix_ms));
 
-        if self.running.as_ref() == Some(&instance_id.to_string()) {
-            self.running = None;
-            self.claimed_dispatch_lease = None;
-        }
+        self.invalidate_claim(instance_id);
+        self.running.remove(instance_id);
+        self.waiting.remove(instance_id);
+        self.claimed_dispatch_leases.remove(instance_id);
     }
 
     // =========================================================================
@@ -665,6 +742,10 @@ impl Scheduler {
 
     /// Pauses the scheduler.
     pub fn pause(&mut self, reason: String) {
+        for id in &self.running {
+            self.invalidate_claim(id);
+        }
+        self.waiting.clear();
         self.state = SchedulerState::Paused { reason };
     }
 
@@ -675,6 +756,10 @@ impl Scheduler {
 
     /// Stops the scheduler.
     pub fn stop(&mut self) {
+        for id in &self.running {
+            self.invalidate_claim(id);
+        }
+        self.waiting.clear();
         self.state = SchedulerState::Stopped;
     }
 
@@ -685,12 +770,12 @@ impl Scheduler {
 
     /// Returns whether an agent is currently running.
     pub fn is_running(&self) -> bool {
-        self.running.is_some()
+        !self.running.is_empty()
     }
 
-    /// Gets the currently running instance ID.
+    /// Gets one running instance ID for diagnostics and legacy callers.
     pub fn running_instance(&self) -> Option<&String> {
-        self.running.as_ref()
+        self.running.iter().next()
     }
 
     // =========================================================================
@@ -738,6 +823,10 @@ impl Scheduler {
 
     /// Enables or disables an agent instance.
     pub fn set_instance_enabled(&mut self, instance_id: &str, enabled: bool) {
+        if !enabled {
+            self.invalidate_claim(instance_id);
+            self.waiting.remove(instance_id);
+        }
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.enabled = enabled;
         }
@@ -874,7 +963,7 @@ mod tests {
             cron.next_ready_at(60_000, start + Duration::from_secs(60)),
             Some(id.clone())
         );
-        let lease = cron.take_claimed_dispatch_lease().unwrap();
+        let lease = cron.take_claimed_dispatch_lease(&id).unwrap();
         cron.wake_signal().clock_changed();
         assert!(!lease.is_current());
         // A poll can consume the event while the claimed attempt is still active.
@@ -908,9 +997,9 @@ mod tests {
         interval.set_wake_monitor_available(true, 0, start);
         assert_eq!(
             interval.next_ready_at(15_000, start + Duration::from_secs(15)),
-            Some(id)
+            Some(id.clone())
         );
-        let lease = interval.take_claimed_dispatch_lease().unwrap();
+        let lease = interval.take_claimed_dispatch_lease(&id).unwrap();
         interval.wake_signal().clock_changed();
         assert!(lease.is_current());
     }

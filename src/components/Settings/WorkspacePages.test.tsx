@@ -89,6 +89,16 @@ describe('SchedulePage', () => {
     });
   });
 
+  it('shows one due attempt waiting for the busy workspace without calling it paused', () => {
+    const details = { ...DETAILS, scheduleEnabled: true,
+      scheduleKind: { type: 'enhancedInterval', intervalSeconds: 15 },
+      scheduleWaitingReason: 'Waiting for the workspace to become available.' } as WorkspaceDetails;
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={details} saving={false} />);
+    expect(screen.getByText('Waiting')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for the workspace to become available.')).toBeInTheDocument();
+    expect(screen.queryByText('Paused')).not.toBeInTheDocument();
+  });
+
   it('shows why an enhanced schedule is paused when wake detection is unavailable', () => {
     const details = { ...DETAILS, scheduleEnabled: true,
       scheduleKind: { type: 'enhancedInterval', intervalSeconds: 15 },

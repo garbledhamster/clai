@@ -166,7 +166,7 @@ fn verify_after_wake(
             let elapsed = resumed.elapsed();
             let wall = chrono::Utc::now().timestamp_millis();
             if !scheduler
-                .take_claimed_dispatch_lease()
+                .take_claimed_dispatch_lease(&id)
                 .is_some_and(|lease| lease.try_commit())
             {
                 return Err("Scheduled claim could not commit after wake.".into());

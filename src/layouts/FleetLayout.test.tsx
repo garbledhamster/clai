@@ -80,6 +80,7 @@ const entry = (
   scheduleEnabled: false,
   schedulePaused: false,
   scheduleBlockedReason: null,
+  scheduleWaitingReason: null,
   scheduleKind: null,
   nextRunInSeconds: null,
   unread: false,

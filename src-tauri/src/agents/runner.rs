@@ -191,16 +191,43 @@ async fn run_next_agent(
             tracing::warn!(%error, "Deferred schedule reconciliation will be retried");
         }
     }
-    let Some(instance_id) = claim_next_instance(scheduler).await else {
-        tracing::debug!("No agents ready");
-        return Ok(());
-    };
-    release_slot_on_error(
-        scheduler,
-        &instance_id,
-        run_claimed_instance(app_handle, scheduler, &instance_id),
-    )
-    .await
+    let app = app_handle.clone();
+    let owned_scheduler = scheduler.clone();
+    dispatch_ready_agents(scheduler, move |instance_id| {
+        let app = app.clone();
+        let scheduler = owned_scheduler.clone();
+        async move { run_claimed_instance(&app, &scheduler, &instance_id).await }
+    })
+    .await;
+    Ok(())
+}
+
+/// Claim one bounded polling batch, then detach its attempts. Collect before
+/// spawning so an immediately busy session cannot be reclaimed in this poll.
+async fn dispatch_ready_agents<F, Fut>(
+    scheduler: &SharedScheduler,
+    run: F,
+) -> Vec<tokio::task::JoinHandle<()>>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RunnerError>> + Send + 'static,
+{
+    let mut claimed = Vec::new();
+    while let Some(id) = claim_next_instance(scheduler).await {
+        claimed.push(id);
+    }
+    claimed
+        .into_iter()
+        .map(|instance_id| {
+            let body = run(instance_id.clone());
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                if let Err(error) = release_slot_on_error(&scheduler, &instance_id, body).await {
+                    tracing::error!(%instance_id, %error, "Scheduled attempt failed");
+                }
+            })
+        })
+        .collect()
 }
 
 /// Claims the next ready instance, marking it running in the scheduler.
@@ -226,7 +253,7 @@ async fn claim_next_instance(scheduler: &SharedScheduler) -> Option<String> {
 }
 
 /// Awaits `body` for a claimed instance and, if it fails while the instance
-/// still holds the scheduler's single running slot, releases the slot with a
+/// still holds its workspace claim, releases the slot with a
 /// retry after [`START_FAILURE_RETRY_MS`]. Without this an early error left
 /// the instance marked running, blocking every later scheduled run. A missing
 /// agent is retried too rather than removed: a failed workspace delete
@@ -241,7 +268,7 @@ async fn release_slot_on_error(
     let result = body.await;
     if result.is_err() {
         let mut sched = scheduler.lock().await;
-        if sched.running_instance().map(String::as_str) == Some(instance_id) {
+        if sched.is_instance_running(instance_id) {
             let retry_at = chrono::Utc::now().timestamp_millis() + START_FAILURE_RETRY_MS;
             sched.complete_agent(instance_id, false, retry_at);
         }
@@ -260,13 +287,17 @@ async fn claimed_instance_details(
     ),
     RunnerError,
 > {
-    let mut sched = scheduler.lock().await;
+    let sched = scheduler.lock().await;
     let instance = sched
         .get_instance(instance_id)
         .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.to_string()))?;
     let workspace_id = instance.workspace_id.clone();
     let agent_id = instance.agent_id.clone();
-    Ok((workspace_id, agent_id, sched.take_claimed_dispatch_lease()))
+    Ok((
+        workspace_id,
+        agent_id,
+        sched.take_claimed_dispatch_lease(instance_id),
+    ))
 }
 
 /// Runs an instance already claimed by [`claim_next_instance`]. Every `Ok`
@@ -295,11 +326,7 @@ async fn run_claimed_instance(
 
     // Check if the automation is still enabled.
     if !agent_config.enabled {
-        // Remove the instance from scheduler
-        {
-            let mut sched = scheduler.lock().await;
-            sched.remove_instance(instance_id);
-        }
+        scheduler.lock().await.remove_instance(instance_id);
 
         return Ok(());
     }
@@ -309,6 +336,7 @@ async fn run_claimed_instance(
     let session =
         ensure_workspace_manager_session(app_handle, &workspace_pool, &agent_config).await?;
 
+    let enhanced = scheduler.lock().await.is_enhanced(instance_id);
     let manual = scheduler
         .lock()
         .await
@@ -322,21 +350,25 @@ async fn run_claimed_instance(
             instance_id,
             agent_id: &agent_id,
             manual,
+            enhanced,
         },
         |event| {
             let _ = emit_event(app_handle, &workspace_id, &session, None, event);
         },
     )
     .await?;
+    if run.is_none() && enhanced {
+        scheduler.lock().await.wait_for_session(instance_id);
+        kick_after_abandon(app_handle, &workspace_id, &workspace_pool, &session.id).await;
+        return Ok(());
+    }
     let ran = run.is_some();
     let result = match run {
         Some(run) => {
-            let engine_run = run.clone();
             let registration = runtime::register_run(
                 runtime::LiveRunKey::new(&workspace_id, &session.id),
                 &run.id,
             );
-            let cancel_token = registration.token();
             let outcome = run_queued_with_preflight(
                 &workspace_pool,
                 &session,
@@ -354,8 +386,8 @@ async fn run_claimed_instance(
                         &workspace_pool,
                         &session,
                         &connection,
-                        engine_run,
-                        cancel_token,
+                        run.clone(),
+                        registration.token(),
                     )
                 },
             )
@@ -373,12 +405,11 @@ async fn run_claimed_instance(
         None => Ok(()),
     };
 
-    let success = log_tick_result(instance_id, &result);
     if let Err(e) = complete_tick_and_persist(
         state.inner(),
         scheduler,
         instance_id,
-        success,
+        log_tick_result(instance_id, &result),
         &agent_config,
         ran,
     )
@@ -434,7 +465,19 @@ async fn run_queued_with_preflight<Fut>(
 where
     Fut: std::future::Future<Output = Result<(), RunnerError>>,
 {
-    let previous_cli_session = if lease.is_none_or(|lease| lease.is_current()) {
+    let manual_check = if lease.is_some() {
+        repository::has_pending_user_message(pool, &session.id).await
+    } else {
+        Ok(false)
+    };
+    // A failed preflight still owns a queued run row. Close it through the
+    // same cleanup path before surfacing the error and releasing the claim.
+    let preflight_error = manual_check.as_ref().err().cloned();
+    let manual_waiting = manual_check.unwrap_or(false);
+    let previous_cli_session = if preflight_error.is_none()
+        && !manual_waiting
+        && lease.is_none_or(|lease| lease.is_current())
+    {
         match crate::assistant::provider_dispatch::with_scheduled_dispatch(lease.cloned(), start())
             .await
         {
@@ -472,7 +515,19 @@ where
         );
         return Err(RunnerError::AssistantPersistence(error));
     }
-    scheduler.lock().await.abandon_enhanced_claim(instance_id);
+    if (manual_waiting
+        || repository::has_pending_user_message(pool, &session.id)
+            .await
+            .unwrap_or(false))
+        && lease.is_none_or(|lease| lease.timing_is_current())
+    {
+        scheduler.lock().await.wait_for_session(instance_id);
+    } else {
+        scheduler.lock().await.abandon_enhanced_claim(instance_id);
+    }
+    if let Some(error) = preflight_error {
+        return Err(RunnerError::AssistantPersistence(error));
+    }
     Ok(StartOutcome::AbandonedOnSleepOrClockChange)
 }
 
@@ -627,12 +682,13 @@ struct TickContext<'a> {
     agent_id: &'a str,
     /// A user-requested "Run now" rather than a scheduled fire.
     manual: bool,
+    enhanced: bool,
 }
 
-/// Creates the tick's run, or skips the tick when the session already has an
-/// active run: a busy tick is dropped, never queued or deferred, and the
-/// schedule advances as usual. A skipped manual run is reported through
-/// `emit` because a user is waiting on it.
+/// Creates the tick's run using the session's atomic idle check. Enhanced
+/// ticks also yield to pending user messages; their caller retains one due
+/// attempt while legacy busy ticks advance as before. A skipped Run now is
+/// reported through `emit` because a user is waiting on it.
 async fn start_tick_run(
     pool: &DbPool,
     session: &AssistantSession,
@@ -640,19 +696,20 @@ async fn start_tick_run(
     tick: TickContext<'_>,
     emit: impl FnOnce(AssistantUiEvent),
 ) -> Result<Option<AssistantRun>, RunnerError> {
-    let run = repository::create_run_if_idle(
-        pool,
-        CreateRunParams {
-            session_id: session.id.clone(),
-            status: RunStatus::Queued,
-            trigger: RunTrigger::Scheduled,
-            connection_id: connection.id.clone(),
-            protocol_id: connection.protocol_id.clone(),
-            model_id: connection.model_id.clone(),
-            error: None,
-        },
-    )
-    .await
+    let params = CreateRunParams {
+        session_id: session.id.clone(),
+        status: RunStatus::Queued,
+        trigger: RunTrigger::Scheduled,
+        connection_id: connection.id.clone(),
+        protocol_id: connection.protocol_id.clone(),
+        model_id: connection.model_id.clone(),
+        error: None,
+    };
+    let run = if tick.enhanced && !tick.manual {
+        repository::create_scheduled_run_if_idle(pool, params).await
+    } else {
+        repository::create_run_if_idle(pool, params).await
+    }
     .map_err(RunnerError::AssistantPersistence)?;
     if run.is_none() {
         let active_run_id = repository::active_run_id(pool, &session.id)
@@ -1319,7 +1376,7 @@ mod tests {
                 scheduler.next_ready_at(15_000, start + Duration::from_secs(15)),
                 Some(id.clone())
             );
-            let lease = scheduler.take_claimed_dispatch_lease();
+            let lease = scheduler.take_claimed_dispatch_lease(&id);
             let run = start_tick_run(
                 &pool,
                 &session,
@@ -1328,6 +1385,7 @@ mod tests {
                     instance_id: &id,
                     agent_id: "agent",
                     manual,
+                    enhanced: true,
                 },
                 |_| {},
             )
@@ -1342,6 +1400,452 @@ mod tests {
                 Arc::new(Mutex::new(scheduler)),
                 lease,
             )
+        }
+
+        #[tokio::test]
+        async fn enhanced_workspaces_claim_independently_without_same_workspace_overlap() {
+            let (_tmp, _pool, _session, _run, scheduler, first_lease) = fixture(false).await;
+            let mut sched = scheduler.lock().await;
+            let start = Instant::now() - Duration::from_secs(30);
+            for (agent, workspace) in [("other", "other-ws"), ("same", "ws")] {
+                sched.register_definition(
+                    AgentDefinition::new(agent, agent).with_workspace_id(workspace),
+                );
+                sched.create_instance(agent).unwrap();
+                sched
+                    .configure_enhanced(
+                        agent,
+                        ScheduleKind::EnhancedInterval {
+                            interval_seconds: 15,
+                        },
+                        0,
+                        start,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                sched.next_ready_at(30_000, Instant::now()).as_deref(),
+                Some("other")
+            );
+            assert!(first_lease.unwrap().is_current());
+            assert!(sched.next_ready_at(30_000, Instant::now()).is_none());
+        }
+
+        #[tokio::test]
+        async fn runner_progresses_second_workspace_while_first_model_waits_and_releases_only_failed_claim(
+        ) {
+            let (_tmp, _pool, _session, _run, scheduler, _lease) = fixture(false).await;
+            {
+                let mut sched = scheduler.lock().await;
+                sched.wait_for_session("agent");
+                sched.register_definition(
+                    AgentDefinition::new("other", "Other").with_workspace_id("other-ws"),
+                );
+                sched.create_instance("other").unwrap();
+                sched
+                    .configure_enhanced(
+                        "other",
+                        ScheduleKind::EnhancedInterval {
+                            interval_seconds: 15,
+                        },
+                        0,
+                        Instant::now() - Duration::from_secs(30),
+                    )
+                    .unwrap();
+            }
+            let held = Arc::new(tokio::sync::Notify::new());
+            let second_finished = Arc::new(tokio::sync::Notify::new());
+            let mut handles = dispatch_ready_agents(&scheduler, |id| {
+                let held = held.clone();
+                let second_finished = second_finished.clone();
+                async move {
+                    if id == "agent" {
+                        held.notified().await;
+                        Ok(())
+                    } else {
+                        second_finished.notify_one();
+                        Err(RunnerError::NoProviderConfigured(id))
+                    }
+                }
+            })
+            .await;
+            assert_eq!(handles.len(), 2);
+            tokio::time::timeout(Duration::from_secs(2), second_finished.notified())
+                .await
+                .unwrap();
+            // Await the failed attempt's own completion, rather than race its guard.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !handles.iter().any(|handle| handle.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let index = handles
+                .iter()
+                .position(|handle| handle.is_finished())
+                .unwrap();
+            handles.swap_remove(index).await.unwrap();
+            {
+                let mut sched = scheduler.lock().await;
+                assert!(sched.is_instance_running("agent"));
+                assert!(!sched.is_instance_running("other"));
+                assert!(
+                    sched.next_ready().is_none(),
+                    "failed start must wait for its next interval"
+                );
+            }
+            held.notify_one();
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn busy_enhanced_tick_retains_one_due_check_and_admits_it_after_manual_completion() {
+            let (_tmp, pool, session, active, scheduler, _lease) = fixture(false).await;
+            let original = repository::latest_run(&pool, &session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            for _ in 0..3 {
+                let run = start_tick_run(
+                    &pool,
+                    &session,
+                    &connection(),
+                    TickContext {
+                        instance_id: "agent",
+                        agent_id: "agent",
+                        manual: false,
+                        enhanced: true,
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap();
+                assert!(run.is_none());
+                let mut sched = scheduler.lock().await;
+                sched.wait_for_session("agent");
+                assert!(sched.waiting_reason("agent").is_some());
+                assert_eq!(sched.next_ready().as_deref(), Some("agent"));
+            }
+            assert_eq!(
+                repository::latest_run(&pool, &session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                original.id
+            );
+            repository::complete_run(&pool, &active.id, RunStatus::Completed, None)
+                .await
+                .unwrap();
+            let next = start_tick_run(
+                &pool,
+                &session,
+                &connection(),
+                TickContext {
+                    instance_id: "agent",
+                    agent_id: "agent",
+                    manual: false,
+                    enhanced: true,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            repository::complete_run(&pool, &next.id, RunStatus::Completed, None)
+                .await
+                .unwrap();
+            let mut sched = scheduler.lock().await;
+            sched.complete_agent("agent", true, 0);
+            assert!(sched.waiting_reason("agent").is_none());
+            assert!(sched.next_ready().is_none());
+        }
+
+        #[tokio::test]
+        async fn user_message_committing_while_schedule_waits_for_sqlite_writer_wins_admission() {
+            let (_tmp, pool, session, old, _scheduler, _lease) = fixture(false).await;
+            repository::complete_run(&pool, &old.id, RunStatus::Completed, None)
+                .await
+                .unwrap();
+            let message = repository::create_user_message(
+                &pool,
+                session.id.clone(),
+                "Manual wins writer race".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            crate::assistant::signals::insert_user_message_signal(&mut tx, &message, "conn")
+                .await
+                .unwrap();
+            let schedule = tokio::spawn({
+                let pool = pool.clone();
+                let session = session.clone();
+                async move {
+                    start_tick_run(
+                        &pool,
+                        &session,
+                        &connection(),
+                        TickContext {
+                            instance_id: "agent",
+                            agent_id: "agent",
+                            manual: false,
+                            enhanced: true,
+                        },
+                        |_| {},
+                    )
+                    .await
+                    .unwrap()
+                }
+            });
+            tokio::task::yield_now().await;
+            tx.commit().await.unwrap();
+            assert!(schedule.await.unwrap().is_none());
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(
+                matches!(dispatcher::claim(&pool, "ws", &session.id, |_| Some(connection())).await.unwrap(),
+                dispatcher::Kick::Started { message_ids, .. } if message_ids == vec![message.id])
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_manual_queue_check_cancels_the_unstarted_run_and_releases_its_claim() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            sqlx::query("DROP TABLE session_signals")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let outcome = release_slot_on_error(&scheduler, "agent", async {
+                run_queued_with_preflight(
+                    &pool,
+                    &session,
+                    &run,
+                    &scheduler,
+                    "agent",
+                    lease.as_ref(),
+                    |_| {},
+                    || async { panic!("queue check failure must not call the model") },
+                )
+                .await
+                .map(|_| ())
+            })
+            .await;
+            assert!(outcome.is_err());
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!scheduler.lock().await.is_running());
+        }
+
+        #[tokio::test]
+        async fn manual_priority_after_consumed_wake_or_clock_change_still_rearms_schedule() {
+            for cron in [false, true] {
+                let (_tmp, pool, session, run, scheduler, mut lease) = fixture(false).await;
+                if cron {
+                    let mut sched = scheduler.lock().await;
+                    sched.wait_for_session("agent");
+                    let start = Instant::now() - Duration::from_secs(60);
+                    sched
+                        .configure_enhanced(
+                            "agent",
+                            ScheduleKind::EnhancedCron {
+                                expression: "* * * * *".into(),
+                                timezone: "UTC".into(),
+                            },
+                            0,
+                            start,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        sched
+                            .next_ready_at(60_000, start + Duration::from_secs(60))
+                            .as_deref(),
+                        Some("agent")
+                    );
+                    lease = sched.take_claimed_dispatch_lease("agent");
+                }
+                let signal = scheduler.lock().await.wake_signal();
+                if cron {
+                    signal.clock_changed();
+                } else {
+                    signal.will_sleep();
+                    signal.did_wake();
+                }
+                // Another workspace's polling pass consumes the event while
+                // this claim is still active, so its timing has not been reset.
+                assert!(scheduler.lock().await.next_ready().is_none());
+                repository::create_user_message(
+                    &pool,
+                    session.id.clone(),
+                    "Manual first".into(),
+                    Some("conn"),
+                )
+                .await
+                .unwrap();
+                let before_cancel_wall = chrono::Utc::now().timestamp_millis();
+                let outcome = run_queued_with_preflight(
+                    &pool,
+                    &session,
+                    &run,
+                    &scheduler,
+                    "agent",
+                    lease.as_ref(),
+                    |_| {},
+                    || async { panic!("manual input must displace the stale scheduled attempt") },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    outcome,
+                    StartOutcome::AbandonedOnSleepOrClockChange
+                ));
+                let manual = dispatcher::claim(&pool, "ws", &session.id, |_| Some(connection()))
+                    .await
+                    .unwrap();
+                let dispatcher::Kick::Started { run: manual, .. } = manual else {
+                    panic!("manual request must run first")
+                };
+                repository::complete_run(&pool, &manual.id, RunStatus::Completed, None)
+                    .await
+                    .unwrap();
+                let mut sched = scheduler.lock().await;
+                let after = Instant::now();
+                assert!(sched.next_ready_at(before_cancel_wall, after).is_none());
+                if !cron {
+                    assert!(sched
+                        .next_ready_at(before_cancel_wall + 14_000, after + Duration::from_secs(14))
+                        .is_none());
+                    assert_eq!(
+                        sched
+                            .next_ready_at(
+                                before_cancel_wall + 16_000,
+                                after + Duration::from_secs(16)
+                            )
+                            .as_deref(),
+                        Some("agent")
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn manual_message_after_session_claim_cancels_before_model_and_keeps_check_due() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            repository::create_user_message(
+                &pool,
+                session.id.clone(),
+                "Manual first".into(),
+                Some("conn"),
+            )
+            .await
+            .unwrap();
+            let calls = AtomicUsize::new(0);
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                StartOutcome::AbandonedOnSleepOrClockChange
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let mut sched = scheduler.lock().await;
+            assert!(!sched.is_running());
+            assert!(sched.waiting_reason("agent").is_some());
+            assert_eq!(sched.next_ready().as_deref(), Some("agent"));
+            assert_eq!(
+                repository::get_run(&pool, &run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Cancelled
+            );
+        }
+
+        #[tokio::test]
+        async fn disable_pause_and_manual_priority_revoke_only_uncommitted_attempts() {
+            for action in ["disable", "pause", "manual", "remove"] {
+                for committed in [false, true] {
+                    let (_tmp, _pool, _session, _run, scheduler, lease) = fixture(false).await;
+                    let lease = lease.unwrap();
+                    if committed {
+                        assert!(lease.try_commit());
+                    }
+                    let mut sched = scheduler.lock().await;
+                    match action {
+                        "disable" => sched.set_instance_enabled("agent", false),
+                        "pause" => sched.pause("Paused by user".into()),
+                        "manual" => sched.yield_to_manual("ws"),
+                        "remove" => {
+                            sched.remove_workspace("ws");
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(lease.try_commit(), committed, "action {action}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn queued_user_request_wins_over_due_scheduled_turn() {
+            let (_tmp, pool, session, previous, _scheduler, _lease) = fixture(false).await;
+            repository::complete_run(&pool, &previous.id, RunStatus::Completed, None)
+                .await
+                .unwrap();
+            let message = repository::create_user_message_with_content(
+                &pool,
+                session.id.clone(),
+                vec![crate::assistant::types::ContentPart::Text {
+                    text: "Please do this first".into(),
+                }],
+                Some("conn"),
+            )
+            .await
+            .unwrap();
+            let run = start_tick_run(
+                &pool,
+                &session,
+                &connection(),
+                TickContext {
+                    instance_id: "agent",
+                    agent_id: "agent",
+                    manual: false,
+                    enhanced: true,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert!(
+                run.is_none(),
+                "scheduled work must leave pending manual input for dispatcher"
+            );
+            let outcome = dispatcher::claim(&pool, "ws", &session.id, |_| Some(connection()))
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, dispatcher::Kick::Started { message_ids, .. } if message_ids == vec![message.id])
+            );
         }
 
         #[tokio::test]
@@ -1534,6 +2038,10 @@ mod tests {
         }
 
         #[tokio::test]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "One recovery scenario verifies cleanup ownership, rollback and pending input together"
+        )]
         async fn failed_cli_preparation_cleanup_blocks_manual_work_until_retry_succeeds() {
             use crate::assistant::compaction_service;
             let (_tmp, pool, mut session, mut run, scheduler, lease) = fixture(false).await;
@@ -1546,14 +2054,7 @@ mod tests {
             session.context.cli_session_id = Some("original-session".into());
             session.context.cli_session_provider = Some("claude-code".into());
             session = repository::update_session(&pool, &session).await.unwrap();
-            let user = repository::create_user_message(
-                &pool,
-                session.id.clone(),
-                "queued manual input".into(),
-                Some("conn"),
-            )
-            .await
-            .unwrap();
+            let mut user = None;
             sqlx::query("CREATE TRIGGER reject_preparation_delete BEFORE DELETE ON assistant_messages WHEN json_extract(OLD.provider_metadata_json, '$.source') = 'claude-code-trigger' BEGIN SELECT RAISE(ABORT, 'injected preparation cleanup failure'); END").execute(&pool).await.unwrap();
             let result = run_queued_with_preflight(
                 &pool,
@@ -1563,9 +2064,22 @@ mod tests {
                 "agent",
                 lease.as_ref(),
                 |_| {},
-                || async { Err(abandoned_cli_start(&pool, &session, &run).await) },
+                || async {
+                    user = Some(
+                        repository::create_user_message(
+                            &pool,
+                            session.id.clone(),
+                            "queued manual input".into(),
+                            Some("conn"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    Err(abandoned_cli_start(&pool, &session, &run).await)
+                },
             )
             .await;
+            let user = user.unwrap();
             assert!(
                 result.is_err(),
                 "cleanup failure must not become successful abandonment"
@@ -1962,6 +2476,7 @@ mod tests {
                     instance_id: &instance_id,
                     agent_id: "agent",
                     manual,
+                    enhanced: false,
                 },
                 |event| events.push(event),
             )

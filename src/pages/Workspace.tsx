@@ -195,6 +195,7 @@ const formatSchedulePill = (details: WorkspaceDetails | null): string | null => 
   if (details.schedulePaused) {
     return cadence ? `Paused · ${cadence}` : 'Paused';
   }
+  if (details.scheduleWaitingReason) return `Waiting · ${cadence || 'scheduled check'}`;
   return cadence ? `Periodic · ${cadence}` : 'Periodic';
 };
 
@@ -1259,7 +1260,7 @@ const WorkspaceHeader = ({
         {(scheduleEnabled || details?.scheduleBlockedReason) && (
           <span
             className={`${styles.schedulePill} ${schedulePaused || details?.scheduleBlockedReason ? styles.schedulePillPaused : styles.schedulePillActive} ${details?.scheduleBlockedReason ? styles.schedulePillBlocked : ''}`}
-            title={details?.scheduleBlockedReason || schedulePillText || undefined}
+            title={details?.scheduleBlockedReason || details?.scheduleWaitingReason || schedulePillText || undefined}
           >
             {schedulePillText}
           </span>

@@ -89,7 +89,7 @@ pub fn apply_workspace_schedule(
     };
 
     // Preserve the active slot; apply the latest saved settings after it exits.
-    if sched.running_instance().map(String::as_str) == Some(agent.id.as_str()) {
+    if sched.is_instance_running(&agent.id) {
         sched.defer_reconcile(&agent.id);
         return;
     }
