@@ -34,6 +34,7 @@ pub mod init;
 pub mod runner;
 pub mod schedule;
 pub mod scheduler;
+pub mod scripts;
 pub mod tmp;
 pub mod types;
 pub mod wake_monitor;

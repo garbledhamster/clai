@@ -379,16 +379,41 @@ async fn run_claimed_instance(
                 |event| {
                     let _ = emit_event(app_handle, &workspace_id, &session, None, event);
                 },
-                || {
-                    run_scheduled_agent(
-                        app_handle,
-                        &agent_config.workspace_id,
+                || async {
+                    run_condition_then(
+                        async {
+                            if enhanced && !manual {
+                                if let Some(lease) = dispatch_lease.as_ref() {
+                                    return super::scripts::check_condition(
+                                        state.inner(),
+                                        &workspace_id,
+                                        &workspace_pool,
+                                        &session.id,
+                                        lease,
+                                    )
+                                    .await;
+                                }
+                            }
+                            super::scripts::ConditionOutcome::Allow
+                        },
                         &workspace_pool,
-                        &session,
-                        &connection,
-                        run.clone(),
-                        registration.token(),
+                        &run.id,
+                        |event| {
+                            let _ = emit_event(app_handle, &workspace_id, &session, None, event);
+                        },
+                        || {
+                            run_scheduled_agent(
+                                app_handle,
+                                &agent_config.workspace_id,
+                                &workspace_pool,
+                                &session,
+                                &connection,
+                                run.clone(),
+                                registration.token(),
+                            )
+                        },
                     )
+                    .await
                 },
             )
             .await;
@@ -420,6 +445,31 @@ async fn run_claimed_instance(
     }
 
     Ok(())
+}
+
+/// The condition owns the queued run but does not start provider/model work.
+pub(crate) async fn run_condition_then<C, F, Fut>(
+    condition: C,
+    pool: &DbPool,
+    run_id: &str,
+    mut emit: impl FnMut(AssistantUiEvent),
+    start: F,
+) -> Result<(), RunnerError>
+where
+    C: std::future::Future<Output = super::scripts::ConditionOutcome>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), RunnerError>>,
+{
+    match condition.await {
+        super::scripts::ConditionOutcome::Allow => start().await,
+        super::scripts::ConditionOutcome::Abandoned => Err(RunnerError::ScheduledDispatchAbandoned),
+        super::scripts::ConditionOutcome::Skip => {
+            crate::assistant::run_lifecycle::cancel_run_with_sink(pool, run_id, &mut emit)
+                .await
+                .map_err(|e| RunnerError::AssistantPersistence(e.to_string()))?;
+            Ok(())
+        }
+    }
 }
 
 async fn kick_after_abandon(app: &AppHandle, workspace_id: &str, pool: &DbPool, session_id: &str) {

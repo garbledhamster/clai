@@ -1483,6 +1483,7 @@ mod tests {
 
     fn failure_output(stdout: &str, stderr: &str, success: bool) -> SandboxCommandOutput {
         SandboxCommandOutput {
+            timed_out: false,
             cwd: PathBuf::from("/tmp"),
             exit_code: if success { Some(0) } else { Some(1) },
             success,

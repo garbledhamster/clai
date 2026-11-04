@@ -491,6 +491,20 @@ export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { 
  */
 timezone: string, };
 
+export type ScriptApproval = { id: string, purpose: string, content: string, interpreter: string, timeoutSeconds: number, access: string, };
+
+export type ScriptConfig = { source: ScriptSource, 
+/**
+ * One executable, without arguments. The selected language determines -c/-e.
+ */
+interpreter: string, timeoutSeconds: number, };
+
+export type ScriptResult = { stdout: string, stderr: string, exitCode: number | null, durationMs: bigint, timedOut: boolean, error: string | null, };
+
+export type ScriptSource = { "type": "inline", content: string, } | { "type": "file", path: string, };
+
+export type ScriptStatus = { pending: ScriptApproval | null, result: ScriptResult | null, error: string | null, running: boolean, };
+
 export type SegmentApproval = { text: string, kind: SegmentKind, suggestedPrefix: string, };
 
 export type SegmentDecision = { "kind": "allowOnce" } | { "kind": "allowAlways", scope: PermissionScope, prefix: string, } | { "kind": "denyOnce", reason?: string, } | { "kind": "denyAlways", scope: PermissionScope, prefix: string, reason?: string, };
@@ -634,7 +648,7 @@ export type WorkspaceAgentSummary = { id: string, displayName: string, isDefault
 
 export type WorkspaceAgentUpdateRequest = { workspaceId: string, agentId: string, name: string, description: string, selectedSkillIds: Array<string>, selectedMcpServerIds: Array<string>, providerConnectionIds: Array<string>, execution: ExecutionCapabilityConfig, enabled: boolean, };
 
-export type WorkspaceDetails = { workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
+export type WorkspaceDetails = { scheduleCondition?: ScriptConfig, scheduleScriptStatus?: ScriptStatus, workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
 /**
  * Attached-but-toggled-off MCP servers for the workspace conversation,
  * sourced from the manager row's `disabled` ref flags in the workspace

@@ -10,10 +10,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { setWorkspaceTitle } from '../../workspace/client';
 import IntervalSelect from './IntervalSelect';
 import WeeklyBlockGrid from './WeeklyBlockGrid';
+import ScheduleCondition, { conditionError } from './ScheduleCondition';
 import { formatNextRun } from '../../fleet/workspaceStatus';
 import { Switch } from './ListEditors';
 import { useReportDirty, type SectionHandle } from './sectionHandle';
-import type { ScheduleKind, WorkspaceDetails } from '../../generated/bindings';
+import type { ScheduleKind, ScriptConfig, WorkspaceDetails } from '../../generated/bindings';
 import form from './SettingsForm.module.css';
 import styles from './WorkspacePages.module.css';
 
@@ -197,6 +198,9 @@ export const SchedulePage = ({
   // Pause/Resume and Run now are immediate commands with their own busy state.
   const [slots, setSlots] = useState<number[]>(() => details?.scheduleAllowedBlocks?.slots ?? []);
   const [blockTimezone, setBlockTimezone] = useState(() => details?.scheduleAllowedBlocks?.timezone ?? 'UTC');
+  const [condition, setCondition] = useState<ScriptConfig | null>(() => details?.scheduleCondition ?? null);
+  const [unattended, setUnattended] = useState(!!details?.scheduleConditionUnattended);
+  const [unattendedApprovalId, setUnattendedApprovalId] = useState<string | null>(null);
   const [commandBusy, setCommandBusy] = useState(false);
   const busy = saving || commandBusy;
   const [error, setError] = useState<string | null>(null);
@@ -221,14 +225,29 @@ export const SchedulePage = ({
   // details every 5 s, and a same-value refetch must not discard the draft.
   const savedKind = JSON.stringify(details?.scheduleKind ?? null);
   const savedBlocks = JSON.stringify(details?.scheduleAllowedBlocks ?? null);
+  const savedCondition = JSON.stringify(details?.scheduleCondition ?? null);
+  const savedUnattended = !!details?.scheduleConditionUnattended;
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs the two-field draft when the saved schedule changes underneath.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs configuration only when saved values change; status polling preserves the draft.
     setEnabled(!!details?.scheduleEnabled);
     setDraft(draftFrom(JSON.parse(savedKind) as ScheduleKind | null));
     const blocks = JSON.parse(savedBlocks);
     setSlots(blocks?.slots ?? []);
     setBlockTimezone(blocks?.timezone ?? 'UTC');
-  }, [details?.scheduleEnabled, savedKind, savedBlocks]);
+    setCondition(JSON.parse(savedCondition) as ScriptConfig | null);
+  }, [details?.scheduleEnabled, savedKind, savedBlocks, savedCondition]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- adopt saved consent only for the same condition; status polling preserves draft approval.
+    setUnattended(JSON.stringify(condition) === savedCondition && savedUnattended);
+    setUnattendedApprovalId(null);
+  }, [condition, savedCondition, savedUnattended]);
+
+  const changeCondition = (next: ScriptConfig | null) => {
+    setCondition(next);
+    setUnattended(false);
+    setUnattendedApprovalId(null);
+  };
 
   // Next fire times for the cron being typed, so it can be checked before Save.
   useEffect(() => {
@@ -259,11 +278,13 @@ export const SchedulePage = ({
   const blockedReason = details?.scheduleBlockedReason;
   const waitingReason = details?.scheduleWaitingReason;
   const savedOn = !!details?.scheduleEnabled;
+  const enhanced = draft.type === 'enhancedInterval' || draft.type === 'enhancedCron';
 
   useReportDirty(
     enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)) ||
       JSON.stringify(slots) !== JSON.stringify(details?.scheduleAllowedBlocks?.slots ?? []) ||
-      (draft.type === 'enhancedInterval' && blockTimezone !== (details?.scheduleAllowedBlocks?.timezone ?? 'UTC')),
+      (draft.type === 'enhancedInterval' && blockTimezone !== (details?.scheduleAllowedBlocks?.timezone ?? 'UTC')) ||
+      (enhanced && (JSON.stringify(condition) !== savedCondition || unattended !== savedUnattended || unattendedApprovalId !== null)),
     onDirtyChange
   );
 
@@ -279,6 +300,8 @@ export const SchedulePage = ({
   };
 
   const build = useCallback((): { ok: true; kind: ScheduleKind | null } | { ok: false; error: string } => {
+    const problem = enhanced ? conditionError(condition) : null;
+    if (problem) return { ok: false, error: problem };
     if (!enabled) return { ok: true, kind: null };
     if (draft.type === 'enhancedInterval') {
       const seconds = Number(draft.intervalSeconds);
@@ -299,7 +322,7 @@ export const SchedulePage = ({
     if (!expression) return { ok: false, error: 'Cron expression is required.' };
     if (!timezone) return { ok: false, error: 'Timezone is required.' };
     return { ok: true, kind: { type: draft.type, expression, timezone } as ScheduleKind };
-  }, [enabled, draft]);
+  }, [enabled, draft, enhanced, condition]);
 
   const runCommand = useCallback(async (call: () => Promise<unknown>, fallback: string) => {
     setCommandBusy(true);
@@ -328,8 +351,9 @@ export const SchedulePage = ({
       }
       try {
         await invoke('workspace_set_schedule', { workspaceId, kind: built.kind,
-          ...(built.kind?.type === 'enhancedInterval' || built.kind?.type === 'enhancedCron' ? {
-            allowedBlocks: { timezone: built.kind.type === 'enhancedCron' ? built.kind.timezone : blockTimezone.trim(), slots },
+          ...(enhanced ? {
+            condition, unattended: !!condition && unattended, unattendedApprovalId,
+            allowedBlocks: { timezone: draft.type === 'enhancedCron' ? draft.timezone.trim() : blockTimezone.trim(), slots },
           } : {}),
         });
         setError(null);
@@ -346,7 +370,7 @@ export const SchedulePage = ({
 
   return (
     <div className={form.page}>
-      <div className={form.columns}>
+      <div className={`${form.columns} ${styles.scheduleColumns}`}>
         <section className={form.panel}>
           <header className={form.panelHeader}>
             <h3 id="schedule-when" className={form.panelTitle}>When the main agent runs</h3>
@@ -507,7 +531,7 @@ export const SchedulePage = ({
                         onClick={() => runCommand(() => invoke('workspace_run_now', { workspaceId }), 'Failed to trigger run.')}
                         disabled={busy}
                       >
-                        Run now
+                        Run agent now
                       </button>
                     )}
                     <button
@@ -533,6 +557,20 @@ export const SchedulePage = ({
               {details?.nextRunInSeconds != null && savedOn && !paused && !blockedReason && <p className={form.hint}>Next eligible check: {formatNextRun(details.nextRunInSeconds)}</p>}
             </div>
           </section>
+
+          {(enhanced || details?.scheduleScriptStatus?.pending || details?.scheduleScriptStatus?.result || details?.scheduleScriptStatus?.error) && (
+            <ScheduleCondition workspaceId={workspaceId} value={enhanced ? condition : null} onChange={changeCondition}
+              unattended={unattended} onUnattendedChange={(checked, approvalId) => {
+                setUnattended(checked);
+                setUnattendedApprovalId(approvalId ?? null);
+              }} onScheduledAuthorize={() => {
+                if (JSON.stringify(condition) === savedCondition) {
+                  setUnattended(true);
+                  setUnattendedApprovalId(null);
+                }
+              }}
+              status={details?.scheduleScriptStatus} disabled={busy || !enhanced} onDetailsRefresh={onDetailsRefresh} />
+          )}
 
           {(draft.type === 'cron' || draft.type === 'enhancedCron') && enabled && (
             <section className={form.panel}>

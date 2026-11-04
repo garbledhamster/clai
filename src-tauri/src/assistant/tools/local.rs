@@ -196,6 +196,13 @@ async fn execute_bash_exec(
     })
     .map_err(|error| augment_timeout_error(error, timeout_ms, explicit_timeout))?;
 
+    if output.timed_out {
+        return Err(augment_timeout_error(
+            output.stderr,
+            timeout_ms,
+            explicit_timeout,
+        ));
+    }
     Ok(serde_json::json!({
         "cwd": agent_path_string(&output.cwd),
         "exitCode": output.exit_code,

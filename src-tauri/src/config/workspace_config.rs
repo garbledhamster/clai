@@ -59,6 +59,10 @@ pub use crate::agents::weekly_blocks::WeeklyAllowedBlocks;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSchedule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_consent: Option<crate::agents::scripts::ScriptConsent>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -905,6 +909,8 @@ mod schedule_surface_tests {
 
     fn schedule(enabled: bool, paused: bool, kind: ScheduleKind) -> WorkspaceSchedule {
         WorkspaceSchedule {
+            condition: None,
+            condition_consent: None,
             enabled,
             paused,
             kind,

@@ -95,6 +95,9 @@ async fn claim_with_cleanup_gate(
     // Keep cleanup ownership stable until the database has decided whether
     // this session can start. The lock is released before any run is spawned.
     let guard = scheduler.lock().await;
+    if guard.script_is_running(workspace_id) {
+        return Ok(Kick::Deferred);
+    }
     if let Some(outcome) = defer_for_cleanup(&guard, workspace_id, session_id) {
         return Ok(outcome);
     }

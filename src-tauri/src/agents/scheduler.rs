@@ -113,12 +113,16 @@ impl DispatchLease {
 
     /// Whether wake, schedule changes or manual priority invalidated the claim.
     pub fn is_current(&self) -> bool {
+        self.is_current_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    pub(crate) fn is_current_at(&self, wall_ms: i64) -> bool {
         self.signal.0.lock().is_ok_and(|state| {
             self.claim_valid.load(Ordering::Relaxed)
                 && self
                     .allowed_blocks
                     .as_ref()
-                    .is_none_or(|blocks| blocks.is_allowed(chrono::Utc::now().timestamp_millis()))
+                    .is_none_or(|blocks| blocks.is_allowed(wall_ms))
                 && !state.sleeping
                 && state.generation == self.generation
                 && self
@@ -186,6 +190,7 @@ pub struct PendingCancellation {
 /// Manages agent definitions and instances. Finds the next agent
 /// that is ready to run, with one claim per workspace.
 pub struct Scheduler {
+    pub(crate) scripts: HashMap<String, super::scripts::ScriptRuntime>,
     /// Current scheduler state.
     state: SchedulerState,
 
@@ -214,6 +219,7 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             state: SchedulerState::Running,
+            scripts: HashMap::new(),
             definitions: HashMap::new(),
             instances: HashMap::new(),
             running: HashSet::new(),
@@ -378,7 +384,11 @@ impl Scheduler {
             .collect();
         // Find first ready instance
         for instance in self.instances.values_mut() {
-            if busy_workspaces.contains(&instance.workspace_id)
+            if self
+                .scripts
+                .get(&instance.workspace_id)
+                .is_some_and(|script| script.running)
+                || busy_workspaces.contains(&instance.workspace_id)
                 || (!self.enhanced.contains_key(&instance.instance_id) && !self.running.is_empty())
             {
                 continue;
@@ -468,10 +478,46 @@ impl Scheduler {
         if self.state != SchedulerState::Running {
             return None;
         }
-        self.allowed_block_waiting_reason(instance_id).or_else(|| {
-            (self.instances.get(instance_id).is_some_and(|i| i.enabled)
-                && self.waiting.contains(instance_id))
-            .then_some("Waiting for the workspace to become available.")
+        self.instances
+            .get(instance_id)
+            .and_then(|i| self.script_notice(&i.workspace_id))
+            .or_else(|| self.allowed_block_waiting_reason(instance_id))
+            .or_else(|| {
+                (self.instances.get(instance_id).is_some_and(|i| i.enabled)
+                    && self.waiting.contains(instance_id))
+                .then_some("Waiting for the workspace to become available.")
+            })
+    }
+
+    pub fn script_status(&self, workspace_id: &str) -> super::scripts::ScriptStatus {
+        self.scripts
+            .get(workspace_id)
+            .map(|s| s.status())
+            .unwrap_or_default()
+    }
+
+    pub fn script_notice(&self, workspace_id: &str) -> Option<&'static str> {
+        let script = self.scripts.get(workspace_id)?;
+        if script.pending.is_some() {
+            Some("Waiting for condition script approval in schedule settings.")
+        } else if script.running {
+            Some("Running condition script.")
+        } else if script.error.is_some() {
+            Some("Condition script failed; see schedule settings. The next check will retry.")
+        } else {
+            None
+        }
+    }
+
+    pub fn script_is_running(&self, workspace_id: &str) -> bool {
+        self.scripts.get(workspace_id).is_some_and(|s| s.running)
+    }
+
+    pub fn workspace_has_scheduled_claim(&self, workspace_id: &str) -> bool {
+        self.running.iter().any(|id| {
+            self.instances
+                .get(id)
+                .is_some_and(|i| i.workspace_id == workspace_id)
         })
     }
 

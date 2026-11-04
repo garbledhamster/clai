@@ -874,6 +874,7 @@ mod tests {
     #[test]
     fn setup_failure_requires_sandbox_exec_stderr_prefix() {
         let output = SandboxCommandOutput {
+            timed_out: false,
             cwd: PathBuf::from("/tmp"),
             exit_code: Some(1),
             success: false,

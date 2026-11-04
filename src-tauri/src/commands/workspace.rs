@@ -181,6 +181,14 @@ pub struct WorkspaceDirEntry {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "bindings.ts")]
 pub struct WorkspaceDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_condition: Option<crate::agents::scripts::ScriptConfig>,
+    #[ts(optional)]
+    pub schedule_condition_unattended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_script_status: Option<crate::agents::scripts::ScriptStatus>,
     pub workspace_id: String,
     pub kind: String,
     pub title: String,
@@ -1377,11 +1385,21 @@ async fn workspace_details(
     // Workspace-level schedule (no longer per-agent). The scheduled tick
     // invokes the default agent.
     let enabled: Option<bool> = None;
-    let schedule = state
+    let schedule_config = state
         .workspace_root(&descriptor.workspace_id)
         .and_then(|root| workspace_config::load(&root).ok())
-        .map(|config| config.schedule.surface())
+        .map(|config| config.schedule)
         .unwrap_or_default();
+    let schedule_condition = schedule_config.condition.clone();
+    let schedule_condition_unattended = Some(schedule_config.condition_consent.is_some());
+    let schedule = schedule_config.surface();
+    let schedule_script_status = Some(
+        state
+            .scheduler
+            .lock()
+            .await
+            .script_status(&descriptor.workspace_id),
+    );
     let (next_run_in_seconds, schedule_blocked_reason, schedule_waiting_reason) = {
         let scheduler = state.scheduler.lock().await;
         let reason = scheduler
@@ -1403,6 +1421,9 @@ async fn workspace_details(
     };
 
     Ok(WorkspaceDetails {
+        schedule_condition,
+        schedule_condition_unattended,
+        schedule_script_status,
         workspace_id: descriptor.workspace_id,
         kind: descriptor.kind,
         title: descriptor.title,
@@ -3114,14 +3135,46 @@ pub async fn workspace_set_schedule(
     workspace_id: String,
     kind: Option<crate::config::workspace_config::ScheduleKind>,
     allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
+    condition: Option<crate::agents::scripts::ScriptConfig>,
+    unattended: Option<bool>,
+    unattended_approval_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let workspace_id = resolve_workspace_id(state.inner(), Some(workspace_id))?;
+    let confirmed = state
+        .scheduler
+        .lock()
+        .await
+        .scripts
+        .get(&workspace_id)
+        .and_then(|runtime| runtime.confirmed.as_ref())
+        .filter(|(id, _)| Some(id) == unattended_approval_id.as_ref())
+        .map(|(_, snapshot)| snapshot.clone());
     crate::agents::init::update_schedule_and_reconcile(
         state.inner(),
         &workspace_id,
         true,
         |config| {
+            if let Some(script) = &condition {
+                script.validate()?;
+                if kind.as_ref().is_some_and(|kind| {
+                    !matches!(
+                        kind,
+                        crate::config::workspace_config::ScheduleKind::EnhancedInterval { .. }
+                            | crate::config::workspace_config::ScheduleKind::EnhancedCron { .. }
+                    )
+                }) {
+                    return Err("Condition scripts require enhanced scheduling.".into());
+                }
+            }
+            config.schedule.condition_consent = crate::agents::scripts::saved_consent(
+                state.inner(),
+                config,
+                &condition,
+                unattended,
+                confirmed.as_ref(),
+            )?;
+            config.schedule.condition = condition;
             config
                 .schedule
                 .set_configuration(kind, allowed_blocks, now_millis())?;
