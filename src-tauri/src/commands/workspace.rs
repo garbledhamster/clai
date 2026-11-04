@@ -183,6 +183,26 @@ pub struct WorkspaceDirEntry {
 pub struct WorkspaceDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub schedule_before: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_after: Option<crate::agents::scripts::ScriptConfig>,
+    #[ts(optional)]
+    pub schedule_before_unattended: Option<bool>,
+    #[ts(optional)]
+    pub schedule_after_unattended: Option<bool>,
+    #[ts(optional)]
+    pub schedule_before_status: Option<crate::agents::scripts::ScriptStatus>,
+    #[ts(optional)]
+    pub schedule_after_status: Option<crate::agents::scripts::ScriptStatus>,
+    #[ts(optional)]
+    pub schedule_cleanup_pending: Option<bool>,
+    #[ts(optional)]
+    pub schedule_cleanup_id: Option<String>,
+    #[ts(optional)]
+    pub schedule_cleanup_interrupted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub schedule_condition: Option<crate::agents::scripts::ScriptConfig>,
     #[ts(optional)]
     pub schedule_condition_unattended: Option<bool>,
@@ -1390,6 +1410,37 @@ async fn workspace_details(
         .and_then(|root| workspace_config::load(&root).ok())
         .map(|config| config.schedule)
         .unwrap_or_default();
+    let schedule_before = schedule_config.before.clone();
+    let schedule_after = schedule_config.after.clone();
+    let schedule_before_unattended = Some(schedule_config.before_consent.is_some());
+    let schedule_after_unattended = Some(schedule_config.after_consent.is_some());
+    let schedule_cleanup_pending = Some(schedule_config.cleanup_intent.is_some());
+    let schedule_cleanup_id = schedule_config
+        .cleanup_intent
+        .as_ref()
+        .map(|intent| intent.id.clone());
+    let schedule_cleanup_interrupted = Some(
+        state
+            .scheduler
+            .lock()
+            .await
+            .scripts
+            .get(&descriptor.workspace_id)
+            .is_some_and(|runtime| runtime.cleanup_interrupted),
+    );
+    let (schedule_before_status, schedule_after_status) = {
+        let scheduler = state.scheduler.lock().await;
+        (
+            Some(scheduler.script_status_for(
+                &descriptor.workspace_id,
+                crate::agents::scripts::ScriptPhase::Before,
+            )),
+            Some(scheduler.script_status_for(
+                &descriptor.workspace_id,
+                crate::agents::scripts::ScriptPhase::After,
+            )),
+        )
+    };
     let schedule_condition = schedule_config.condition.clone();
     let schedule_condition_unattended = Some(schedule_config.condition_consent.is_some());
     let schedule = schedule_config.surface();
@@ -1413,14 +1464,27 @@ async fn workspace_details(
             }
             _ => None,
         };
-        let waiting = default_workspace_agent_id
-            .as_deref()
-            .and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
+        let waiting = scheduler
+            .script_notice(&descriptor.workspace_id)
+            .or_else(|| {
+                default_workspace_agent_id
+                    .as_deref()
+                    .and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
+            })
             .map(str::to_owned);
         (next, reason, waiting)
     };
 
     Ok(WorkspaceDetails {
+        schedule_before,
+        schedule_after,
+        schedule_before_unattended,
+        schedule_after_unattended,
+        schedule_before_status,
+        schedule_after_status,
+        schedule_cleanup_pending,
+        schedule_cleanup_id,
+        schedule_cleanup_interrupted,
         schedule_condition,
         schedule_condition_unattended,
         schedule_script_status,
@@ -3032,6 +3096,12 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
     for locator in locators {
         let id = locator.id.clone();
         let workspace_pool = state.workspace_db(&id).await?;
+        let script_notice = state
+            .scheduler
+            .lock()
+            .await
+            .script_notice(&id)
+            .map(str::to_owned);
         // No `config.json` access in this loop: everything a rail card needs
         // is already on the in-memory locator. Reaching for the config here
         // cost five full read+parse cycles per workspace on every 5s poll.
@@ -3064,7 +3134,8 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
             schedule_enabled: schedule.enabled,
             schedule_paused: schedule.paused,
             schedule_blocked_reason,
-            schedule_waiting_reason: scheduler_waiting.get(&locator.default_agent_id).cloned(),
+            schedule_waiting_reason: script_notice
+                .or_else(|| scheduler_waiting.get(&locator.default_agent_id).cloned()),
             schedule_kind: schedule.kind,
             schedule_allowed_blocks: schedule.allowed_blocks,
             next_run_in_seconds,
@@ -3138,24 +3209,37 @@ pub async fn workspace_set_schedule(
     condition: Option<crate::agents::scripts::ScriptConfig>,
     unattended: Option<bool>,
     unattended_approval_id: Option<String>,
+    before: Option<crate::agents::scripts::ScriptConfig>,
+    after: Option<crate::agents::scripts::ScriptConfig>,
+    before_unattended: Option<bool>,
+    after_unattended: Option<bool>,
+    before_unattended_approval_id: Option<String>,
+    after_unattended_approval_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let workspace_id = resolve_workspace_id(state.inner(), Some(workspace_id))?;
-    let confirmed = state
-        .scheduler
-        .lock()
-        .await
-        .scripts
-        .get(&workspace_id)
-        .and_then(|runtime| runtime.confirmed.as_ref())
-        .filter(|(id, _)| Some(id) == unattended_approval_id.as_ref())
-        .map(|(_, snapshot)| snapshot.clone());
+    use crate::agents::scripts::ScriptPhase;
+    let (confirmed, before_confirmed, after_confirmed) = {
+        let scheduler = state.scheduler.lock().await;
+        let runtime = scheduler.scripts.get(&workspace_id);
+        (
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::Condition, unattended_approval_id.as_ref())
+            }),
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::Before, before_unattended_approval_id.as_ref())
+            }),
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::After, after_unattended_approval_id.as_ref())
+            }),
+        )
+    };
     crate::agents::init::update_schedule_and_reconcile(
         state.inner(),
         &workspace_id,
         true,
         |config| {
-            if let Some(script) = &condition {
+            for script in [&condition, &before, &after].into_iter().flatten() {
                 script.validate()?;
                 if kind.as_ref().is_some_and(|kind| {
                     !matches!(
@@ -3174,7 +3258,25 @@ pub async fn workspace_set_schedule(
                 unattended,
                 confirmed.as_ref(),
             )?;
+            config.schedule.before_consent = crate::agents::scripts::saved_phase_consent(
+                state.inner(),
+                config,
+                ScriptPhase::Before,
+                &before,
+                before_unattended,
+                before_confirmed.as_ref(),
+            )?;
+            config.schedule.after_consent = crate::agents::scripts::saved_phase_consent(
+                state.inner(),
+                config,
+                ScriptPhase::After,
+                &after,
+                after_unattended,
+                after_confirmed.as_ref(),
+            )?;
             config.schedule.condition = condition;
+            config.schedule.before = before;
+            config.schedule.after = after;
             config
                 .schedule
                 .set_configuration(kind, allowed_blocks, now_millis())?;

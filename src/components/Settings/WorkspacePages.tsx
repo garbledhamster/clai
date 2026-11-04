@@ -10,7 +10,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { setWorkspaceTitle } from '../../workspace/client';
 import IntervalSelect from './IntervalSelect';
 import WeeklyBlockGrid from './WeeklyBlockGrid';
-import ScheduleCondition, { conditionError } from './ScheduleCondition';
+import ScheduleCondition, { scriptError } from './ScheduleCondition';
 import { formatNextRun } from '../../fleet/workspaceStatus';
 import { Switch } from './ListEditors';
 import { useReportDirty, type SectionHandle } from './sectionHandle';
@@ -185,6 +185,46 @@ const formatRelative = (ms: number): string => {
   return day < 30 ? `in ${day}d` : '';
 };
 
+// Each phase follows only its own saved configuration. Status polling and
+// approval changes in another phase must not replace an unsaved script draft.
+const useScheduleScriptDraft = (savedValue: ScriptConfig | null | undefined, savedUnattended: boolean | undefined) => {
+  const saved = JSON.stringify(savedValue ?? null);
+  const [value, setValue] = useState<ScriptConfig | null>(() => savedValue ?? null);
+  const [unattended, setUnattended] = useState(!!savedUnattended);
+  const [approvalId, setApprovalId] = useState<string | null>(null);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- only this phase's persisted configuration changed.
+    setValue(JSON.parse(saved) as ScriptConfig | null);
+  }, [saved]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- consent follows the exact saved script; polling preserves draft approval.
+    setUnattended(JSON.stringify(value) === saved && !!savedUnattended);
+    setApprovalId(null);
+  }, [value, saved, savedUnattended]);
+
+  return {
+    value, unattended, approvalId,
+    dirty: JSON.stringify(value) !== saved || unattended !== !!savedUnattended || approvalId !== null,
+    change: (next: ScriptConfig | null) => {
+      setValue(next);
+      setUnattended(false);
+      setApprovalId(null);
+    },
+    changeUnattended: (checked: boolean, id?: string) => {
+      setUnattended(checked);
+      setApprovalId(id ?? null);
+    },
+    authorizeSaved: () => {
+      if (JSON.stringify(value) === saved) {
+        setUnattended(true);
+        setApprovalId(null);
+      }
+    },
+  };
+};
+
 export const SchedulePage = ({
   ref,
   workspaceId,
@@ -198,9 +238,9 @@ export const SchedulePage = ({
   // Pause/Resume and Run now are immediate commands with their own busy state.
   const [slots, setSlots] = useState<number[]>(() => details?.scheduleAllowedBlocks?.slots ?? []);
   const [blockTimezone, setBlockTimezone] = useState(() => details?.scheduleAllowedBlocks?.timezone ?? 'UTC');
-  const [condition, setCondition] = useState<ScriptConfig | null>(() => details?.scheduleCondition ?? null);
-  const [unattended, setUnattended] = useState(!!details?.scheduleConditionUnattended);
-  const [unattendedApprovalId, setUnattendedApprovalId] = useState<string | null>(null);
+  const condition = useScheduleScriptDraft(details?.scheduleCondition, details?.scheduleConditionUnattended);
+  const before = useScheduleScriptDraft(details?.scheduleBefore, details?.scheduleBeforeUnattended);
+  const after = useScheduleScriptDraft(details?.scheduleAfter, details?.scheduleAfterUnattended);
   const [commandBusy, setCommandBusy] = useState(false);
   const busy = saving || commandBusy;
   const [error, setError] = useState<string | null>(null);
@@ -225,8 +265,6 @@ export const SchedulePage = ({
   // details every 5 s, and a same-value refetch must not discard the draft.
   const savedKind = JSON.stringify(details?.scheduleKind ?? null);
   const savedBlocks = JSON.stringify(details?.scheduleAllowedBlocks ?? null);
-  const savedCondition = JSON.stringify(details?.scheduleCondition ?? null);
-  const savedUnattended = !!details?.scheduleConditionUnattended;
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs configuration only when saved values change; status polling preserves the draft.
     setEnabled(!!details?.scheduleEnabled);
@@ -234,20 +272,7 @@ export const SchedulePage = ({
     const blocks = JSON.parse(savedBlocks);
     setSlots(blocks?.slots ?? []);
     setBlockTimezone(blocks?.timezone ?? 'UTC');
-    setCondition(JSON.parse(savedCondition) as ScriptConfig | null);
-  }, [details?.scheduleEnabled, savedKind, savedBlocks, savedCondition]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- adopt saved consent only for the same condition; status polling preserves draft approval.
-    setUnattended(JSON.stringify(condition) === savedCondition && savedUnattended);
-    setUnattendedApprovalId(null);
-  }, [condition, savedCondition, savedUnattended]);
-
-  const changeCondition = (next: ScriptConfig | null) => {
-    setCondition(next);
-    setUnattended(false);
-    setUnattendedApprovalId(null);
-  };
+  }, [details?.scheduleEnabled, savedKind, savedBlocks]);
 
   // Next fire times for the cron being typed, so it can be checked before Save.
   useEffect(() => {
@@ -284,7 +309,7 @@ export const SchedulePage = ({
     enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)) ||
       JSON.stringify(slots) !== JSON.stringify(details?.scheduleAllowedBlocks?.slots ?? []) ||
       (draft.type === 'enhancedInterval' && blockTimezone !== (details?.scheduleAllowedBlocks?.timezone ?? 'UTC')) ||
-      (enhanced && (JSON.stringify(condition) !== savedCondition || unattended !== savedUnattended || unattendedApprovalId !== null)),
+      (enhanced && (condition.dirty || before.dirty || after.dirty)),
     onDirtyChange
   );
 
@@ -300,7 +325,7 @@ export const SchedulePage = ({
   };
 
   const build = useCallback((): { ok: true; kind: ScheduleKind | null } | { ok: false; error: string } => {
-    const problem = enhanced ? conditionError(condition) : null;
+    const problem = enhanced ? scriptError(condition.value) || scriptError(before.value, 'before') || scriptError(after.value, 'after') : null;
     if (problem) return { ok: false, error: problem };
     if (!enabled) return { ok: true, kind: null };
     if (draft.type === 'enhancedInterval') {
@@ -322,7 +347,7 @@ export const SchedulePage = ({
     if (!expression) return { ok: false, error: 'Cron expression is required.' };
     if (!timezone) return { ok: false, error: 'Timezone is required.' };
     return { ok: true, kind: { type: draft.type, expression, timezone } as ScheduleKind };
-  }, [enabled, draft, enhanced, condition]);
+  }, [enabled, draft, enhanced, condition.value, before.value, after.value]);
 
   const runCommand = useCallback(async (call: () => Promise<unknown>, fallback: string) => {
     setCommandBusy(true);
@@ -352,7 +377,9 @@ export const SchedulePage = ({
       try {
         await invoke('workspace_set_schedule', { workspaceId, kind: built.kind,
           ...(enhanced ? {
-            condition, unattended: !!condition && unattended, unattendedApprovalId,
+            condition: condition.value, unattended: !!condition.value && condition.unattended, unattendedApprovalId: condition.approvalId,
+            before: before.value, beforeUnattended: !!before.value && before.unattended, beforeUnattendedApprovalId: before.approvalId,
+            after: after.value, afterUnattended: !!after.value && after.unattended, afterUnattendedApprovalId: after.approvalId,
             allowedBlocks: { timezone: draft.type === 'enhancedCron' ? draft.timezone.trim() : blockTimezone.trim(), slots },
           } : {}),
         });
@@ -552,25 +579,28 @@ export const SchedulePage = ({
                   Not scheduled. The main agent runs when you message it.
                 </p>
               ) : null}
+              {details?.scheduleCleanupPending && <p className={form.hint} role="status">Cleanup pending. This workspace waits until the outstanding cleanup finishes or is explicitly skipped. Preparation or the agent may still be running; review the After script status below for approval requests or errors. A settings test does not complete this cleanup.</p>}
               {(blockedReason || (!paused && waitingReason)) && <p className={form.lede}>{blockedReason || waitingReason}</p>}
               {details?.scheduleAllowedBlocks && <p className={form.hint}>Saved timezone: {details.scheduleAllowedBlocks.timezone}</p>}
               {details?.nextRunInSeconds != null && savedOn && !paused && !blockedReason && <p className={form.hint}>Next eligible check: {formatNextRun(details.nextRunInSeconds)}</p>}
             </div>
           </section>
 
-          {(enhanced || details?.scheduleScriptStatus?.pending || details?.scheduleScriptStatus?.result || details?.scheduleScriptStatus?.error) && (
-            <ScheduleCondition workspaceId={workspaceId} value={enhanced ? condition : null} onChange={changeCondition}
-              unattended={unattended} onUnattendedChange={(checked, approvalId) => {
-                setUnattended(checked);
-                setUnattendedApprovalId(approvalId ?? null);
-              }} onScheduledAuthorize={() => {
-                if (JSON.stringify(condition) === savedCondition) {
-                  setUnattended(true);
-                  setUnattendedApprovalId(null);
-                }
-              }}
-              status={details?.scheduleScriptStatus} disabled={busy || !enhanced} onDetailsRefresh={onDetailsRefresh} />
-          )}
+          {([
+            { phase: 'condition', script: condition, status: details?.scheduleScriptStatus },
+            { phase: 'before', script: before, status: details?.scheduleBeforeStatus },
+            { phase: 'after', script: after, status: details?.scheduleAfterStatus },
+          ] as const).map(({ phase, script, status }) => (enhanced || status?.pending || status?.result || status?.error || status?.running || (phase === 'after' && details?.scheduleCleanupPending)) && (
+            <ScheduleCondition key={phase} phase={phase} workspaceId={workspaceId}
+              value={enhanced ? script.value : null} onChange={script.change}
+              unattended={script.unattended} onUnattendedChange={script.changeUnattended}
+              onScheduledAuthorize={script.authorizeSaved} status={status}
+              disabled={busy || !enhanced} approvalDisabled={busy || (!enhanced && phase !== 'after')}
+              previewBlocked={!!details?.scheduleCleanupPending}
+              cleanupIntentId={phase === 'after' ? details?.scheduleCleanupId : undefined}
+              cleanupInterrupted={phase === 'after' && !!details?.scheduleCleanupInterrupted}
+              onDetailsRefresh={onDetailsRefresh} />
+          ))}
 
           {(draft.type === 'cron' || draft.type === 'enhancedCron') && enabled && (
             <section className={form.panel}>

@@ -132,6 +132,17 @@ async fn dispatch(
         .await?
         .ok_or_else(|| format!("Assistant session not found: {}", session_id))?;
     let app_state = deps.app.state::<AppState>();
+    // A manual request can reach dispatch during startup before schedule
+    // population. Restore durable cleanup ownership before any claim.
+    let root = app_state
+        .workspace_root(&deps.workspace_id)
+        .ok_or("Workspace not found.")?;
+    let workspace =
+        crate::config::workspace_config::load(&root).map_err(|error| error.to_string())?;
+    crate::agents::cleanup_recovery::restore_runtime(
+        &mut *app_state.scheduler.lock().await,
+        &workspace,
+    );
     // Queued manual input revokes an uncommitted scheduled claim. Committed
     // model work finishes normally; its end dispatches the pending request.
     if repository::has_pending_user_message(&deps.pool, session_id).await? {

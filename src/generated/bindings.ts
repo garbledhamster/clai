@@ -491,7 +491,7 @@ export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { 
  */
 timezone: string, };
 
-export type ScriptApproval = { id: string, purpose: string, content: string, interpreter: string, timeoutSeconds: number, access: string, };
+export type ScriptApproval = { phase?: ScriptPhase, id: string, purpose: string, content: string, interpreter: string, timeoutSeconds: number, access: string, };
 
 export type ScriptConfig = { source: ScriptSource, 
 /**
@@ -499,7 +499,13 @@ export type ScriptConfig = { source: ScriptSource,
  */
 interpreter: string, timeoutSeconds: number, };
 
-export type ScriptResult = { stdout: string, stderr: string, exitCode: number | null, durationMs: bigint, timedOut: boolean, error: string | null, };
+export type ScriptPhase = "condition" | "before" | "after";
+
+export type ScriptResult = { 
+/**
+ * A sandbox process was launched; distinguishes failed setup from partial preparation.
+ */
+started?: boolean, stdout: string, stderr: string, exitCode: number | null, durationMs: bigint, timedOut: boolean, error: string | null, };
 
 export type ScriptSource = { "type": "inline", content: string, } | { "type": "file", path: string, };
 
@@ -648,7 +654,7 @@ export type WorkspaceAgentSummary = { id: string, displayName: string, isDefault
 
 export type WorkspaceAgentUpdateRequest = { workspaceId: string, agentId: string, name: string, description: string, selectedSkillIds: Array<string>, selectedMcpServerIds: Array<string>, providerConnectionIds: Array<string>, execution: ExecutionCapabilityConfig, enabled: boolean, };
 
-export type WorkspaceDetails = { scheduleCondition?: ScriptConfig, scheduleScriptStatus?: ScriptStatus, workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
+export type WorkspaceDetails = { scheduleBefore?: ScriptConfig, scheduleAfter?: ScriptConfig, scheduleBeforeUnattended?: boolean, scheduleAfterUnattended?: boolean, scheduleBeforeStatus?: ScriptStatus, scheduleAfterStatus?: ScriptStatus, scheduleCleanupPending?: boolean, scheduleCleanupId?: string, scheduleCleanupInterrupted?: boolean, scheduleCondition?: ScriptConfig, scheduleConditionUnattended?: boolean, scheduleScriptStatus?: ScriptStatus, workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
 /**
  * Attached-but-toggled-off MCP servers for the workspace conversation,
  * sourced from the manager row's `disabled` ref flags in the workspace

@@ -148,6 +148,7 @@ pub fn start_agent_runner(app_handle: AppHandle, scheduler: SharedScheduler) {
         loop {
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
             retry_pending_cancellations(&cleanup_app, &cleanup_scheduler).await;
+            super::cleanup_recovery::poll(&cleanup_app).await;
         }
     });
 
@@ -401,16 +402,43 @@ async fn run_claimed_instance(
                         |event| {
                             let _ = emit_event(app_handle, &workspace_id, &session, None, event);
                         },
-                        || {
-                            run_scheduled_agent(
-                                app_handle,
-                                &agent_config.workspace_id,
-                                &workspace_pool,
-                                &session,
-                                &connection,
-                                run.clone(),
-                                registration.token(),
-                            )
+                        || async {
+                            let start = || {
+                                run_scheduled_agent(
+                                    app_handle,
+                                    &agent_config.workspace_id,
+                                    &workspace_pool,
+                                    &session,
+                                    &connection,
+                                    run.clone(),
+                                    registration.token(),
+                                )
+                            };
+                            if enhanced && !manual {
+                                if let Some(lease) = dispatch_lease.as_ref() {
+                                    return super::hooks::run_prepared(
+                                        state.inner(),
+                                        &workspace_id,
+                                        &workspace_pool,
+                                        &session.id,
+                                        &run.id,
+                                        lease,
+                                        registration.token(),
+                                        |event| {
+                                            let _ = emit_event(
+                                                app_handle,
+                                                &workspace_id,
+                                                &session,
+                                                None,
+                                                event,
+                                            );
+                                        },
+                                        start,
+                                    )
+                                    .await;
+                                }
+                            }
+                            start().await
                         },
                     )
                     .await
@@ -444,6 +472,13 @@ async fn run_claimed_instance(
             "Failed to persist run completion to workspace config");
     }
 
+    // Engine completion may have deferred manual input behind cleanup ownership.
+    for pending_session in crate::assistant::signals::sessions_with_pending(&workspace_pool)
+        .await
+        .map_err(RunnerError::AssistantPersistence)?
+    {
+        kick_after_abandon(app_handle, &workspace_id, &workspace_pool, &pending_session).await;
+    }
     Ok(())
 }
 

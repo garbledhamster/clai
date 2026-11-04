@@ -69,6 +69,9 @@ pub struct DispatchLease {
 }
 
 impl DispatchLease {
+    pub(crate) fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Relaxed)
+    }
     /// Commit the first provider operation while ordered with sleep and clock events.
     pub fn try_commit(&self) -> bool {
         self.try_commit_with_clock(|| chrono::Utc::now().timestamp_millis())
@@ -387,7 +390,7 @@ impl Scheduler {
             if self
                 .scripts
                 .get(&instance.workspace_id)
-                .is_some_and(|script| script.running)
+                .is_some_and(|script| script.running || script.cleanup_owned)
                 || busy_workspaces.contains(&instance.workspace_id)
                 || (!self.enhanced.contains_key(&instance.instance_id) && !self.running.is_empty())
             {
@@ -492,25 +495,56 @@ impl Scheduler {
     pub fn script_status(&self, workspace_id: &str) -> super::scripts::ScriptStatus {
         self.scripts
             .get(workspace_id)
-            .map(|s| s.status())
+            .map(|s| s.status_for(super::scripts::ScriptPhase::Condition))
+            .unwrap_or_default()
+    }
+
+    pub fn script_status_for(
+        &self,
+        workspace_id: &str,
+        phase: super::scripts::ScriptPhase,
+    ) -> super::scripts::ScriptStatus {
+        self.scripts
+            .get(workspace_id)
+            .map(|runtime| runtime.status_for(phase))
             .unwrap_or_default()
     }
 
     pub fn script_notice(&self, workspace_id: &str) -> Option<&'static str> {
         let script = self.scripts.get(workspace_id)?;
-        if script.pending.is_some() {
+        if script.cleanup_interrupted {
+            Some("Interrupted cleanup requires attention in schedule settings.")
+        } else if script
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.approval.phase == Some(super::scripts::ScriptPhase::After))
+        {
+            Some("Waiting for after-script approval in schedule settings.")
+        } else if script
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.approval.phase == Some(super::scripts::ScriptPhase::Before))
+        {
+            Some("Waiting for before-script approval in schedule settings.")
+        } else if script.pending.is_some() {
             Some("Waiting for condition script approval in schedule settings.")
         } else if script.running {
-            Some("Running condition script.")
+            Some(match script.phase {
+                super::scripts::ScriptPhase::Condition => "Running condition script.",
+                super::scripts::ScriptPhase::Before => "Running before script.",
+                super::scripts::ScriptPhase::After => "Running after script.",
+            })
         } else if script.error.is_some() {
-            Some("Condition script failed; see schedule settings. The next check will retry.")
+            Some("Schedule script failed; see schedule settings. Future checks continue.")
         } else {
             None
         }
     }
 
     pub fn script_is_running(&self, workspace_id: &str) -> bool {
-        self.scripts.get(workspace_id).is_some_and(|s| s.running)
+        self.scripts
+            .get(workspace_id)
+            .is_some_and(|s| s.running || s.cleanup_owned)
     }
 
     pub fn workspace_has_scheduled_claim(&self, workspace_id: &str) -> bool {

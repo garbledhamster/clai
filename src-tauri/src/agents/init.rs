@@ -81,6 +81,7 @@ pub fn apply_workspace_schedule(
     sched: &mut crate::agents::scheduler::Scheduler,
     config: &crate::config::WorkspaceConfig,
 ) {
+    super::cleanup_recovery::restore_runtime(sched, config);
     // The workspace schedule fires the workspace's own Main agent. A shared
     // definition never becomes a scheduler key: the same teammate assigned in
     // five workspaces would collide on one instance.

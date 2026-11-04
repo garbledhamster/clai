@@ -2,6 +2,7 @@
 //! Script consent never changes the Main agent's execution policy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
@@ -54,9 +55,53 @@ impl ScriptConfig {
         }
         interpreter_flag(&self.interpreter)?;
         if matches!(&self.source, ScriptSource::File { path } if path.trim().is_empty()) {
-            return Err("Select a condition script file.".into());
+            return Err("Select a script file.".into());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "bindings.ts")]
+pub enum ScriptPhase {
+    #[default]
+    Condition,
+    Before,
+    After,
+}
+
+impl ScriptPhase {
+    pub fn script(
+        self,
+        schedule: &crate::config::workspace_config::WorkspaceSchedule,
+    ) -> Option<&ScriptConfig> {
+        match self {
+            Self::Condition => schedule.condition.as_ref(),
+            Self::Before => schedule.before.as_ref(),
+            Self::After => schedule.after.as_ref(),
+        }
+    }
+    pub fn consent(
+        self,
+        schedule: &crate::config::workspace_config::WorkspaceSchedule,
+    ) -> Option<&ScriptConsent> {
+        match self {
+            Self::Condition => schedule.condition_consent.as_ref(),
+            Self::Before => schedule.before_consent.as_ref(),
+            Self::After => schedule.after_consent.as_ref(),
+        }
+    }
+    pub fn set_consent(
+        self,
+        schedule: &mut crate::config::workspace_config::WorkspaceSchedule,
+        consent: Option<ScriptConsent>,
+    ) {
+        match self {
+            Self::Condition => schedule.condition_consent = consent,
+            Self::Before => schedule.before_consent = consent,
+            Self::After => schedule.after_consent = consent,
+        }
     }
 }
 
@@ -64,6 +109,9 @@ impl ScriptConfig {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "bindings.ts")]
 pub struct ScriptApproval {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub phase: Option<ScriptPhase>,
     pub id: String,
     pub purpose: String,
     pub content: String,
@@ -72,10 +120,14 @@ pub struct ScriptApproval {
     pub access: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, TS)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "bindings.ts")]
 pub struct ScriptResult {
+    /// A sandbox process was launched; distinguishes failed setup from partial preparation.
+    #[serde(default)]
+    #[ts(optional)]
+    pub started: Option<bool>,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
@@ -137,6 +189,14 @@ pub(crate) struct ScriptRuntime {
     pub result: Option<ScriptResult>,
     pub error: Option<String>,
     pub confirmed: Option<(String, CapturedScript)>,
+    pub confirmed_hooks: HashMap<ScriptPhase, (String, CapturedScript)>,
+    pub phase: ScriptPhase,
+    pub results: HashMap<ScriptPhase, ScriptResult>,
+    /// Holds manual dispatch until preparation/model and required cleanup finish.
+    pub cleanup_owned: bool,
+    pub cleanup_interrupted: bool,
+    /// One detached recovery task, including its approval wait, per workspace.
+    pub recovery_active: bool,
     /// Includes Run now tests, which do not create a model run.
     pub running: bool,
 }
@@ -150,13 +210,54 @@ impl ScriptRuntime {
             running: self.running,
         }
     }
+    pub fn status_for(&self, phase: ScriptPhase) -> ScriptStatus {
+        if self.phase == phase {
+            return self.status();
+        }
+        let result = self.results.get(&phase).cloned();
+        ScriptStatus {
+            error: result.as_ref().and_then(|r| r.error.clone()),
+            result,
+            pending: None,
+            running: false,
+        }
+    }
+    pub fn record_result(&mut self, phase: ScriptPhase, result: ScriptResult) {
+        self.phase = phase;
+        self.running = false;
+        self.error = result.error.clone();
+        self.result = Some(result.clone());
+        self.results.insert(phase, result);
+    }
+    pub fn confirmed_for(&self, phase: ScriptPhase, id: Option<&String>) -> Option<CapturedScript> {
+        let value = if phase == ScriptPhase::Condition {
+            self.confirmed.as_ref()
+        } else {
+            self.confirmed_hooks.get(&phase)
+        };
+        value
+            .filter(|(key, _)| Some(key) == id)
+            .map(|(_, value)| value.clone())
+    }
     pub fn request(
         &mut self,
         snapshot: CapturedScript,
         purpose: &str,
         decision: Option<oneshot::Sender<Option<CapturedScript>>>,
     ) -> ScriptApproval {
+        self.request_for(snapshot, purpose, ScriptPhase::Condition, decision)
+    }
+    pub fn request_for(
+        &mut self,
+        snapshot: CapturedScript,
+        purpose: &str,
+        phase: ScriptPhase,
+        decision: Option<oneshot::Sender<Option<CapturedScript>>>,
+    ) -> ScriptApproval {
+        self.phase = phase;
+        self.result = self.results.get(&phase).cloned();
         let approval = ScriptApproval {
+            phase: Some(phase),
             id: uuid::Uuid::new_v4().to_string(),
             purpose: purpose.into(),
             content: snapshot.content.clone(),
@@ -307,26 +408,42 @@ pub(crate) fn saved_consent(
     unattended: Option<bool>,
     confirmed: Option<&CapturedScript>,
 ) -> Result<Option<ScriptConsent>, String> {
-    if unattended == Some(false) || condition.is_none() {
+    saved_phase_consent(
+        state,
+        workspace,
+        ScriptPhase::Condition,
+        condition,
+        unattended,
+        confirmed,
+    )
+}
+
+pub(crate) fn saved_phase_consent(
+    state: &AppState,
+    workspace: &crate::config::WorkspaceConfig,
+    phase: ScriptPhase,
+    script: &Option<ScriptConfig>,
+    unattended: Option<bool>,
+    confirmed: Option<&CapturedScript>,
+) -> Result<Option<ScriptConsent>, String> {
+    if unattended == Some(false) || script.is_none() {
         return Ok(None);
     }
     if unattended.is_none() {
-        return Ok((workspace.schedule.condition == *condition)
-            .then(|| workspace.schedule.condition_consent.clone())
+        return Ok((phase.script(&workspace.schedule) == script.as_ref())
+            .then(|| phase.consent(&workspace.schedule).cloned())
             .flatten());
     }
-    let current = capture_for_config(state, workspace, condition.as_ref().unwrap())?;
+    let current = capture_for_config(state, workspace, script.as_ref().unwrap())?;
     let approved = confirmed.is_some_and(|snapshot| {
         snapshot.config == current.config && snapshot.same_approval(&current)
-    }) || workspace
-        .schedule
-        .condition_consent
-        .as_ref()
+    }) || phase
+        .consent(&workspace.schedule)
         .is_some_and(|consent| consent.allows(&current));
     if !approved {
-        return Err(
-            "Review and explicitly approve this condition for unattended execution.".into(),
-        );
+        return Err(format!(
+            "Review and explicitly approve the {phase:?} script for unattended execution."
+        ));
     }
     Ok(Some(current.consent()))
 }
@@ -517,11 +634,12 @@ fn script_result(
             } else {
                 match output.exit_code {
                     Some(0 | 1) => None,
-                    Some(code) => Some(format!("Condition exited with status {code}.")),
-                    None => Some("Condition terminated without an exit status (signal).".into()),
+                    Some(code) => Some(format!("Script exited with status {code}.")),
+                    None => Some("Script terminated without an exit status (signal).".into()),
                 }
             };
             ScriptResult {
+                started: Some(true),
                 stdout: output.stdout,
                 stderr: output.stderr,
                 exit_code: output.exit_code,
@@ -536,6 +654,15 @@ fn script_result(
             error: Some(error),
             ..Default::default()
         },
+    }
+}
+
+pub(crate) fn normalize_result(phase: ScriptPhase, result: &mut ScriptResult) {
+    if phase != ScriptPhase::Condition && result.error.is_none() && result.exit_code != Some(0) {
+        result.error = Some(format!(
+            "{phase:?} script failed with exit status {:?}.",
+            result.exit_code
+        ));
     }
 }
 
@@ -654,21 +781,19 @@ where
             snapshot = current;
             continue; // One replacement request, never a backlog per interval.
         }
-        state
-            .scheduler
-            .lock()
-            .await
-            .scripts
-            .entry(workspace_id.into())
-            .or_default()
-            .running = true;
+        {
+            let mut scheduler = state.scheduler.lock().await;
+            let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
+            runtime.phase = ScriptPhase::Condition;
+            runtime.result = runtime.results.get(&ScriptPhase::Condition).cloned();
+            runtime.error = None;
+            runtime.running = true;
+        }
         let result = execute(snapshot).await;
         {
             let mut scheduler = state.scheduler.lock().await;
             let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
-            runtime.running = false;
-            runtime.error = result.error.clone();
-            runtime.result = Some(result.clone());
+            runtime.record_result(ScriptPhase::Condition, result.clone());
         }
         if !condition_eligible(pool, session_id, lease, clock()).await? {
             return Ok(ConditionOutcome::Abandoned);
@@ -1605,5 +1730,580 @@ mod tests {
         assert!(!first.same_approval(
             &capture_with_execution(dir.path(), &restricted, &inline("exit 0")).unwrap()
         ));
+    }
+
+    async fn hook_fixture(before: bool, before_consent: bool, after_consent: bool) -> Fixture {
+        let f = fixture(None).await;
+        let prep = before.then(|| inline("prepare"));
+        let cleanup = inline("cleanup");
+        let prep_consent = prep
+            .as_ref()
+            .filter(|_| before_consent)
+            .map(|script| capture(&f.state, "ws", script).unwrap().consent());
+        let cleanup_consent =
+            after_consent.then(|| capture(&f.state, "ws", &cleanup).unwrap().consent());
+        f.state
+            .update_workspace_config("ws", |workspace| {
+                workspace.schedule.before = prep;
+                workspace.schedule.after = Some(cleanup);
+                workspace.schedule.before_consent = prep_consent;
+                workspace.schedule.after_consent = cleanup_consent;
+                Ok(())
+            })
+            .unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn preparation_outcomes_cleanup_partial_work_and_never_call_model_on_failure() {
+        for (code, started, timed_out, expected_agent, expected_cleanup) in [
+            (Some(0), true, false, 1, 1),
+            (Some(1), true, false, 0, 1),
+            (Some(2), true, false, 0, 1),
+            (None, true, true, 0, 1),
+            (None, true, false, 0, 1),
+            (None, false, false, 0, 0),
+        ] {
+            let f = hook_fixture(true, true, true).await;
+            let models = AtomicUsize::new(0);
+            let cleanups = AtomicUsize::new(0);
+            crate::agents::hooks::run_prepared_with_executor(
+                &f.state,
+                "ws",
+                &f.pool,
+                &f.session.id,
+                &f.run.id,
+                &f.lease,
+                tokio_util::sync::CancellationToken::new(),
+                |_| {},
+                |snapshot, phase| {
+                    let f = &f;
+                    let cleanups = &cleanups;
+                    async move {
+                        let saved = workspace_config::load(&f.root).unwrap();
+                        let intent = saved.schedule.cleanup_intent.unwrap();
+                        assert_eq!(intent.content, "cleanup");
+                        assert!(intent
+                            .identity
+                            .allows(&capture(&f.state, "ws", &intent.script).unwrap()));
+                        assert!(f.state.scheduler.lock().await.script_is_running("ws"));
+                        if phase == ScriptPhase::Before {
+                            assert_eq!(snapshot.content, "prepare");
+                            ScriptResult {
+                                started: Some(started),
+                                exit_code: code,
+                                timed_out,
+                                error: (code.is_none()).then(|| "failed".into()),
+                                ..Default::default()
+                            }
+                        } else {
+                            assert_eq!(phase, ScriptPhase::After);
+                            cleanups.fetch_add(1, Ordering::SeqCst);
+                            ScriptResult {
+                                started: Some(true),
+                                exit_code: Some(0),
+                                ..Default::default()
+                            }
+                        }
+                    }
+                },
+                || async {
+                    models.fetch_add(1, Ordering::SeqCst);
+                    assert!(f.lease.try_commit());
+                    repository::update_run_status(&f.pool, &f.run.id, RunStatus::Completed, None)
+                        .await
+                        .unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(models.load(Ordering::SeqCst), expected_agent);
+            assert_eq!(cleanups.load(Ordering::SeqCst), expected_cleanup);
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_none());
+            assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+            if code == Some(1) {
+                assert!(f
+                    .state
+                    .scheduler
+                    .lock()
+                    .await
+                    .script_status_for("ws", ScriptPhase::Before)
+                    .error
+                    .is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_before_has_no_cleanup_intent_or_agent_call() {
+        let f = hook_fixture(true, false, false).await;
+        let attempt = crate::agents::hooks::run_prepared_with_executor(
+            &f.state,
+            "ws",
+            &f.pool,
+            &f.session.id,
+            &f.run.id,
+            &f.lease,
+            tokio_util::sync::CancellationToken::new(),
+            |_| {},
+            |_, _| async { panic!("skipped preparation executed") },
+            || async { panic!("skipped preparation called model") },
+        );
+        let skip = async {
+            assert_eq!(pending(&f.state).await.phase, Some(ScriptPhase::Before));
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_none());
+            respond(&f, false).await;
+        };
+        let (result, ()) = tokio::join!(attempt, skip);
+        result.unwrap();
+        assert!(workspace_config::load(&f.root)
+            .unwrap()
+            .schedule
+            .cleanup_intent
+            .is_none());
+        assert!(!repository::get_run(&f.pool, &f.run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_active());
+    }
+
+    #[tokio::test]
+    async fn manual_disable_and_cancel_during_preparation_still_cleanup_before_release() {
+        for interruption in ["manual", "disable", "cancel"] {
+            let f = hook_fixture(true, true, true).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cleanups = AtomicUsize::new(0);
+            crate::agents::hooks::run_prepared_with_executor(
+                &f.state,
+                "ws",
+                &f.pool,
+                &f.session.id,
+                &f.run.id,
+                &f.lease,
+                cancel.clone(),
+                |_| {},
+                |_, phase| {
+                    let f = &f;
+                    let cancel = &cancel;
+                    let cleanups = &cleanups;
+                    async move {
+                        if phase == ScriptPhase::Before {
+                            match interruption {
+                                "manual" => f.state.scheduler.lock().await.yield_to_manual("ws"),
+                                "disable" => f
+                                    .state
+                                    .scheduler
+                                    .lock()
+                                    .await
+                                    .set_instance_enabled("main", false),
+                                _ => cancel.cancel(),
+                            }
+                        } else {
+                            cleanups.fetch_add(1, Ordering::SeqCst);
+                            assert!(f.state.scheduler.lock().await.script_is_running("ws"));
+                        }
+                        ScriptResult {
+                            started: Some(true),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }
+                    }
+                },
+                || async { panic!("revoked preparation called model") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn after_approval_survives_disable_and_owns_workspace_until_process_finishes() {
+        let f = hook_fixture(true, true, false).await;
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let finished = std::sync::Mutex::new(Some(finished));
+        let (started, started_wait) = tokio::sync::oneshot::channel();
+        let started = std::sync::Mutex::new(Some(started));
+        let attempt = crate::agents::hooks::run_prepared_with_executor(
+            &f.state,
+            "ws",
+            &f.pool,
+            &f.session.id,
+            &f.run.id,
+            &f.lease,
+            tokio_util::sync::CancellationToken::new(),
+            |_| {},
+            |_, phase| {
+                let finished = &finished;
+                let started = &started;
+                async move {
+                    if phase == ScriptPhase::After {
+                        let wait = finished.lock().unwrap().take().unwrap();
+                        started.lock().unwrap().take().unwrap().send(()).unwrap();
+                        wait.await.unwrap();
+                    }
+                    ScriptResult {
+                        started: Some(true),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    }
+                }
+            },
+            || async {
+                assert!(f.lease.try_commit());
+                Ok(())
+            },
+        );
+        let responder = async {
+            let approval = pending(&f.state).await;
+            assert_eq!(approval.phase, Some(ScriptPhase::After));
+            {
+                let mut scheduler = f.state.scheduler.lock().await;
+                scheduler.set_instance_enabled("main", false);
+                scheduler.yield_to_manual("ws");
+                assert!(scheduler.script_is_running("ws"));
+            }
+            respond(&f, true).await;
+            started_wait.await.unwrap();
+            assert!(f.state.scheduler.lock().await.script_is_running("ws"));
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_some());
+            finish.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(attempt, responder);
+        result.unwrap();
+        assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+    }
+
+    #[tokio::test]
+    async fn no_preparation_only_cleans_after_agent_commit_and_completed_cleanup_failure_releases()
+    {
+        for agent_starts in [false, true] {
+            let f = hook_fixture(false, false, true).await;
+            let cleanups = AtomicUsize::new(0);
+            let result = crate::agents::hooks::run_prepared_with_executor(
+                &f.state,
+                "ws",
+                &f.pool,
+                &f.session.id,
+                &f.run.id,
+                &f.lease,
+                tokio_util::sync::CancellationToken::new(),
+                |_| {},
+                |_, phase| {
+                    let cleanups = &cleanups;
+                    async move {
+                        assert_eq!(phase, ScriptPhase::After);
+                        cleanups.fetch_add(1, Ordering::SeqCst);
+                        ScriptResult {
+                            started: Some(true),
+                            exit_code: None,
+                            timed_out: true,
+                            error: Some("cleanup timed out".into()),
+                            ..Default::default()
+                        }
+                    }
+                },
+                || async {
+                    if agent_starts {
+                        assert!(f.lease.try_commit());
+                    }
+                    Err(crate::agents::runner::RunnerError::AssistantPersistence(
+                        "model failed".into(),
+                    ))
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(cleanups.load(Ordering::SeqCst), usize::from(agent_starts));
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_none());
+            assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+            if agent_starts {
+                assert!(
+                    f.state
+                        .scheduler
+                        .lock()
+                        .await
+                        .script_status_for("ws", ScriptPhase::After)
+                        .result
+                        .unwrap()
+                        .timed_out
+                );
+            }
+        }
+    }
+    async fn interrupted_cleanup(
+        f: &Fixture,
+        script: &ScriptConfig,
+        unattended: bool,
+    ) -> crate::agents::hooks::CleanupIntent {
+        let snapshot = capture(&f.state, "ws", script).unwrap();
+        let consent = unattended.then(|| snapshot.consent());
+        f.state
+            .update_workspace_config("ws", |workspace| {
+                workspace.schedule.after = Some(script.clone());
+                workspace.schedule.after_consent = consent.clone();
+                workspace.schedule.enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        let intent = crate::agents::hooks::persist_intent(
+            &f.state,
+            "ws",
+            &f.session.id,
+            &f.run.id,
+            &snapshot,
+            consent,
+        )
+        .unwrap();
+        repository::complete_run(&f.pool, &f.run.id, RunStatus::Cancelled, None)
+            .await
+            .unwrap();
+        *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+        intent
+    }
+
+    async fn recovery_pending(state: &AppState) -> ScriptApproval {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(pending) = state
+                    .scheduler
+                    .lock()
+                    .await
+                    .script_status_for("ws", ScriptPhase::After)
+                    .pending
+                {
+                    return pending;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_restart_forgets_run_once_and_preserves_intent_until_explicit_skip() {
+        let f = fixture(None).await;
+        let intent = interrupted_cleanup(&f, &inline("exit 0"), false).await;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let count = entered.clone();
+        let first = crate::agents::cleanup_recovery::recover_with_executor(
+            &f.state,
+            "ws",
+            move |_| async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<ScriptResult>().await
+            },
+        );
+        let decision = async {
+            let approval = recovery_pending(&f.state).await;
+            assert_eq!(approval.purpose, "recovery");
+            crate::commands::schedule_scripts::resolve_approval(
+                &f.state,
+                &f.pool,
+                "ws",
+                &approval.id,
+                true,
+            )
+            .await
+            .unwrap();
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            approval.id
+        };
+        let first_id = tokio::select! {
+            outcome = first => panic!("cleanup should be interrupted, got {outcome:?}"),
+            approval_id = decision => approval_id,
+        };
+        assert_eq!(
+            workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .unwrap()
+                .id,
+            intent.id
+        );
+        *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+        let retry =
+            crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+                panic!("Skip cannot execute cleanup")
+            });
+        let skip = async {
+            let approval = recovery_pending(&f.state).await;
+            assert_ne!(approval.id, first_id);
+            assert!(f.state.scheduler.lock().await.script_is_running("ws"));
+            crate::commands::schedule_scripts::resolve_approval(
+                &f.state,
+                &f.pool,
+                "ws",
+                &approval.id,
+                false,
+            )
+            .await
+            .unwrap();
+        };
+        let (result, _) = tokio::join!(retry, skip);
+        result.unwrap();
+        let saved = workspace_config::load(&f.root).unwrap();
+        assert!(!saved.schedule.enabled);
+        assert!(saved.schedule.cleanup_intent.is_none());
+        assert!(saved.schedule.cleanup_completion.unwrap().skipped);
+        assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_restart_records_completed_failure_and_restores_it_without_retry() {
+        let f = fixture(None).await;
+        interrupted_cleanup(&f, &inline("exit 2"), true).await;
+        let calls = AtomicUsize::new(0);
+        crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ScriptResult {
+                started: Some(true),
+                exit_code: Some(2),
+                ..Default::default()
+            }
+        })
+        .await
+        .unwrap();
+        let saved = workspace_config::load(&f.root).unwrap();
+        assert!(saved.schedule.cleanup_intent.is_none());
+        assert_eq!(
+            saved
+                .schedule
+                .cleanup_completion
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .exit_code,
+            Some(2)
+        );
+        *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+        crate::agents::cleanup_recovery::restore_runtime(
+            &mut *f.state.scheduler.lock().await,
+            &saved,
+        );
+        assert!(f
+            .state
+            .scheduler
+            .lock()
+            .await
+            .script_status_for("ws", ScriptPhase::After)
+            .result
+            .unwrap()
+            .error
+            .is_some());
+        crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ScriptResult::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_restart_changed_bound_file_requires_restore_or_explicit_skip() {
+        let f = fixture(None).await;
+        let path = f.root.join("cleanup.sh");
+        std::fs::write(&path, "exit 0").unwrap();
+        let script = ScriptConfig {
+            source: ScriptSource::File {
+                path: "cleanup.sh".into(),
+            },
+            ..inline("")
+        };
+        let intent = interrupted_cleanup(&f, &script, true).await;
+        std::fs::write(&path, "touch unapproved").unwrap();
+        for _ in 0..2 {
+            let result =
+                crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+                    panic!("changed bytes must not execute")
+                })
+                .await;
+            assert!(result.is_err());
+            let scheduler = f.state.scheduler.lock().await;
+            assert!(scheduler.script_is_running("ws"));
+            assert!(scheduler
+                .script_status_for("ws", ScriptPhase::After)
+                .pending
+                .is_none());
+            assert!(scheduler
+                .script_status_for("ws", ScriptPhase::After)
+                .error
+                .is_some());
+        }
+        assert!(
+            crate::agents::cleanup_recovery::skip_unavailable(&f.state, "ws", "stale-id")
+                .await
+                .is_err()
+        );
+        assert!(workspace_config::load(&f.root)
+            .unwrap()
+            .schedule
+            .cleanup_intent
+            .is_some());
+        crate::agents::cleanup_recovery::skip_unavailable(&f.state, "ws", &intent.id)
+            .await
+            .unwrap();
+        assert!(
+            workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_completion
+                .unwrap()
+                .skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_restart_retries_uncertain_intent_gap_even_when_scheduling_is_disabled() {
+        let f = fixture(None).await;
+        interrupted_cleanup(&f, &inline("exit 0"), true).await;
+        let calls = AtomicUsize::new(0);
+        crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ScriptResult {
+                started: Some(true),
+                exit_code: Some(0),
+                ..Default::default()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(workspace_config::load(&f.root)
+            .unwrap()
+            .schedule
+            .cleanup_intent
+            .is_none());
     }
 }

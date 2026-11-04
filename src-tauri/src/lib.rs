@@ -64,11 +64,65 @@ pub mod runtime {
 /// Narrow production seams for the opt-in native scheduler verification harness.
 #[doc(hidden)]
 pub mod scheduler_verification {
+    pub use crate::agents::hooks::CleanupIntent;
     pub use crate::agents::init::initialize_wake_monitor;
     pub use crate::agents::scheduler::Scheduler;
+    pub use crate::agents::scripts::{ScriptConfig, ScriptResult, ScriptSource};
     pub use crate::agents::types::AgentDefinition;
     pub use crate::agents::wake_monitor::{install, uninstall};
     pub use crate::config::workspace_config::ScheduleKind;
+
+    /// Bind a real immutable cleanup intent in isolated workspace storage.
+    pub fn persist_cleanup(
+        state: &crate::AppState,
+        workspace_id: &str,
+        session_id: &str,
+        run_id: &str,
+        script: &ScriptConfig,
+        unattended: bool,
+    ) -> Result<CleanupIntent, String> {
+        let snapshot = crate::agents::scripts::capture(state, workspace_id, script)?;
+        let consent = unattended.then(|| snapshot.consent());
+        state.update_workspace_config(workspace_id, |workspace| {
+            workspace.schedule.after = Some(script.clone());
+            workspace.schedule.after_consent = consent.clone();
+            Ok(())
+        })?;
+        crate::agents::hooks::persist_intent(
+            state,
+            workspace_id,
+            session_id,
+            run_id,
+            &snapshot,
+            consent,
+        )
+    }
+
+    pub async fn recover_cleanup(
+        state: &crate::AppState,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        crate::agents::cleanup_recovery::recover(state, workspace_id).await
+    }
+
+    /// Pause after the real sandboxed cleanup exits and before durable completion.
+    /// A disposable child process can be killed at this exact crash boundary.
+    pub async fn recover_cleanup_before_record<F: std::future::Future<Output = ()>>(
+        state: &crate::AppState,
+        workspace_id: &str,
+        checkpoint: F,
+    ) -> Result<(), String> {
+        crate::agents::cleanup_recovery::recover_with_executor(
+            state,
+            workspace_id,
+            |snapshot| async {
+                let result = snapshot.execute(state, workspace_id).await;
+                checkpoint.await;
+                result
+            },
+        )
+        .await
+    }
 }
 
 /// Shared application state accessible from all commands.
@@ -268,6 +322,8 @@ impl AppState {
             .write()
             .map_err(|e| format!("Workspace index lock error: {}", e))?
             .attach_pool(workspace_id.to_string(), pool.clone());
+        let workspace = workspace_config::load(&root).map_err(|error| error.to_string())?;
+        agents::cleanup_recovery::restore_runtime(&mut *self.scheduler.lock().await, &workspace);
         Ok(pool)
     }
 }
@@ -434,12 +490,12 @@ pub fn run() {
                     if let Err(e) = initialize_workspace_storage(&state).await {
                         tracing::warn!("Failed to initialize workspace storage: {}", e);
                     }
-                    resume_open_workspaces(&app_handle, state.inner());
                     agents::init::populate_scheduler_from_workspace_agents(
                         &post_db_scheduler,
                         state.inner(),
                     )
                     .await;
+                    resume_open_workspaces(&app_handle, state.inner());
                 }
             });
 
@@ -551,6 +607,7 @@ pub fn run() {
             commands::workspace::workspace_set_schedule,
             commands::schedule_scripts::workspace_script_preview,
             commands::schedule_scripts::workspace_script_decide,
+            commands::schedule_scripts::workspace_cleanup_skip,
             commands::schedule_scripts::workspace_script_authorize,
             commands::workspace::workspace_set_schedule_paused,
             commands::workspace::set_scheduler_paused,

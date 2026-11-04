@@ -60,6 +60,18 @@ pub use crate::agents::weekly_blocks::WeeklyAllowedBlocks;
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSchedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_consent: Option<crate::agents::scripts::ScriptConsent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_consent: Option<crate::agents::scripts::ScriptConsent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_intent: Option<crate::agents::hooks::CleanupIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_completion: Option<crate::agents::hooks::CleanupCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<crate::agents::scripts::ScriptConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition_consent: Option<crate::agents::scripts::ScriptConsent>,
@@ -909,6 +921,12 @@ mod schedule_surface_tests {
 
     fn schedule(enabled: bool, paused: bool, kind: ScheduleKind) -> WorkspaceSchedule {
         WorkspaceSchedule {
+            before: None,
+            after: None,
+            before_consent: None,
+            after_consent: None,
+            cleanup_intent: None,
+            cleanup_completion: None,
             condition: None,
             condition_consent: None,
             enabled,

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createRef } from 'react';
 
@@ -24,6 +24,8 @@ const DETAILS = {
   schedulePaused: false,
   scheduleKind: null,
 } as unknown as WorkspaceDetails;
+
+const EMPTY_HOOKS = { before: null, beforeUnattended: false, beforeUnattendedApprovalId: null, after: null, afterUnattended: false, afterUnattendedApprovalId: null };
 
 const submit = async (ref: React.RefObject<SectionHandle | null>) => {
   let result: { ok: boolean; error?: string } | undefined;
@@ -90,7 +92,7 @@ describe('SchedulePage', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: { type: 'enhancedInterval', intervalSeconds: 15 },
-      allowedBlocks: { timezone: 'UTC', slots: [] }, condition: null, unattended: false, unattendedApprovalId: null,
+      allowedBlocks: { timezone: 'UTC', slots: [] }, condition: null, unattended: false, unattendedApprovalId: null, ...EMPTY_HOOKS,
     });
   });
 
@@ -136,7 +138,7 @@ describe('SchedulePage', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: { type: 'enhancedCron', expression: '0 10 * * *', timezone: 'UTC' },
-      allowedBlocks: { timezone: 'UTC', slots: [] }, condition: null, unattended: false, unattendedApprovalId: null,
+      allowedBlocks: { timezone: 'UTC', slots: [] }, condition: null, unattended: false, unattendedApprovalId: null, ...EMPTY_HOOKS,
     });
   });
 
@@ -235,7 +237,7 @@ describe('weekly allowed blocks', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: type === 'enhancedCron' ? { ...kind, timezone: 'America/Chicago' } : kind,
-      allowedBlocks: { timezone: 'America/Chicago', slots: [36] }, condition: null, unattended: false, unattendedApprovalId: null,
+      allowedBlocks: { timezone: 'America/Chicago', slots: [36] }, condition: null, unattended: false, unattendedApprovalId: null, ...EMPTY_HOOKS,
     });
   });
 });
@@ -266,7 +268,7 @@ describe('schedule condition', () => {
       workspaceId: 'ws-1', kind: { type: 'enhancedInterval', intervalSeconds: 30 },
       allowedBlocks: { timezone: 'UTC', slots: [] },
       condition: { source: { type: 'inline', content: 'exit 1' }, interpreter: 'bash', timeoutSeconds: 30 },
-      unattended: false, unattendedApprovalId: null,
+      unattended: false, unattendedApprovalId: null, ...EMPTY_HOOKS,
     });
     expect(screen.getByRole('switch', { name: 'Run unattended' })).not.toBeChecked();
   });
@@ -435,7 +437,7 @@ describe('unattended condition consent', () => {
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: { type: 'enhancedInterval', intervalSeconds: 30 },
       allowedBlocks: { timezone: 'UTC', slots: [] }, condition: SAVED_CONDITION,
-      unattended: true, unattendedApprovalId: 'confirmed-draft',
+      unattended: true, unattendedApprovalId: 'confirmed-draft', ...EMPTY_HOOKS,
     });
     expect(mockInvoke).not.toHaveBeenCalledWith('workspace_script_decide', expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith('workspace_run_now', expect.anything());
@@ -528,4 +530,219 @@ describe('unattended condition consent', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', expect.objectContaining({ unattended: false, unattendedApprovalId: null }));
   });
+});
+
+
+const HOOK = { source: { type: 'inline', content: 'echo hook' }, interpreter: 'sh', timeoutSeconds: 300 } as const;
+const hookPanel = (phase: 'before' | 'after') => within(screen.getByRole('region', { name: `${phase === 'before' ? 'Before' : 'After'} script` }));
+
+describe('scheduled preparation and cleanup controls', () => {
+  it('saves all script drafts, cadence and blocks atomically and preserves them through status polling', async () => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    const dirty = vi.fn();
+    const page = (details: WorkspaceDetails) => <SchedulePage ref={ref} workspaceId="ws-1" details={details} saving={false} onDirtyChange={dirty} />;
+    const { rerender } = render(page(ENHANCED));
+    await user.click(screen.getByRole('switch', { name: 'Prepare before the agent runs' }));
+    await user.click(screen.getByRole('switch', { name: 'Clean up after the scheduled attempt' }));
+    expect(screen.getByLabelText('Before timeout (seconds)')).toHaveValue(300);
+    expect(screen.getByLabelText('After timeout (seconds)')).toHaveValue(300);
+    await user.type(screen.getByLabelText('Before script contents'), 'mkdir -p scratch');
+    await user.type(screen.getByLabelText('After script contents'), 'rm -rf scratch');
+    await user.click(screen.getByRole('button', { name: 'Monday 09:00–09:15' }));
+    await act(async () => rerender(page({ ...ENHANCED, scheduleWaitingReason: 'Waiting outside allowed blocks.',
+      scheduleBeforeStatus: { pending: null, running: false, result: null, error: 'Previous preparation failed.' },
+    })));
+    expect(screen.getByLabelText('Before script contents')).toHaveValue('mkdir -p scratch');
+    expect(screen.getByLabelText('After script contents')).toHaveValue('rm -rf scratch');
+    expect(dirty).toHaveBeenLastCalledWith(true);
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
+      workspaceId: 'ws-1', kind: ENHANCED.scheduleKind,
+      allowedBlocks: { timezone: 'UTC', slots: [36] }, condition: null, unattended: false, unattendedApprovalId: null,
+      before: { ...HOOK, source: { type: 'inline', content: 'mkdir -p scratch' } },
+      after: { ...HOOK, source: { type: 'inline', content: 'rm -rf scratch' } },
+      beforeUnattended: false, afterUnattended: false, beforeUnattendedApprovalId: null, afterUnattendedApprovalId: null,
+    });
+    expect(hookPanel('after').getByText(/at-least-once execution/)).toBeInTheDocument();
+  });
+
+  it.each(['before', 'after'] as const)('validates the %s timeout before saving or testing', async (phase) => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    render(<SchedulePage ref={ref} workspaceId="ws-1" details={{ ...ENHANCED, scheduleBefore: HOOK, scheduleAfter: HOOK }} saving={false} />);
+    const label = phase === 'before' ? 'Before' : 'After';
+    await user.clear(screen.getByLabelText(`${label} timeout (seconds)`));
+    expect(await submit(ref)).toEqual({ ok: false, error: `${label} timeout must be a positive whole number of seconds.` });
+    await user.click(screen.getByRole('button', { name: `Run ${phase} now` }));
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_set_schedule', expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_script_preview', expect.anything());
+  });
+
+  it('confirms unsaved before and after tests independently, retaining each output and draft', async () => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === 'workspace_script_preview') {
+        const phase = (args as { phase: 'before' | 'after' }).phase;
+        return Promise.resolve({ ...APPROVAL, id: phase, phase, content: `echo ${phase}`, timeoutSeconds: 300 });
+      }
+      if (command === 'workspace_script_decide') {
+        const phase = (args as { approvalId: string }).approvalId;
+        return Promise.resolve({ ...RESULT, stdout: `${phase} output` });
+      }
+      return Promise.resolve(null);
+    });
+    render(<SchedulePage ref={ref} workspaceId="ws-1" details={{ ...ENHANCED, scheduleBefore: HOOK, scheduleAfter: HOOK }} saving={false} />);
+    for (const phase of ['before', 'after'] as const) {
+      const label = phase === 'before' ? 'Before' : 'After';
+      await user.clear(screen.getByLabelText(`${label} script contents`));
+      await user.type(screen.getByLabelText(`${label} script contents`), `echo ${phase}`);
+      await user.click(screen.getByRole('button', { name: `Run ${phase} now` }));
+      expect(mockInvoke).toHaveBeenCalledWith('workspace_script_preview', { workspaceId: 'ws-1', phase, script: { ...HOOK, source: { type: 'inline', content: `echo ${phase}` } } });
+      expect(hookPanel(phase).getByLabelText(`Captured ${phase} script`)).toHaveTextContent(`echo ${phase}`);
+      expect(hookPanel(phase).getByText(APPROVAL.access)).toBeInTheDocument();
+      await user.type(screen.getByLabelText(`${label} script contents`), ' changed');
+      expect(hookPanel(phase).getByLabelText(`Captured ${phase} script`)).toHaveTextContent(`echo ${phase}`);
+      await user.click(hookPanel(phase).getByRole('button', { name: 'Run once' }));
+      expect(screen.getByRole('region', { name: `${label} result` })).toHaveTextContent(`${label} failed · Exit 1 · 12 ms`);
+      expect(screen.getByLabelText(`${label} script contents`)).toHaveValue(`echo ${phase} changed`);
+    }
+    expect(screen.getByText('before output')).toBeInTheDocument();
+    expect(screen.getByText('after output')).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_set_schedule', expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_run_now', expect.anything());
+  });
+
+  it('uses the file chooser and interpreter for the selected hook only', async () => {
+    const user = userEvent.setup();
+    mockOpen.mockResolvedValue('/tmp/cleanup.py');
+    mockInvoke.mockImplementation((command) => command === 'workspace_script_preview' ? Promise.reject('Interpreter is unavailable: python3') : Promise.resolve(null));
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={{ ...ENHANCED, scheduleBefore: HOOK, scheduleAfter: HOOK }} saving={false} />);
+    await user.click(hookPanel('after').getByRole('button', { name: 'Script file' }));
+    await user.click(hookPanel('after').getByRole('button', { name: 'Choose file…' }));
+    expect(mockOpen).toHaveBeenCalledWith({ title: 'Select after script', multiple: false, directory: false });
+    await user.clear(screen.getByLabelText('After interpreter'));
+    await user.type(screen.getByLabelText('After interpreter'), 'python3');
+    await user.click(screen.getByRole('button', { name: 'Run after now' }));
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_script_preview', { workspaceId: 'ws-1', phase: 'after', script: {
+      source: { type: 'file', path: '/tmp/cleanup.py' }, interpreter: 'python3', timeoutSeconds: 300,
+    } });
+    expect(hookPanel('after').getByRole('alert')).toHaveTextContent('Interpreter is unavailable: python3');
+    expect(screen.getByLabelText('Before script contents')).toHaveValue('echo hook');
+  });
+
+  it('keeps unattended confirmations separate and clears only the edited phase consent', async () => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === 'workspace_script_preview') {
+        const phase = (args as { phase: 'before' | 'after' }).phase;
+        return Promise.resolve({ ...APPROVAL, id: phase, phase, purpose: 'unattended', content: 'echo hook', timeoutSeconds: 300 });
+      }
+      if (command === 'workspace_script_authorize') return Promise.resolve(`confirmed-${(args as { approvalId: string }).approvalId}`);
+      return Promise.resolve(null);
+    });
+    const initial = { ...WITH_CONDITION, scheduleConditionUnattended: true, scheduleBefore: HOOK, scheduleAfter: HOOK };
+    const page = (details: WorkspaceDetails) => <SchedulePage ref={ref} workspaceId="ws-1" details={details} saving={false} />;
+    const { rerender } = render(page(initial));
+    for (const phase of ['before', 'after'] as const) {
+      await user.click(hookPanel(phase).getByRole('switch', { name: 'Run unattended' }));
+      expect(hookPanel(phase).getByRole('switch', { name: 'Run unattended' })).not.toBeChecked();
+      await user.click(hookPanel(phase).getByRole('button', { name: 'Approve unattended' }));
+      expect(hookPanel(phase).getByRole('switch', { name: 'Run unattended' })).toBeChecked();
+    }
+    await act(async () => rerender(page({ ...initial, schedulePaused: true })));
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenLastCalledWith('workspace_set_schedule', expect.objectContaining({
+      condition: SAVED_CONDITION, unattended: true,
+      before: HOOK, beforeUnattended: true, beforeUnattendedApprovalId: 'confirmed-before',
+      after: HOOK, afterUnattended: true, afterUnattendedApprovalId: 'confirmed-after',
+    }));
+    await user.type(screen.getByLabelText('Before script contents'), ' changed');
+    expect(hookPanel('before').getByRole('switch', { name: 'Run unattended' })).not.toBeChecked();
+    expect(hookPanel('after').getByRole('switch', { name: 'Run unattended' })).toBeChecked();
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenLastCalledWith('workspace_set_schedule', expect.objectContaining({
+      unattended: true, beforeUnattended: false, beforeUnattendedApprovalId: null,
+      afterUnattended: true, afterUnattendedApprovalId: 'confirmed-after',
+    }));
+  });
+
+  it.each([true, false])('keeps cleanup approval actionable after disabling and switching to legacy mode (run=%s)', async (run) => {
+    const user = userEvent.setup();
+    const initial = { ...ENHANCED, scheduleAfter: HOOK, scheduleCleanupPending: true, scheduleAfterStatus: {
+      pending: { ...APPROVAL, id: 'cleanup', phase: 'after', purpose: 'scheduled' }, running: false, result: null, error: null,
+    } } as WorkspaceDetails;
+    const page = (details: WorkspaceDetails) => <SchedulePage ref={createRef()} workspaceId="ws-1" details={details} saving={false} />;
+    const { rerender } = render(page(initial));
+    await act(async () => rerender(page({ ...initial, scheduleEnabled: false, scheduleKind: { type: 'interval', intervalMinutes: 30 },
+      scheduleWaitingReason: 'Outside allowed blocks.',
+    })));
+    expect(hookPanel('after').getByText(/A scheduled cleanup approval stays available outside allowed blocks/)).toBeInTheDocument();
+    expect(hookPanel('after').getByRole('button', { name: 'Run once' })).toBeEnabled();
+    expect(hookPanel('after').getByRole('button', { name: 'Skip' })).toBeEnabled();
+    await user.click(hookPanel('after').getByRole('button', { name: run ? 'Run once' : 'Skip' }));
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_script_decide', { workspaceId: 'ws-1', approvalId: 'cleanup', run });
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_set_schedule', expect.anything());
+  });
+
+  it('removes an expired before approval without losing either hook draft', async () => {
+    const user = userEvent.setup();
+    const initial = { ...ENHANCED, scheduleBefore: HOOK, scheduleAfter: HOOK, scheduleBeforeStatus: {
+      pending: { ...APPROVAL, phase: 'before', purpose: 'scheduled' }, running: false, result: null, error: null,
+    } } as WorkspaceDetails;
+    const page = (details: WorkspaceDetails) => <SchedulePage ref={createRef()} workspaceId="ws-1" details={details} saving={false} />;
+    const { rerender } = render(page(initial));
+    await user.type(screen.getByLabelText('Before script contents'), ' draft');
+    await user.type(screen.getByLabelText('After script contents'), ' draft');
+    await act(async () => rerender(page({ ...initial, scheduleBeforeStatus: { pending: null, running: false, result: null, error: null } })));
+    expect(hookPanel('before').queryByRole('button', { name: 'Run once' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Before script contents')).toHaveValue('echo hook draft');
+    expect(screen.getByLabelText('After script contents')).toHaveValue('echo hook draft');
+  });
+
+  it('shows outstanding cleanup attention and independent failed/timed out phase results', () => {
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={{ ...ENHANCED, scheduleCleanupPending: true,
+      scheduleBeforeStatus: { pending: null, running: false, result: { ...RESULT, stdout: 'prepare output' }, error: null },
+      scheduleAfterStatus: { pending: null, running: false, result: { ...RESULT, timedOut: true, exitCode: null,
+        stdout: 'cleanup output', error: 'After script exceeded its timeout.' }, error: 'Interrupted cleanup requires attention.' },
+    }} saving={false} />);
+    expect(screen.getByRole('status')).toHaveTextContent('Cleanup pending.');
+    expect(screen.getByRole('status')).toHaveTextContent('A settings test does not complete this cleanup.');
+    expect(screen.getByRole('region', { name: 'Before result' })).toHaveTextContent('Before failed · Exit 1');
+    expect(screen.getByRole('region', { name: 'After result' })).toHaveTextContent('After timed out · No exit status');
+    expect(screen.getByText('prepare output')).toBeInTheDocument();
+    expect(screen.getByText('cleanup output')).toBeInTheDocument();
+    expect(hookPanel('after').getByRole('alert')).toHaveTextContent('Interrupted cleanup requires attention.');
+  });
+  it('keeps an explicit Skip available for interrupted cleanup with an unavailable bound input', async () => {
+    const user = userEvent.setup();
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={{ ...DETAILS,
+      scheduleCleanupPending: true, scheduleCleanupId: 'intent-8', scheduleCleanupInterrupted: true,
+      scheduleAfterStatus: { pending: null, result: null, running: false, error: 'Cannot read original cleanup file.' },
+    }} saving={false} />);
+    expect(hookPanel('after').getByText(/Preparation or the agent may not have started/)).toBeInTheDocument();
+    await user.click(hookPanel('after').getByRole('button', { name: 'Skip outstanding cleanup' }));
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_cleanup_skip', { workspaceId: 'ws-1', intentId: 'intent-8' });
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_set_schedule', expect.anything());
+  });
+
+  it('requires fresh Run once after restart and retains a bound approval when revalidation fails', async () => {
+    const user = userEvent.setup();
+    mockInvoke.mockImplementation((command) => command === 'workspace_script_decide'
+      ? Promise.reject('The bound cleanup input changed. Restore it or explicitly Skip cleanup.') : Promise.resolve(null));
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={{ ...DETAILS,
+      scheduleCleanupPending: true, scheduleCleanupId: 'intent-8', scheduleCleanupInterrupted: true,
+      scheduleAfterStatus: { pending: { ...APPROVAL, id: 'recovery-8', phase: 'after', purpose: 'recovery' },
+        result: null, running: false, error: null },
+    }} saving={false} />);
+    expect(hookPanel('after').getByRole('heading', { name: 'Interrupted cleanup needs fresh approval' })).toBeInTheDocument();
+    expect(hookPanel('after').queryByRole('button', { name: 'Approve unattended' })).not.toBeInTheDocument();
+    await user.click(hookPanel('after').getByRole('button', { name: 'Run once' }));
+    expect(hookPanel('after').getByRole('button', { name: 'Run once' })).toBeEnabled();
+    expect(hookPanel('after').getByRole('button', { name: 'Skip' })).toBeEnabled();
+    expect(hookPanel('after').getByRole('alert')).toHaveTextContent('Restore it or explicitly Skip cleanup.');
+  });
+
 });
