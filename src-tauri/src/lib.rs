@@ -61,6 +61,16 @@ pub mod runtime {
     pub use crate::assistant::runtime::{cancel_run, register_run, LiveRunKey};
 }
 
+/// Narrow production seams for the opt-in native scheduler verification harness.
+#[doc(hidden)]
+pub mod scheduler_verification {
+    pub use crate::agents::init::initialize_wake_monitor;
+    pub use crate::agents::scheduler::Scheduler;
+    pub use crate::agents::types::AgentDefinition;
+    pub use crate::agents::wake_monitor::{install, uninstall};
+    pub use crate::config::workspace_config::ScheduleKind;
+}
+
 /// Shared application state accessible from all commands.
 ///
 /// This struct holds all the shared resources that commands need access to.

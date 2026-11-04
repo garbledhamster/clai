@@ -1,4 +1,6 @@
-//! Synthetic in-process notifications; this never sleeps or changes the host.
+//! Default: synthetic notifications, unchanged. Explicit --preflight and
+//! --observe-real modes use the production scheduler without app state or data.
+//! No mode initiates sleep or changes the host.
 
 #[cfg(target_os = "macos")]
 pub mod scheduler {
@@ -30,7 +32,23 @@ mod agents {
 mod wake_monitor;
 
 #[cfg(target_os = "macos")]
+#[path = "support/real_wake_probe.rs"]
+mod real_wake_probe;
+
+#[cfg(target_os = "macos")]
 fn main() {
+    if let Some(mode) = std::env::args()
+        .skip(1)
+        .find(|mode| mode == "--preflight" || mode == "--observe-real")
+    {
+        if mode == "--preflight" || mode == "--observe-real" {
+            if let Err(error) = real_wake_probe::run(mode == "--preflight") {
+                eprintln!("FAIL native wake probe: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     use objc2_app_kit::{
         NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
     };
@@ -59,5 +77,9 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if std::env::args().any(|mode| mode == "--preflight" || mode == "--observe-real") {
+        eprintln!("Native scheduler wake verification requires macOS.");
+        std::process::exit(2);
+    }
     println!("macOS notification test skipped on this platform");
 }
