@@ -181,6 +181,34 @@ pub struct WorkspaceDirEntry {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "bindings.ts")]
 pub struct WorkspaceDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_before: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_after: Option<crate::agents::scripts::ScriptConfig>,
+    #[ts(optional)]
+    pub schedule_before_unattended: Option<bool>,
+    #[ts(optional)]
+    pub schedule_after_unattended: Option<bool>,
+    #[ts(optional)]
+    pub schedule_before_status: Option<crate::agents::scripts::ScriptStatus>,
+    #[ts(optional)]
+    pub schedule_after_status: Option<crate::agents::scripts::ScriptStatus>,
+    #[ts(optional)]
+    pub schedule_cleanup_pending: Option<bool>,
+    #[ts(optional)]
+    pub schedule_cleanup_id: Option<String>,
+    #[ts(optional)]
+    pub schedule_cleanup_interrupted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_condition: Option<crate::agents::scripts::ScriptConfig>,
+    #[ts(optional)]
+    pub schedule_condition_unattended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub schedule_script_status: Option<crate::agents::scripts::ScriptStatus>,
     pub workspace_id: String,
     pub kind: String,
     pub title: String,
@@ -251,6 +279,8 @@ pub struct WorkspaceDetails {
     // controls the Fleet card has. Mirrors WorkspaceListEntry.
     pub schedule_enabled: bool,
     pub schedule_paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_blocked_reason: Option<String>,
     /// The workspace's schedule mode (interval vs cron). Empty when the
     /// workspace isn't scheduled. The frontend reads this to render the
     /// "every Nm" / "Cron: …" label and to populate the workspace
@@ -258,7 +288,12 @@ pub struct WorkspaceDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_kind: Option<crate::config::workspace_config::ScheduleKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_in_seconds: Option<u64>,
+    // A due enhanced check waiting for this workspace to become available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_waiting_reason: Option<String>,
 }
 
 /// The one expensive extra the details payload can carry: `includeFiles`
@@ -1367,26 +1402,31 @@ async fn workspace_details(
     let tasks =
         list_workspace_task_responses(&workspace_pool, state, &descriptor.workspace_id).await?;
 
-    // Workspace-level schedule (no longer per-agent). The scheduled tick
-    // invokes the default agent.
-    let enabled: Option<bool> = None;
-    let schedule = state
-        .workspace_root(&descriptor.workspace_id)
-        .and_then(|root| workspace_config::load(&root).ok())
-        .map(|config| config.schedule.surface())
-        .unwrap_or_default();
-    let next_run_in_seconds = match default_workspace_agent_id.as_deref() {
-        Some(manager_id) if schedule.wants_countdown() => {
-            let instance_id = AgentInstance::instance_id_for(manager_id);
-            let scheduler = state.scheduler.lock().await;
-            scheduler
-                .get_instance(&instance_id)
-                .map(|instance| instance.seconds_until_next_run())
-        }
-        _ => None,
-    };
+    let schedule_response = workspace_schedule_response(
+        state,
+        &descriptor.workspace_id,
+        default_workspace_agent_id.as_deref(),
+    )
+    .await;
+    let schedule = schedule_response.config.surface();
 
     Ok(WorkspaceDetails {
+        schedule_before: schedule_response.config.before.clone(),
+        schedule_after: schedule_response.config.after.clone(),
+        schedule_before_unattended: Some(schedule_response.config.before_consent.is_some()),
+        schedule_after_unattended: Some(schedule_response.config.after_consent.is_some()),
+        schedule_before_status: Some(schedule_response.before_status),
+        schedule_after_status: Some(schedule_response.after_status),
+        schedule_cleanup_pending: Some(schedule_response.config.cleanup_intent.is_some()),
+        schedule_cleanup_id: schedule_response
+            .config
+            .cleanup_intent
+            .as_ref()
+            .map(|intent| intent.id.clone()),
+        schedule_cleanup_interrupted: Some(schedule_response.cleanup_interrupted),
+        schedule_condition: schedule_response.config.condition.clone(),
+        schedule_condition_unattended: Some(schedule_response.config.condition_consent.is_some()),
+        schedule_script_status: Some(schedule_response.condition_status),
         workspace_id: descriptor.workspace_id,
         kind: descriptor.kind,
         title: descriptor.title,
@@ -1406,12 +1446,68 @@ async fn workspace_details(
         artifact_count_capped: artifact_stats.capped,
         artifact_latest_modified_at: artifact_stats.latest_modified_at,
         queued_message_ids,
-        enabled,
+        enabled: None,
         schedule_enabled: schedule.enabled,
         schedule_paused: schedule.paused,
+        schedule_blocked_reason: schedule_response.blocked_reason,
+        schedule_waiting_reason: schedule_response.waiting_reason,
         schedule_kind: schedule.kind,
-        next_run_in_seconds,
+        schedule_allowed_blocks: schedule.allowed_blocks,
+        next_run_in_seconds: schedule_response.next_run_in_seconds,
     })
+}
+
+struct WorkspaceScheduleResponse {
+    config: workspace_config::WorkspaceSchedule,
+    before_status: crate::agents::scripts::ScriptStatus,
+    after_status: crate::agents::scripts::ScriptStatus,
+    condition_status: crate::agents::scripts::ScriptStatus,
+    cleanup_interrupted: bool,
+    next_run_in_seconds: Option<u64>,
+    blocked_reason: Option<String>,
+    waiting_reason: Option<String>,
+}
+
+async fn workspace_schedule_response(
+    state: &AppState,
+    workspace_id: &str,
+    manager_id: Option<&str>,
+) -> WorkspaceScheduleResponse {
+    let config = state
+        .workspace_root(workspace_id)
+        .and_then(|root| workspace_config::load(&root).ok())
+        .map(|config| config.schedule)
+        .unwrap_or_default();
+    let schedule = config.surface();
+    let scheduler = state.scheduler.lock().await;
+    let blocked_reason = scheduler
+        .pending_cancellation_reason(workspace_id)
+        .or_else(|| schedule.blocked_reason(scheduler.wake_monitor_available()))
+        .map(str::to_owned);
+    let next_run_in_seconds = manager_id
+        .filter(|_| schedule.wants_countdown() && blocked_reason.is_none())
+        .and_then(|id| scheduler.seconds_until_next_run(&AgentInstance::instance_id_for(id)));
+    let waiting_reason = scheduler
+        .script_notice(workspace_id)
+        .or_else(|| {
+            manager_id.and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
+        })
+        .map(str::to_owned);
+    WorkspaceScheduleResponse {
+        config,
+        before_status: scheduler
+            .script_status_for(workspace_id, crate::agents::scripts::ScriptPhase::Before),
+        after_status: scheduler
+            .script_status_for(workspace_id, crate::agents::scripts::ScriptPhase::After),
+        condition_status: scheduler.script_status(workspace_id),
+        cleanup_interrupted: scheduler
+            .scripts
+            .get(workspace_id)
+            .is_some_and(|runtime| runtime.cleanup_interrupted),
+        next_run_in_seconds,
+        blocked_reason,
+        waiting_reason,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2711,6 +2807,8 @@ pub struct WorkspaceListEntry {
     // scheduled workspaces do not jump the queue).
     pub schedule_enabled: bool,
     pub schedule_paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_blocked_reason: Option<String>,
     /// Schedule mode (interval vs cron). Empty when the workspace is
     /// not scheduled. The Fleet card reads this to render the cadence
     /// label (`every 5m` for Interval, `0 9 * * 1-5` for Cron).
@@ -2730,6 +2828,11 @@ pub struct WorkspaceListEntry {
     /// section. Derived from `WorkspaceConfig::starred_at > 0`.
     pub starred: bool,
     pub updated_at: i64,
+    // A due enhanced check waiting for this workspace to become available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_waiting_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 /// Create a new general workspace with a UUID and filesystem root.
@@ -2937,6 +3040,10 @@ pub async fn workspace_fork(
 /// List all file-backed workspaces.
 #[tauri::command]
 pub async fn workspace_list(state: State<'_, AppState>) -> Result<Vec<WorkspaceListEntry>, String> {
+    workspace_list_entries(state.inner()).await
+}
+
+async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEntry>, String> {
     let mut entries = Vec::new();
     let locators = state
         .workspace_index
@@ -2949,17 +3056,44 @@ pub async fn workspace_list(state: State<'_, AppState>) -> Result<Vec<WorkspaceL
     // for workspaces, that's the manager workspace_agent's row id
     // (init.rs:populate_scheduler_from_workspace_agents registers with
     // workspace_agents.id as both the definition id and instance agent_id).
-    let scheduler_seconds: HashMap<String, u64> = {
+    let (scheduler_seconds, scheduler_waiting, pending_cancellations, wake_monitor_available): (
+        HashMap<String, u64>,
+        HashMap<String, String>,
+        _,
+        _,
+    ) = {
         let scheduler = state.scheduler.lock().await;
-        scheduler
-            .all_instances()
-            .map(|instance| (instance.agent_id.clone(), instance.seconds_until_next_run()))
-            .collect()
+        (
+            scheduler
+                .all_instances()
+                .filter_map(|instance| {
+                    scheduler
+                        .seconds_until_next_run(&instance.instance_id)
+                        .map(|seconds| (instance.agent_id.clone(), seconds))
+                })
+                .collect(),
+            scheduler
+                .all_instances()
+                .filter_map(|instance| {
+                    scheduler
+                        .waiting_reason(&instance.instance_id)
+                        .map(|reason| (instance.agent_id.clone(), reason.to_string()))
+                })
+                .collect(),
+            scheduler.pending_cancellations(),
+            scheduler.wake_monitor_available(),
+        )
     };
 
     for locator in locators {
         let id = locator.id.clone();
         let workspace_pool = state.workspace_db(&id).await?;
+        let script_notice = state
+            .scheduler
+            .lock()
+            .await
+            .script_notice(&id)
+            .map(str::to_owned);
         // No `config.json` access in this loop: everything a rail card needs
         // is already on the in-memory locator. Reaching for the config here
         // cost five full read+parse cycles per workspace on every 5s poll.
@@ -2967,8 +3101,17 @@ pub async fn workspace_list(state: State<'_, AppState>) -> Result<Vec<WorkspaceL
             count_session_messages(&workspace_pool, &locator.default_agent_id).await;
         let running_task_count = running_task_count(&workspace_pool).await?;
         let schedule = locator.schedule;
-        let next_run_in_seconds = schedule
-            .wants_countdown()
+        let cancellation_pending = pending_cancellations
+            .iter()
+            .any(|item| item.workspace_id == id);
+        let schedule_blocked_reason = if cancellation_pending {
+            Some(crate::agents::scheduler::PENDING_CANCELLATION_REASON.to_string())
+        } else {
+            schedule
+                .blocked_reason(wake_monitor_available)
+                .map(str::to_owned)
+        };
+        let next_run_in_seconds = (schedule.wants_countdown() && schedule_blocked_reason.is_none())
             .then(|| scheduler_seconds.get(&locator.default_agent_id).copied())
             .flatten();
 
@@ -2982,7 +3125,11 @@ pub async fn workspace_list(state: State<'_, AppState>) -> Result<Vec<WorkspaceL
             running_task_count,
             schedule_enabled: schedule.enabled,
             schedule_paused: schedule.paused,
+            schedule_blocked_reason,
+            schedule_waiting_reason: script_notice
+                .or_else(|| scheduler_waiting.get(&locator.default_agent_id).cloned()),
             schedule_kind: schedule.kind,
+            schedule_allowed_blocks: schedule.allowed_blocks,
             next_run_in_seconds,
             unread: locator.last_run_completed_at > 0
                 && locator.last_run_completed_at > locator.last_opened_at,
@@ -3047,39 +3194,93 @@ pub async fn workspace_run_now(
 /// `next_run_at_unix_ms` is recomputed against the new mode so the
 /// schedule is exact ("next run at ...") from the user's perspective.
 #[tauri::command]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Tauri named command arguments preserve the existing IPC payload"
+)]
 pub async fn workspace_set_schedule(
     workspace_id: String,
     kind: Option<crate::config::workspace_config::ScheduleKind>,
+    allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
+    condition: Option<crate::agents::scripts::ScriptConfig>,
+    unattended: Option<bool>,
+    unattended_approval_id: Option<String>,
+    before: Option<crate::agents::scripts::ScriptConfig>,
+    after: Option<crate::agents::scripts::ScriptConfig>,
+    before_unattended: Option<bool>,
+    after_unattended: Option<bool>,
+    before_unattended_approval_id: Option<String>,
+    after_unattended_approval_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let workspace_id = resolve_workspace_id(state.inner(), Some(workspace_id))?;
-    let ((), config) = state.update_workspace_config(&workspace_id, |config| {
-        match kind {
-            None => {
-                // Disabling clears the pause + next-run anchor so a future
-                // re-enable starts from a fresh schedule.
-                config.schedule.enabled = false;
-                config.schedule.paused = false;
-                config.schedule.next_run_at_unix_ms = None;
+    use crate::agents::scripts::ScriptPhase;
+    let (confirmed, before_confirmed, after_confirmed) = {
+        let scheduler = state.scheduler.lock().await;
+        let runtime = scheduler.scripts.get(&workspace_id);
+        (
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::Condition, unattended_approval_id.as_ref())
+            }),
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::Before, before_unattended_approval_id.as_ref())
+            }),
+            runtime.and_then(|r| {
+                r.confirmed_for(ScriptPhase::After, after_unattended_approval_id.as_ref())
+            }),
+        )
+    };
+    crate::agents::init::update_schedule_and_reconcile(
+        state.inner(),
+        &workspace_id,
+        true,
+        |config| {
+            for script in [&condition, &before, &after].into_iter().flatten() {
+                script.validate()?;
+                if kind.as_ref().is_some_and(|kind| {
+                    !matches!(
+                        kind,
+                        crate::config::workspace_config::ScheduleKind::EnhancedInterval { .. }
+                            | crate::config::workspace_config::ScheduleKind::EnhancedCron { .. }
+                    )
+                }) {
+                    return Err("Condition scripts require enhanced scheduling.".into());
+                }
             }
-            Some(new_kind) => {
-                // Validate before saving — surfaces "invalid cron" /
-                // "unknown timezone" / "interval=0" as a clean error to the UI.
-                let now = now_millis();
-                let next = crate::agents::schedule::compute_next_run_at(&new_kind, now)?;
-                config.schedule.enabled = true;
-                config.schedule.kind = new_kind;
-                config.schedule.next_run_at_unix_ms = Some(next);
-            }
-        }
-        config.updated_at = now_millis();
-        Ok(())
-    })?;
-
-    let mut scheduler = state.scheduler.lock().await;
-    crate::agents::init::apply_workspace_schedule(&mut scheduler, &config);
-
-    Ok(())
+            config.schedule.condition_consent = crate::agents::scripts::saved_consent(
+                state.inner(),
+                config,
+                &condition,
+                unattended,
+                confirmed.as_ref(),
+            )?;
+            config.schedule.before_consent = crate::agents::scripts::saved_phase_consent(
+                state.inner(),
+                config,
+                ScriptPhase::Before,
+                &before,
+                before_unattended,
+                before_confirmed.as_ref(),
+            )?;
+            config.schedule.after_consent = crate::agents::scripts::saved_phase_consent(
+                state.inner(),
+                config,
+                ScriptPhase::After,
+                &after,
+                after_unattended,
+                after_confirmed.as_ref(),
+            )?;
+            config.schedule.condition = condition;
+            config.schedule.before = before;
+            config.schedule.after = after;
+            config
+                .schedule
+                .set_configuration(kind, allowed_blocks, now_millis())?;
+            config.updated_at = now_millis();
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Preview the next `n` fire times for a candidate schedule without
@@ -3098,7 +3299,7 @@ pub async fn workspace_preview_schedule(
     let now = now_millis();
     let n = count.unwrap_or(3).clamp(1, 10);
     match &kind {
-        ScheduleKind::Interval { .. } => {
+        ScheduleKind::Interval { .. } | ScheduleKind::EnhancedInterval { .. } => {
             // For interval mode the next-N preview is just repeated
             // increments — `now + N*interval` is informative enough
             // and avoids implying the cadence is anchored to wall-clock
@@ -3107,7 +3308,9 @@ pub async fn workspace_preview_schedule(
                 &kind, now,
             )?])
         }
-        ScheduleKind::Cron { .. } => crate::agents::schedule::upcoming_cron_runs(&kind, now, n),
+        ScheduleKind::Cron { .. } | ScheduleKind::EnhancedCron { .. } => {
+            crate::agents::schedule::upcoming_cron_runs(&kind, now, n)
+        }
     }
 }
 
@@ -3131,19 +3334,20 @@ pub async fn workspace_set_schedule_paused(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let workspace_id = resolve_workspace_id(state.inner(), Some(workspace_id))?;
-    let ((), config) = state.update_workspace_config(&workspace_id, |config| {
-        if !config.schedule.enabled {
-            return Err("Workspace is not periodic.".to_string());
-        }
-        config.schedule.paused = paused;
-        config.updated_at = now_millis();
-        Ok(())
-    })?;
-
-    let mut scheduler = state.scheduler.lock().await;
-    crate::agents::init::apply_workspace_schedule(&mut scheduler, &config);
-
-    Ok(())
+    crate::agents::init::update_schedule_and_reconcile(
+        state.inner(),
+        &workspace_id,
+        false,
+        |config| {
+            if !config.schedule.enabled {
+                return Err("Workspace is not periodic.".to_string());
+            }
+            config.schedule.paused = paused;
+            config.updated_at = now_millis();
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Globally pause or resume the agent scheduler ("pause all workspaces").
@@ -5252,6 +5456,168 @@ mod tests {
             .await
             .expect("details")
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_status_tracks_live_wake_registration_for_enabled_and_disabled_schedules() {
+        use crate::config::workspace_config::ScheduleKind;
+        for enabled in [false, true] {
+            for available in [false, true] {
+                let workspace = DetailsWorkspace::new().await;
+                crate::agents::init::update_schedule_and_reconcile(
+                    &workspace.state,
+                    DETAILS_WORKSPACE_ID,
+                    true,
+                    |config| {
+                        config.schedule.enabled = enabled;
+                        config.schedule.kind = ScheduleKind::EnhancedInterval {
+                            interval_seconds: 15,
+                        };
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+                let mut scheduler = workspace.state.scheduler.lock().await;
+                let registration =
+                    crate::agents::init::initialize_wake_monitor(&mut scheduler, |_| {
+                        if available {
+                            Ok(())
+                        } else {
+                            Err("observer unavailable".into())
+                        }
+                    });
+                assert_eq!(registration.is_ok(), available);
+                drop(scheduler);
+                let details = workspace.details(WITHOUT_FILES).await;
+                let entries = workspace_list_entries(&workspace.state).await.unwrap();
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.id == DETAILS_WORKSPACE_ID)
+                    .unwrap();
+                assert_eq!(details.schedule_enabled, enabled);
+                assert_eq!(entry.schedule_enabled, enabled);
+                assert_eq!(
+                    details.schedule_blocked_reason.is_some(),
+                    enabled && !available
+                );
+                assert_eq!(
+                    entry.schedule_blocked_reason,
+                    details.schedule_blocked_reason
+                );
+                assert_eq!(details.next_run_in_seconds.is_some(), enabled && available);
+                assert_eq!(entry.next_run_in_seconds.is_some(), enabled && available);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_status_reports_one_waiting_check_and_clears_it_after_pause_or_disable() {
+        use crate::config::workspace_config::ScheduleKind;
+        let workspace = DetailsWorkspace::new().await;
+        crate::agents::init::update_schedule_and_reconcile(
+            &workspace.state,
+            DETAILS_WORKSPACE_ID,
+            true,
+            |config| {
+                config.schedule.enabled = true;
+                config.schedule.kind = ScheduleKind::EnhancedInterval {
+                    interval_seconds: 15,
+                };
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let mut scheduler = workspace.state.scheduler.lock().await;
+            scheduler.set_wake_monitor_available(true, 0, std::time::Instant::now());
+            scheduler.wait_for_session(DETAILS_MANAGER_ID);
+        }
+        let details = workspace.details(WITHOUT_FILES).await;
+        assert!(!details.schedule_paused);
+        assert!(details.schedule_blocked_reason.is_none());
+        assert_eq!(
+            details.schedule_waiting_reason.as_deref(),
+            Some("Waiting for the workspace to become available.")
+        );
+        let entries = workspace_list_entries(&workspace.state).await.unwrap();
+        assert_eq!(
+            entries[0].schedule_waiting_reason,
+            details.schedule_waiting_reason
+        );
+        for enabled in [true, false] {
+            crate::agents::init::update_schedule_and_reconcile(
+                &workspace.state,
+                DETAILS_WORKSPACE_ID,
+                true,
+                |config| {
+                    config.schedule.enabled = enabled;
+                    config.schedule.paused = enabled;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            let details = workspace.details(WITHOUT_FILES).await;
+            assert!(details.schedule_waiting_reason.is_none());
+            assert_eq!(details.schedule_enabled, enabled);
+            assert_eq!(details.schedule_paused, enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn details_exposes_failed_cancellation_even_when_schedule_is_disabled() {
+        let workspace = DetailsWorkspace::new().await;
+        {
+            let mut scheduler = workspace.state.scheduler.lock().await;
+            let definition = crate::agents::AgentDefinition::new(DETAILS_MANAGER_ID, "Main")
+                .with_workspace_id(DETAILS_WORKSPACE_ID);
+            scheduler.register_definition(definition);
+            let id = scheduler.create_instance(DETAILS_MANAGER_ID).unwrap();
+            assert_eq!(scheduler.next_ready(), Some(id.clone()));
+            scheduler.retain_failed_cancellation(&id, "session", "run", None);
+            crate::agents::init::initialize_wake_monitor(&mut scheduler, |_| Ok(())).unwrap();
+        }
+        crate::agents::init::update_schedule_and_reconcile(
+            &workspace.state,
+            DETAILS_WORKSPACE_ID,
+            true,
+            |config| {
+                config.schedule.enabled = false;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let details = workspace.details(WITHOUT_FILES).await;
+        assert!(!details.schedule_enabled);
+        assert_eq!(
+            details.schedule_blocked_reason.as_deref(),
+            Some(crate::agents::scheduler::PENDING_CANCELLATION_REASON)
+        );
+        assert!(details.next_run_in_seconds.is_none());
+        let entries = workspace_list_entries(&workspace.state).await.unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == DETAILS_WORKSPACE_ID)
+            .unwrap();
+        assert_eq!(
+            entry.schedule_blocked_reason,
+            details.schedule_blocked_reason
+        );
+        assert!(entry.next_run_in_seconds.is_none());
+        workspace
+            .state
+            .scheduler
+            .lock()
+            .await
+            .finish_pending_cancellation(DETAILS_WORKSPACE_ID, "run");
+        assert!(workspace
+            .details(WITHOUT_FILES)
+            .await
+            .schedule_blocked_reason
+            .is_none());
     }
 
     #[tokio::test]

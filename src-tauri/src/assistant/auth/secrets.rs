@@ -97,6 +97,11 @@ impl ProviderSecretStorage {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn before_test_read(secret_ref: &str, hook: impl FnOnce() + Send + 'static) {
+        test_vault::before_read(secret_ref, Box::new(hook));
+    }
+
     #[allow(dead_code)]
     #[cfg_attr(test, allow(clippy::unnecessary_wraps))]
     pub fn get_secret(secret_ref: &str) -> Result<Option<String>, keyring::Error> {
@@ -200,7 +205,22 @@ mod test_vault {
             .insert(key(service, secret_ref), value.to_string());
     }
 
+    type ReadHook = Box<dyn FnOnce() + Send>;
+
+    fn read_hooks() -> &'static Mutex<HashMap<String, ReadHook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, ReadHook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn before_read(secret_ref: &str, hook: ReadHook) {
+        read_hooks().lock().unwrap().insert(secret_ref.into(), hook);
+    }
+
     pub(crate) fn get(service: &str, secret_ref: &str) -> Option<String> {
+        let hook = read_hooks().lock().unwrap().remove(secret_ref);
+        if let Some(hook) = hook {
+            hook();
+        }
         vault()
             .lock()
             .expect("test vault lock")

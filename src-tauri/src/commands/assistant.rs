@@ -414,6 +414,11 @@ pub async fn assistant_send_message(
     provider_connection(state.inner(), &connection_id)?;
     let mut content = vec![ContentPart::Text { text: message }];
     content.extend(images);
+    // Order manual arrival with scheduled provider commitment. Keep admission
+    // closed until the user signal is durable, so a new claim cannot enter
+    // between revoking the old one and persisting the pending request.
+    let scheduler = state.scheduler.lock().await;
+    scheduler.yield_to_manual(&workspace_id);
     let assistant_message = repository::create_user_message_with_content(
         &target_pool,
         session.id.clone(),
@@ -421,6 +426,7 @@ pub async fn assistant_send_message(
         Some(connection_id.as_str()),
     )
     .await?;
+    drop(scheduler);
     emit_event(
         &app,
         &workspace_id,
@@ -483,7 +489,8 @@ pub async fn assistant_compact_session(
         compaction::VERBATIM_TAIL_MAX_TOKENS,
         &mut conversation,
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
 
     let Some(outcome) = outcome else {
         return Ok(AssistantCompactionResult {

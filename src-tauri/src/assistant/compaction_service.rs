@@ -1,7 +1,7 @@
 use crate::assistant::{conversation::RunConversation, conversation::COMPACTION_METADATA_SOURCE};
 use std::path::Path;
 
-use crate::assistant::compaction::{self, CompactionOutcome, PreparedCompaction};
+use crate::assistant::compaction::{self, CompactionError, CompactionOutcome, PreparedCompaction};
 use crate::assistant::repository::{self, CreateCompactionParams, CreateMessageParams};
 use crate::assistant::types::{
     AssistantSession, CompactionTrigger, ContentPart, MessageRole, ProviderConnection,
@@ -88,7 +88,7 @@ pub async fn compact_conversation(
     run_id: Option<&str>,
     verbatim_tail_tokens: usize,
     conversation: &mut RunConversation,
-) -> Result<Option<CompactionOutcome>, String> {
+) -> Result<Option<CompactionOutcome>, CompactionError> {
     let prepared = compaction::prepare_compaction(
         session,
         connection,
@@ -102,7 +102,8 @@ pub async fn compact_conversation(
     match prepared {
         Some(prepared) => commit_compaction(pool, conversation, prepared)
             .await
-            .map(Some),
+            .map(Some)
+            .map_err(CompactionError::from),
         None => Ok(None),
     }
 }
@@ -114,7 +115,7 @@ pub async fn compact_for_context_limit_recovery(
     summary_working_dir: Option<&Path>,
     run_id: &str,
     conversation: &mut RunConversation,
-) -> Result<Option<CompactionOutcome>, String> {
+) -> Result<Option<CompactionOutcome>, CompactionError> {
     let prepared = compaction::prepare_context_limit_recovery(
         session,
         connection,
@@ -126,7 +127,8 @@ pub async fn compact_for_context_limit_recovery(
     match prepared {
         Some(prepared) => commit_compaction(pool, conversation, prepared)
             .await
-            .map(Some),
+            .map(Some)
+            .map_err(CompactionError::from),
         None => Ok(None),
     }
 }

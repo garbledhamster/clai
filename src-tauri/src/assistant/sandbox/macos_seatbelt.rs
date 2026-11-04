@@ -22,7 +22,10 @@ enum PathFilter {
     Subpath(String),
 }
 
-pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
+pub(crate) async fn run_guarded(
+    mut command: SandboxCommand,
+    start_check: Option<super::runner::StartCheck<'_>>,
+) -> Result<Option<SandboxCommandOutput>, String> {
     validate_profile_paths(&command)?;
     prune_missing_grants(&mut command);
 
@@ -67,6 +70,13 @@ pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, St
         .env("TEMP", &private_tmp);
     prepare_stdio(&mut child_command);
 
+    // No await separates this logical start from process spawn. The callback
+    // orders admission with wake/manual revocation without holding a gate over I/O.
+    if start_check.is_some_and(|check| !check()) {
+        cleanup_ephemeral_tmp_dir(&private_tmp, ephemeral);
+        return Ok(None);
+    }
+
     let child = match child_command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -96,7 +106,7 @@ pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, St
         return Err(classify_sandbox_exec_failure(&output.stderr));
     }
 
-    Ok(output)
+    Ok(Some(output))
 }
 
 fn validate_profile_paths(command: &SandboxCommand) -> Result<(), String> {
@@ -874,6 +884,7 @@ mod tests {
     #[test]
     fn setup_failure_requires_sandbox_exec_stderr_prefix() {
         let output = SandboxCommandOutput {
+            timed_out: false,
             cwd: PathBuf::from("/tmp"),
             exit_code: Some(1),
             success: false,

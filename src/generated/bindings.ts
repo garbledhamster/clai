@@ -483,13 +483,34 @@ export type SandboxSessionBusConfig = "deny" | "allow";
  * surfacing as a confusing save error when the user's interval was
  * actually 24h.
  */
-export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { "type": "cron", expression: string, 
+export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { "type": "enhancedInterval", intervalSeconds: number, } | { "type": "enhancedCron", expression: string, timezone: string, } | { "type": "cron", expression: string, 
 /**
  * IANA timezone name. Empty / unknown values are rejected by
  * `compute_next_run_at` at save time so an invalid string can't
  * silently fall through to UTC.
  */
 timezone: string, };
+
+export type ScriptApproval = { phase?: ScriptPhase, id: string, purpose: string, content: string, interpreter: string, timeoutSeconds: number, access: string, };
+
+export type ScriptConfig = { source: ScriptSource, 
+/**
+ * One executable, without arguments. The selected language determines -c/-e.
+ */
+interpreter: string, timeoutSeconds: number, };
+
+export type ScriptPhase = "condition" | "before" | "after";
+
+export type ScriptResult = { 
+/**
+ * Some(false): known not launched. Some(true): known launched and collected.
+ * None: legacy or uncertain launch/completion; cleanup must remain actionable.
+ */
+started?: boolean, stdout: string, stderr: string, exitCode: number | null, durationMs: bigint, timedOut: boolean, error: string | null, };
+
+export type ScriptSource = { "type": "inline", content: string, } | { "type": "file", path: string, };
+
+export type ScriptStatus = { pending: ScriptApproval | null, result: ScriptResult | null, error: string | null, running: boolean, };
 
 export type SegmentApproval = { text: string, kind: SegmentKind, suggestedPrefix: string, };
 
@@ -597,6 +618,11 @@ providerId: string | null, apiKey: string | null, authMode: AuthMode | null, bas
 
 export type WebCapabilityConfig = { enabled: boolean, };
 
+/**
+ * Selected Monday-first quarter-hours, 0..672. Empty means unrestricted.
+ */
+export type WeeklyAllowedBlocks = { timezone: string, slots: Array<number>, };
+
 export type WorkspaceAgentCreateRequest = { workspaceId: string, name: string, description: string, selectedSkillIds: Array<string>, selectedMcpServerIds: Array<string>, providerConnectionIds: Array<string>, execution: ExecutionCapabilityConfig, enabled: boolean, 
 /**
  * Optional explicit id; if absent, a fresh UUID is generated.
@@ -629,7 +655,7 @@ export type WorkspaceAgentSummary = { id: string, displayName: string, isDefault
 
 export type WorkspaceAgentUpdateRequest = { workspaceId: string, agentId: string, name: string, description: string, selectedSkillIds: Array<string>, selectedMcpServerIds: Array<string>, providerConnectionIds: Array<string>, execution: ExecutionCapabilityConfig, enabled: boolean, };
 
-export type WorkspaceDetails = { workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
+export type WorkspaceDetails = { scheduleBefore?: ScriptConfig, scheduleAfter?: ScriptConfig, scheduleBeforeUnattended?: boolean, scheduleAfterUnattended?: boolean, scheduleBeforeStatus?: ScriptStatus, scheduleAfterStatus?: ScriptStatus, scheduleCleanupPending?: boolean, scheduleCleanupId?: string, scheduleCleanupInterrupted?: boolean, scheduleCondition?: ScriptConfig, scheduleConditionUnattended?: boolean, scheduleScriptStatus?: ScriptStatus, workspaceId: string, kind: string, title: string, agentId: string | null, assignedAgents: Array<WorkspaceAgentResponse>, tasks: Array<WorkspaceTaskResponse>, defaultWorkspaceAgentId: string | null, rootPath: string | null, providerConnectionIds: Array<string>, providerConnectionNames: Array<string>, selectedMcpServerIds: Array<string>, 
 /**
  * Attached-but-toggled-off MCP servers for the workspace conversation,
  * sourced from the manager row's `disabled` ref flags in the workspace
@@ -674,14 +700,14 @@ artifactLatestModifiedAt: bigint,
  * "Queued" chip + remove affordance; live updates flow through the
  * `QueuedMessagesDelivered` / `MessageDeleted` events.
  */
-queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boolean, schedulePaused: boolean, 
+queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boolean, schedulePaused: boolean, scheduleBlockedReason: string | null, 
 /**
  * The workspace's schedule mode (interval vs cron). Empty when the
  * workspace isn't scheduled. The frontend reads this to render the
  * "every Nm" / "Cron: …" label and to populate the workspace
  * settings modal.
  */
-scheduleKind: ScheduleKind | null, nextRunInSeconds: bigint | null, };
+scheduleKind: ScheduleKind | null, scheduleAllowedBlocks: WeeklyAllowedBlocks | null, nextRunInSeconds: bigint | null, scheduleWaitingReason: string | null, };
 
 /**
  * The one expensive extra the details payload can carry: `includeFiles`
@@ -732,7 +758,7 @@ export type WorkspaceFileContent = { path: string, viewer: string, content: stri
 
 export type WorkspaceFileEntry = { path: string, relativePath: string, name: string, viewer: string, size: bigint | null, updatedAt: bigint | null, preview: string | null, };
 
-export type WorkspaceListEntry = { id: string, kind: string, title: string, agentId: string | null, enabled: boolean, messageCount: bigint, runningTaskCount: bigint, scheduleEnabled: boolean, schedulePaused: boolean, 
+export type WorkspaceListEntry = { id: string, kind: string, title: string, agentId: string | null, enabled: boolean, messageCount: bigint, runningTaskCount: bigint, scheduleEnabled: boolean, schedulePaused: boolean, scheduleBlockedReason: string | null, 
 /**
  * Schedule mode (interval vs cron). Empty when the workspace is
  * not scheduled. The Fleet card reads this to render the cadence
@@ -749,7 +775,7 @@ unread: boolean,
  * User starred this workspace — the rail pins it in the "Starred"
  * section. Derived from `WorkspaceConfig::starred_at > 0`.
  */
-starred: boolean, updatedAt: bigint, };
+starred: boolean, updatedAt: bigint, scheduleWaitingReason: string | null, scheduleAllowedBlocks: WeeklyAllowedBlocks | null, };
 
 export type WorkspaceSessionBinding = { session: AssistantSession, providerConnectionId: string | null, };
 

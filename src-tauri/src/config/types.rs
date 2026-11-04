@@ -644,7 +644,16 @@ impl AgentConfig {
                     );
                 }
             }
-            ScheduleKind::Cron { expression, .. } => {
+            ScheduleKind::EnhancedInterval { interval_seconds } => {
+                if *interval_seconds < 15 {
+                    return Err(
+                        "Scheduled agents must have an interval of at least 15 seconds."
+                            .to_string(),
+                    );
+                }
+            }
+            ScheduleKind::Cron { expression, .. }
+            | ScheduleKind::EnhancedCron { expression, .. } => {
                 if expression.trim().is_empty() {
                     return Err("Cron-scheduled agents must have a cron expression.".to_string());
                 }

@@ -177,21 +177,25 @@ const formatNextRun = (seconds: number | bigint | null | undefined): string | nu
 };
 
 const formatSchedulePill = (details: WorkspaceDetails | null): string | null => {
-  if (!details?.scheduleEnabled) return null;
+  if (!details?.scheduleEnabled && !details?.scheduleBlockedReason) return null;
   const kind = details.scheduleKind;
   let cadence: string | null = null;
   if (kind?.type === 'interval' && Number(kind.intervalMinutes) > 0) {
     cadence = `every ${Number(kind.intervalMinutes)}m`;
+  } else if (kind?.type === 'enhancedInterval' && Number(kind.intervalSeconds) >= 15) {
+    cadence = `every ${Number(kind.intervalSeconds)}s`;
   } else if (
-    kind?.type === 'cron' &&
+    (kind?.type === 'cron' || kind?.type === 'enhancedCron') &&
     typeof kind.expression === 'string' &&
     kind.expression.trim()
   ) {
     cadence = `cron: ${kind.expression.trim()}`;
   }
+  if (details.scheduleBlockedReason) return details.scheduleBlockedReason;
   if (details.schedulePaused) {
     return cadence ? `Paused · ${cadence}` : 'Paused';
   }
+  if (details.scheduleWaitingReason) return `Waiting · ${cadence || 'scheduled check'}`;
   return cadence ? `Periodic · ${cadence}` : 'Periodic';
 };
 
@@ -1253,10 +1257,10 @@ const WorkspaceHeader = ({
             {currentTitle}
           </h1>
         )}
-        {scheduleEnabled && (
+        {(scheduleEnabled || details?.scheduleBlockedReason) && (
           <span
-            className={`${styles.schedulePill} ${schedulePaused ? styles.schedulePillPaused : styles.schedulePillActive}`}
-            title={schedulePillText || undefined}
+            className={`${styles.schedulePill} ${schedulePaused || details?.scheduleBlockedReason ? styles.schedulePillPaused : styles.schedulePillActive} ${details?.scheduleBlockedReason ? styles.schedulePillBlocked : ''}`}
+            title={details?.scheduleBlockedReason || details?.scheduleWaitingReason || schedulePillText || undefined}
           >
             {schedulePillText}
           </span>

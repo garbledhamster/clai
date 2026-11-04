@@ -46,8 +46,10 @@ const scheduleSummary = (details: WorkspaceDetails | null): string => {
   if (!details?.scheduleEnabled) return 'Off';
   const kind = details.scheduleKind;
   let when = 'On';
-  if (kind?.type === 'cron') {
+  if (kind?.type === 'cron' || kind?.type === 'enhancedCron') {
     when = kind.expression;
+  } else if (kind?.type === 'enhancedInterval') {
+    when = `Every ${kind.intervalSeconds} sec`;
   } else if (kind?.type === 'interval') {
     const mins = kind.intervalMinutes;
     when = mins % 60 === 0 ? `Every ${mins / 60} h` : `Every ${mins} min`;

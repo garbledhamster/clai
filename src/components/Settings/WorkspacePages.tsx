@@ -9,9 +9,12 @@ import React, { useCallback, useEffect, useImperativeHandle, useState } from 're
 import { invoke } from '@tauri-apps/api/core';
 import { setWorkspaceTitle } from '../../workspace/client';
 import IntervalSelect from './IntervalSelect';
+import WeeklyBlockGrid from './WeeklyBlockGrid';
+import ScheduleCondition, { scriptError } from './ScheduleCondition';
+import { formatNextRun } from '../../fleet/workspaceStatus';
 import { Switch } from './ListEditors';
 import { useReportDirty, type SectionHandle } from './sectionHandle';
-import type { ScheduleKind, WorkspaceDetails } from '../../generated/bindings';
+import type { ScheduleKind, ScriptConfig, WorkspaceDetails } from '../../generated/bindings';
 import form from './SettingsForm.module.css';
 import styles from './WorkspacePages.module.css';
 
@@ -132,7 +135,8 @@ export const GeneralPage = ({ ref, workspaceId, details, saving, onDirtyChange }
 
 type ScheduleDraft =
   | { type: 'interval'; intervalMinutes: number }
-  | { type: 'cron'; expression: string; timezone: string };
+  | { type: 'enhancedInterval'; intervalSeconds: number }
+  | { type: 'cron' | 'enhancedCron'; expression: string; timezone: string };
 
 // One click for the common cases; the expression stays editable below.
 const CRON_PRESETS = [
@@ -145,6 +149,9 @@ const CRON_PRESETS = [
 ];
 
 const draftFrom = (kind: ScheduleKind | null | undefined): ScheduleDraft => {
+  const enhanced = kind;
+  if (enhanced?.type === 'enhancedInterval') return { ...enhanced };
+  if (enhanced?.type === 'enhancedCron') return { ...enhanced };
   if (kind?.type === 'cron') {
     return { type: 'cron', expression: kind.expression || '', timezone: kind.timezone || '' };
   }
@@ -178,6 +185,46 @@ const formatRelative = (ms: number): string => {
   return day < 30 ? `in ${day}d` : '';
 };
 
+// Each phase follows only its own saved configuration. Status polling and
+// approval changes in another phase must not replace an unsaved script draft.
+const useScheduleScriptDraft = (savedValue: ScriptConfig | null | undefined, savedUnattended: boolean | undefined) => {
+  const saved = JSON.stringify(savedValue ?? null);
+  const [value, setValue] = useState<ScriptConfig | null>(() => savedValue ?? null);
+  const [unattended, setUnattended] = useState(!!savedUnattended);
+  const [approvalId, setApprovalId] = useState<string | null>(null);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- only this phase's persisted configuration changed.
+    setValue(JSON.parse(saved) as ScriptConfig | null);
+  }, [saved]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- consent follows the exact saved script; polling preserves draft approval.
+    setUnattended(JSON.stringify(value) === saved && !!savedUnattended);
+    setApprovalId(null);
+  }, [value, saved, savedUnattended]);
+
+  return {
+    value, unattended, approvalId,
+    dirty: JSON.stringify(value) !== saved || unattended !== !!savedUnattended || approvalId !== null,
+    change: (next: ScriptConfig | null) => {
+      setValue(next);
+      setUnattended(false);
+      setApprovalId(null);
+    },
+    changeUnattended: (checked: boolean, id?: string) => {
+      setUnattended(checked);
+      setApprovalId(id ?? null);
+    },
+    authorizeSaved: () => {
+      if (JSON.stringify(value) === saved) {
+        setUnattended(true);
+        setApprovalId(null);
+      }
+    },
+  };
+};
+
 export const SchedulePage = ({
   ref,
   workspaceId,
@@ -189,6 +236,11 @@ export const SchedulePage = ({
   const [enabled, setEnabled] = useState(!!details?.scheduleEnabled);
   const [draft, setDraft] = useState(() => draftFrom(details?.scheduleKind));
   // Pause/Resume and Run now are immediate commands with their own busy state.
+  const [slots, setSlots] = useState<number[]>(() => details?.scheduleAllowedBlocks?.slots ?? []);
+  const [blockTimezone, setBlockTimezone] = useState(() => details?.scheduleAllowedBlocks?.timezone ?? 'UTC');
+  const condition = useScheduleScriptDraft(details?.scheduleCondition, details?.scheduleConditionUnattended);
+  const before = useScheduleScriptDraft(details?.scheduleBefore, details?.scheduleBeforeUnattended);
+  const after = useScheduleScriptDraft(details?.scheduleAfter, details?.scheduleAfterUnattended);
   const [commandBusy, setCommandBusy] = useState(false);
   const busy = saving || commandBusy;
   const [error, setError] = useState<string | null>(null);
@@ -212,16 +264,20 @@ export const SchedulePage = ({
   // Keyed on the schedule's value, not its object: the workspace re-fetches
   // details every 5 s, and a same-value refetch must not discard the draft.
   const savedKind = JSON.stringify(details?.scheduleKind ?? null);
+  const savedBlocks = JSON.stringify(details?.scheduleAllowedBlocks ?? null);
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs the two-field draft when the saved schedule changes underneath.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs configuration only when saved values change; status polling preserves the draft.
     setEnabled(!!details?.scheduleEnabled);
     setDraft(draftFrom(JSON.parse(savedKind) as ScheduleKind | null));
-  }, [details?.scheduleEnabled, savedKind]);
+    const blocks = JSON.parse(savedBlocks);
+    setSlots(blocks?.slots ?? []);
+    setBlockTimezone(blocks?.timezone ?? 'UTC');
+  }, [details?.scheduleEnabled, savedKind, savedBlocks]);
 
   // Next fire times for the cron being typed, so it can be checked before Save.
   useEffect(() => {
-    const expression = draft.type === 'cron' ? draft.expression.trim() : '';
-    const timezone = draft.type === 'cron' ? draft.timezone.trim() : '';
+    const expression = draft.type === 'cron' || draft.type === 'enhancedCron' ? draft.expression.trim() : '';
+    const timezone = draft.type === 'cron' || draft.type === 'enhancedCron' ? draft.timezone.trim() : '';
     if (!enabled || !expression || !timezone) {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- clears the preview when there is nothing to preview; the fetch below is async.
       setPreview([]);
@@ -244,24 +300,41 @@ export const SchedulePage = ({
   }, [enabled, draft]);
 
   const paused = !!details?.schedulePaused;
+  const blockedReason = details?.scheduleBlockedReason;
+  const waitingReason = details?.scheduleWaitingReason;
   const savedOn = !!details?.scheduleEnabled;
+  const enhanced = draft.type === 'enhancedInterval' || draft.type === 'enhancedCron';
 
   useReportDirty(
-    enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)),
+    enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)) ||
+      JSON.stringify(slots) !== JSON.stringify(details?.scheduleAllowedBlocks?.slots ?? []) ||
+      (draft.type === 'enhancedInterval' && blockTimezone !== (details?.scheduleAllowedBlocks?.timezone ?? 'UTC')) ||
+      (enhanced && (condition.dirty || before.dirty || after.dirty)),
     onDirtyChange
   );
 
   const setType = (type: 'interval' | 'cron') => {
     setDraft((prev) => {
-      if (prev.type === type) return prev;
+      const enhanced = prev.type === 'enhancedInterval' || prev.type === 'enhancedCron';
+      if ((type === 'interval' && (prev.type === 'interval' || prev.type === 'enhancedInterval')) ||
+          (type === 'cron' && (prev.type === 'cron' || prev.type === 'enhancedCron'))) return prev;
       return type === 'cron'
-        ? { type: 'cron', expression: '0 * * * *', timezone: hostTimezone || 'UTC' }
-        : { type: 'interval', intervalMinutes: 30 };
+        ? { type: enhanced ? 'enhancedCron' : 'cron', expression: '0 * * * *', timezone: hostTimezone || 'UTC' }
+        : enhanced ? { type: 'enhancedInterval', intervalSeconds: 1800 } : { type: 'interval', intervalMinutes: 30 };
     });
   };
 
   const build = useCallback((): { ok: true; kind: ScheduleKind | null } | { ok: false; error: string } => {
+    const problem = enhanced ? scriptError(condition.value) || scriptError(before.value, 'before') || scriptError(after.value, 'after') : null;
+    if (problem) return { ok: false, error: problem };
     if (!enabled) return { ok: true, kind: null };
+    if (draft.type === 'enhancedInterval') {
+      const seconds = Number(draft.intervalSeconds);
+      if (!Number.isInteger(seconds) || seconds < 15 || seconds > 4294967295) {
+        return { ok: false, error: 'Interval must be a whole number of at least 15 seconds.' };
+      }
+      return { ok: true, kind: { type: 'enhancedInterval', intervalSeconds: seconds } as ScheduleKind };
+    }
     if (draft.type === 'interval') {
       const mins = Number(draft.intervalMinutes);
       if (!Number.isFinite(mins) || mins < 1 || mins > 1440) {
@@ -273,8 +346,8 @@ export const SchedulePage = ({
     const timezone = draft.timezone.trim();
     if (!expression) return { ok: false, error: 'Cron expression is required.' };
     if (!timezone) return { ok: false, error: 'Timezone is required.' };
-    return { ok: true, kind: { type: 'cron', expression, timezone } as ScheduleKind };
-  }, [enabled, draft]);
+    return { ok: true, kind: { type: draft.type, expression, timezone } as ScheduleKind };
+  }, [enabled, draft, enhanced, condition.value, before.value, after.value]);
 
   const runCommand = useCallback(async (call: () => Promise<unknown>, fallback: string) => {
     setCommandBusy(true);
@@ -302,7 +375,14 @@ export const SchedulePage = ({
         return { ok: false, error: built.error };
       }
       try {
-        await invoke('workspace_set_schedule', { workspaceId, kind: built.kind });
+        await invoke('workspace_set_schedule', { workspaceId, kind: built.kind,
+          ...(enhanced ? {
+            condition: condition.value, unattended: !!condition.value && condition.unattended, unattendedApprovalId: condition.approvalId,
+            before: before.value, beforeUnattended: !!before.value && before.unattended, beforeUnattendedApprovalId: before.approvalId,
+            after: after.value, afterUnattended: !!after.value && after.unattended, afterUnattendedApprovalId: after.approvalId,
+            allowedBlocks: { timezone: draft.type === 'enhancedCron' ? draft.timezone.trim() : blockTimezone.trim(), slots },
+          } : {}),
+        });
         setError(null);
         return { ok: true };
       } catch (err) {
@@ -317,7 +397,7 @@ export const SchedulePage = ({
 
   return (
     <div className={form.page}>
-      <div className={form.columns}>
+      <div className={`${form.columns} ${styles.scheduleColumns}`}>
         <section className={form.panel}>
           <header className={form.panelHeader}>
             <h3 id="schedule-when" className={form.panelTitle}>When the main agent runs</h3>
@@ -331,13 +411,25 @@ export const SchedulePage = ({
               disabled={busy}
             />
 
+            <Switch
+              label="Use enhanced scheduling"
+              hint="Use second intervals and restart schedules after sleep."
+              checked={draft.type === 'enhancedInterval' || draft.type === 'enhancedCron'}
+              onChange={(checked) => setDraft((prev) => {
+                if (prev.type === 'interval') return checked ? { type: 'enhancedInterval', intervalSeconds: prev.intervalMinutes * 60 } : prev;
+                if (prev.type === 'enhancedInterval') return checked ? prev : { type: 'interval', intervalMinutes: Math.max(1, Math.ceil(prev.intervalSeconds / 60)) };
+                return { ...prev, type: checked ? 'enhancedCron' : 'cron' };
+              })}
+              disabled={off}
+            />
+
             <div className={form.segmented} role="group" aria-label="Schedule type">
               {(['interval', 'cron'] as const).map((type) => (
                 <button
                   key={type}
                   type="button"
                   className={form.segment}
-                  aria-pressed={draft.type === type}
+                  aria-pressed={type === 'interval' ? draft.type === 'interval' || draft.type === 'enhancedInterval' : draft.type === 'cron' || draft.type === 'enhancedCron'}
                   onClick={() => setType(type)}
                   disabled={off}
                 >
@@ -346,7 +438,14 @@ export const SchedulePage = ({
               ))}
             </div>
 
-            {draft.type === 'interval' ? (
+            {draft.type === 'enhancedInterval' ? (
+              <div className={form.field}>
+                <label className={form.label} htmlFor="ws-interval-seconds">Interval in seconds</label>
+                <input id="ws-interval-seconds" className={form.input} type="number" min={15} step={1}
+                  value={draft.intervalSeconds} onChange={(e) => setDraft({ type: 'enhancedInterval', intervalSeconds: Number(e.target.value) })} disabled={off} />
+                <p className={form.hint}>Counted from when the previous run finishes; timing is best effort.</p>
+              </div>
+            ) : draft.type === 'interval' ? (
               <div className={form.field}>
                 <label className={form.label} htmlFor="ws-interval">Every</label>
                 <IntervalSelect
@@ -421,6 +520,18 @@ export const SchedulePage = ({
                 </div>
               </>
             )}
+            {(draft.type === 'enhancedInterval' || draft.type === 'enhancedCron') && (
+              <section className={form.field} aria-label="Allowed execution periods">
+                <h4 className={form.label}>Allowed weekly blocks</h4>
+                {draft.type === 'enhancedInterval' && <>
+                  <label className={form.label} htmlFor="ws-block-tz">Timezone</label>
+                  <input id="ws-block-tz" className={form.input} value={blockTimezone}
+                    onChange={(event) => setBlockTimezone(event.target.value)} disabled={off} spellCheck={false} />
+                </>}
+                <p className={form.hint}>The saved named zone stays fixed when you travel. Cron and allowed blocks share this zone.</p>
+                <WeeklyBlockGrid slots={slots} onChange={setSlots} disabled={off} />
+              </section>
+            )}
           </div>
         </section>
 
@@ -434,10 +545,10 @@ export const SchedulePage = ({
                 <div className={styles.status}>
                   <span className={styles.statusLabel}>
                     <span
-                      className={`${styles.dot} ${paused ? styles.dotPaused : styles.dotRunning}`}
+                      className={`${styles.dot} ${paused || blockedReason ? styles.dotPaused : styles.dotRunning}`}
                       aria-hidden="true"
                     />
-                    {paused ? 'Paused' : 'Running'}
+                    {paused || blockedReason ? 'Paused' : waitingReason ? 'Waiting' : 'Running'}
                   </span>
                   <span className={styles.statusActions}>
                     {!paused && (
@@ -447,7 +558,7 @@ export const SchedulePage = ({
                         onClick={() => runCommand(() => invoke('workspace_run_now', { workspaceId }), 'Failed to trigger run.')}
                         disabled={busy}
                       >
-                        Run now
+                        Run agent now
                       </button>
                     )}
                     <button
@@ -463,18 +574,38 @@ export const SchedulePage = ({
                     </button>
                   </span>
                 </div>
-              ) : (
+              ) : !blockedReason ? (
                 <p className={form.lede}>
                   Not scheduled. The main agent runs when you message it.
                 </p>
-              )}
+              ) : null}
+              {details?.scheduleCleanupPending && <p className={form.hint} role="status">Cleanup pending. This workspace waits until the outstanding cleanup finishes or is explicitly skipped. Preparation or the agent may still be running; review the After script status below for approval requests or errors. A settings test does not complete this cleanup.</p>}
+              {(blockedReason || (!paused && waitingReason)) && <p className={form.lede}>{blockedReason || waitingReason}</p>}
+              {details?.scheduleAllowedBlocks && <p className={form.hint}>Saved timezone: {details.scheduleAllowedBlocks.timezone}</p>}
+              {details?.nextRunInSeconds != null && savedOn && !paused && !blockedReason && <p className={form.hint}>Next eligible check: {formatNextRun(details.nextRunInSeconds)}</p>}
             </div>
           </section>
 
-          {draft.type === 'cron' && enabled && (
+          {([
+            { phase: 'condition', script: condition, status: details?.scheduleScriptStatus },
+            { phase: 'before', script: before, status: details?.scheduleBeforeStatus },
+            { phase: 'after', script: after, status: details?.scheduleAfterStatus },
+          ] as const).map(({ phase, script, status }) => (enhanced || status?.pending || status?.result || status?.error || status?.running || (phase === 'after' && details?.scheduleCleanupPending)) && (
+            <ScheduleCondition key={phase} phase={phase} workspaceId={workspaceId}
+              value={enhanced ? script.value : null} onChange={script.change}
+              unattended={script.unattended} onUnattendedChange={script.changeUnattended}
+              onScheduledAuthorize={script.authorizeSaved} status={status}
+              disabled={busy || !enhanced} approvalDisabled={busy || (!enhanced && phase !== 'after')}
+              previewBlocked={!!details?.scheduleCleanupPending}
+              cleanupIntentId={phase === 'after' ? details?.scheduleCleanupId : undefined}
+              cleanupInterrupted={phase === 'after' && !!details?.scheduleCleanupInterrupted}
+              onDetailsRefresh={onDetailsRefresh} />
+          ))}
+
+          {(draft.type === 'cron' || draft.type === 'enhancedCron') && enabled && (
             <section className={form.panel}>
               <header className={form.panelHeader}>
-                <h3 id="schedule-next" className={form.panelTitle}>Next runs</h3>
+                <h3 id="schedule-next" className={form.panelTitle}>{draft.type === 'enhancedCron' ? 'Cron occurrences' : 'Next runs'}</h3>
               </header>
               <div className={form.panelBody}>
                 {previewError ? (

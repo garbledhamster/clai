@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
@@ -34,6 +35,7 @@ pub struct SandboxCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommandOutput {
+    pub timed_out: bool,
     pub cwd: PathBuf,
     pub exit_code: Option<i32>,
     pub success: bool,
@@ -41,7 +43,19 @@ pub struct SandboxCommandOutput {
     pub stderr: String,
 }
 
+pub(crate) type StartCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
 pub async fn run_command(command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
+    run_command_guarded(command, None)
+        .await?
+        .ok_or_else(|| "Command start was abandoned".into())
+}
+
+/// Admission is evaluated by the backend after setup, directly before spawn.
+pub(crate) async fn run_command_guarded(
+    command: SandboxCommand,
+    start_check: Option<StartCheck<'_>>,
+) -> Result<Option<SandboxCommandOutput>, String> {
     if command.argv.is_empty() {
         return Err("Sandbox command argv cannot be empty".to_string());
     }
@@ -54,17 +68,20 @@ pub async fn run_command(command: SandboxCommand) -> Result<SandboxCommandOutput
 
     #[cfg(target_os = "linux")]
     {
-        super::linux_bwrap::run(command).await
+        super::linux_bwrap::run_guarded(command, start_check).await
     }
 
     #[cfg(target_os = "macos")]
     {
-        super::macos_seatbelt::run(command).await
+        super::macos_seatbelt::run_guarded(command, start_check).await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        super::unsupported::run(command).await
+        if start_check.is_some_and(|check| !check()) {
+            return Ok(None);
+        }
+        super::unsupported::run(command).await.map(Some)
     }
 }
 
@@ -84,23 +101,21 @@ pub(crate) async fn run_spawned_child(
         .take()
         .ok_or_else(|| "Failed to capture command stderr".to_string())?;
 
-    let stdout_task = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.map(|_| buf)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.map(|_| buf)
-    });
+    // Keep draining after the retained prefix fills. A noisy child must never
+    // grow our memory without bound or block on a full stdout/stderr pipe.
+    let byte_limit = output_limit.saturating_mul(4);
+    let stdout_capture = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout_task = tokio::spawn(read_bounded(stdout, byte_limit, stdout_capture.clone()));
+    let mut stderr_task = tokio::spawn(read_bounded(stderr, byte_limit, stderr_capture.clone()));
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
     // Capture the pid up front: on timeout we signal the child's whole process
     // group (it was spawned as a group leader, see `prepare_stdio`), and
     // `child.id()` returns `None` once the child has been awaited/reaped.
     let child_pid = child.id();
 
-    let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(result) => result.map_err(|e| format!("Shell command failed: {}", e))?,
         Err(_) => {
             // Timed out. Kill the entire process tree so descendants
@@ -120,21 +135,53 @@ pub(crate) async fn run_spawned_child(
             let _ = timeout(POST_KILL_REAP_TIMEOUT, child.wait()).await;
             drain_or_abort(stdout_task).await;
             drain_or_abort(stderr_task).await;
-            return Err(format!(
-                "{} timed out after {} ms",
-                timeout_label, timeout_ms
+            return Ok(timeout_output(
+                cwd,
+                &stdout_capture,
+                &stderr_capture,
+                output_limit,
+                format!("{timeout_label} timed out after {timeout_ms} ms"),
             ));
         }
     };
 
-    let stdout_bytes = stdout_task
-        .await
-        .map_err(|e| format!("Failed to collect stdout: {}", e))?
-        .map_err(|e| format!("Failed to read stdout: {}", e))?;
-    let stderr_bytes = stderr_task
-        .await
-        .map_err(|e| format!("Failed to collect stderr: {}", e))?
-        .map_err(|e| format!("Failed to read stderr: {}", e))?;
+    // Descendants may hold pipes open after the immediate child exits. The
+    // same deadline covers output draining, not just the direct child's wait.
+    let output = tokio::time::timeout_at(deadline, async {
+        (&mut stdout_task)
+            .await
+            .map_err(|e| format!("Failed to collect stdout: {e}"))?
+            .map_err(|e| format!("Failed to read stdout: {e}"))?;
+        (&mut stderr_task)
+            .await
+            .map_err(|e| format!("Failed to collect stderr: {e}"))?
+            .map_err(|e| format!("Failed to read stderr: {e}"))?;
+        Ok::<_, String>(())
+    })
+    .await;
+    match output {
+        Ok(output) => output?,
+        Err(_) => {
+            kill_process_tree(child_pid);
+            stdout_task.abort();
+            stderr_task.abort();
+            return Ok(timeout_output(
+                cwd,
+                &stdout_capture,
+                &stderr_capture,
+                output_limit,
+                format!("{timeout_label} timed out after {timeout_ms} ms while draining output"),
+            ));
+        }
+    };
+    let stdout_bytes = stdout_capture
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let stderr_bytes = stderr_capture
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut stderr = truncate_string(
@@ -152,6 +199,7 @@ pub(crate) async fn run_spawned_child(
     }
 
     Ok(SandboxCommandOutput {
+        timed_out: false,
         cwd,
         exit_code: status.code(),
         success: status.success(),
@@ -161,6 +209,45 @@ pub(crate) async fn run_spawned_child(
         ),
         stderr,
     })
+}
+
+fn timeout_output(
+    cwd: PathBuf,
+    stdout: &Mutex<Vec<u8>>,
+    stderr: &Mutex<Vec<u8>>,
+    limit: usize,
+    message: String,
+) -> SandboxCommandOutput {
+    let stdout = stdout.lock().unwrap_or_else(|e| e.into_inner());
+    let stderr = stderr.lock().unwrap_or_else(|e| e.into_inner());
+    SandboxCommandOutput {
+        timed_out: true,
+        cwd,
+        exit_code: None,
+        success: false,
+        stdout: truncate_string(String::from_utf8_lossy(&stdout).into_owned(), limit),
+        stderr: format!(
+            "{}\n{message}",
+            truncate_string(String::from_utf8_lossy(&stderr).into_owned(), limit)
+        ),
+    }
+}
+
+async fn read_bounded(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+    retained: Arc<Mutex<Vec<u8>>>,
+) -> std::io::Result<()> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let mut retained = retained.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = count.min(limit.saturating_sub(retained.len()));
+        retained.extend_from_slice(&chunk[..keep]);
+    }
 }
 
 /// Force-kill the child and its entire descendant tree.
@@ -233,7 +320,7 @@ fn windows_taskkill_args(pid: u32) -> [String; 4] {
 /// Await a reader task, but give up and abort it after `POST_KILL_REAP_TIMEOUT`
 /// so a pipe fd held open by a surviving grandchild can't hang the timeout
 /// path forever.
-async fn drain_or_abort(mut task: JoinHandle<std::io::Result<Vec<u8>>>) {
+async fn drain_or_abort(mut task: JoinHandle<std::io::Result<()>>) {
     if timeout(POST_KILL_REAP_TIMEOUT, &mut task).await.is_err() {
         task.abort();
     }
@@ -301,8 +388,9 @@ mod tests {
         let result =
             run_spawned_child(child, dir.path().to_path_buf(), 300, 1_000, "Test command").await;
 
-        let err = result.expect_err("command should time out");
-        assert!(err.contains("timed out"), "unexpected error: {err}");
+        let output = result.expect("timeout retains bounded captured output");
+        assert!(output.timed_out);
+        assert!(output.stderr.contains("timed out"));
 
         // Wait past the grandchild's 3s delay; if the group kill worked it was
         // reaped before it could run.
@@ -384,6 +472,68 @@ mod tests {
             out.stderr.ends_with("process terminated by signal 15"),
             "{}",
             out.stderr
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod scheduled_process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noisy_process_is_drained_but_only_a_bounded_prefix_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "i=0; while [ $i -lt 20000 ]; do printf '1234567890'; printf 'abcdefghij' >&2; i=$((i+1)); done"]);
+        prepare_stdio(&mut command);
+        let output = run_spawned_child(
+            command.spawn().unwrap(),
+            dir.path().into(),
+            10_000,
+            100,
+            "Noisy condition",
+        )
+        .await
+        .unwrap();
+        assert!(!output.timed_out);
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.starts_with("1234567890"));
+        assert!(output.stderr.starts_with("abcdefghij"));
+        assert!(output.stdout.len() < 150 && output.stderr.len() < 150);
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        read_bounded(&vec![b'x'; 1_000_000][..], 400, capture.clone())
+            .await
+            .unwrap();
+        assert_eq!(capture.lock().unwrap().len(), 400);
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_partial_output_and_covers_a_descendant_holding_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("escaped");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "printf 'partial output'; printf 'partial error' >&2; (sleep 2; touch '{}') & exit 0",
+            marker.display()
+        ));
+        prepare_stdio(&mut command);
+        let output = run_spawned_child(
+            command.spawn().unwrap(),
+            dir.path().into(),
+            100,
+            100,
+            "Condition",
+        )
+        .await
+        .unwrap();
+        assert!(output.timed_out);
+        assert_eq!(output.stdout, "partial output");
+        assert!(output.stderr.contains("partial error"));
+        assert!(output.stderr.contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !marker.exists(),
+            "descendant survived timeout after direct parent exited"
         );
     }
 }

@@ -30,12 +30,17 @@
 //! - **init** - Scheduler initialization and instance management
 //! - **tmp** - Startup cleanup for ephemeral runtime files
 
+pub mod cleanup_recovery;
+pub mod hooks;
 pub mod init;
 pub mod runner;
 pub mod schedule;
 pub mod scheduler;
+pub mod scripts;
 pub mod tmp;
 pub mod types;
+pub mod wake_monitor;
+pub mod weekly_blocks;
 
 // Re-export main types for convenience
 pub use types::AgentDefinition;

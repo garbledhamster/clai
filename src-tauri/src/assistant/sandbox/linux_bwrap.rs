@@ -36,7 +36,17 @@ fn launch_argv(bwrap_args: Vec<OsString>, in_flatpak: bool) -> (&'static str, Ve
     }
 }
 
-pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
+#[cfg(test)]
+pub async fn run(command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
+    run_guarded(command, None)
+        .await?
+        .ok_or_else(|| "Command start was abandoned".into())
+}
+
+pub(crate) async fn run_guarded(
+    mut command: SandboxCommand,
+    start_check: Option<super::runner::StartCheck<'_>>,
+) -> Result<Option<SandboxCommandOutput>, String> {
     prune_missing_grants(&mut command).await;
     let args = bwrap_args(&command)?;
     let in_flatpak = crate::providers::is_flatpak();
@@ -44,6 +54,12 @@ pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, St
     let mut child_command = Command::new(program);
     child_command.args(launch_args);
     prepare_stdio(&mut child_command);
+
+    // No await separates this logical start from process spawn. The callback
+    // orders admission with wake/manual revocation without holding a gate over I/O.
+    if start_check.is_some_and(|check| !check()) {
+        return Ok(None);
+    }
 
     let child = child_command.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -70,7 +86,7 @@ pub async fn run(mut command: SandboxCommand) -> Result<SandboxCommandOutput, St
         return Err(classify_bwrap_failure(&output.stderr));
     }
 
-    Ok(output)
+    Ok(Some(output))
 }
 
 // Bwrap's own diagnostics — emitted only when bwrap itself fails before it can
@@ -1483,6 +1499,7 @@ mod tests {
 
     fn failure_output(stdout: &str, stderr: &str, success: bool) -> SandboxCommandOutput {
         SandboxCommandOutput {
+            timed_out: false,
             cwd: PathBuf::from("/tmp"),
             exit_code: if success { Some(0) } else { Some(1) },
             success,

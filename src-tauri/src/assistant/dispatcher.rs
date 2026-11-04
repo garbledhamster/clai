@@ -70,6 +70,42 @@ pub async fn resume_workspace(deps: AssistantDeps) {
     .await;
 }
 
+/// Cleanup owns the session even if a cancellation command already closed its
+/// run row. Leave pending user signals untouched until rollback has succeeded.
+pub(crate) fn defer_for_cleanup(
+    scheduler: &crate::agents::scheduler::Scheduler,
+    workspace_id: &str,
+    session_id: &str,
+) -> Option<Kick> {
+    scheduler
+        .pending_cancellations()
+        .into_iter()
+        .find(|pending| pending.workspace_id == workspace_id && pending.session_id == session_id)
+        .map(|pending| Kick::Busy {
+            run_id: pending.run_id,
+        })
+}
+
+pub(crate) async fn claim_with_cleanup_gate(
+    scheduler: &crate::agents::SharedScheduler,
+    workspace_id: &str,
+    session_id: &str,
+    claim: impl Future<Output = Result<Kick, String>>,
+) -> Result<Kick, String> {
+    // Keep cleanup ownership stable until the database has decided whether
+    // this session can start. The lock is released before any run is spawned.
+    let guard = scheduler.lock().await;
+    if guard.script_is_running(workspace_id) {
+        return Ok(Kick::Deferred);
+    }
+    if let Some(outcome) = defer_for_cleanup(&guard, workspace_id, session_id) {
+        return Ok(outcome);
+    }
+    let outcome = claim.await;
+    drop(guard);
+    outcome
+}
+
 async fn resume_sessions<F, Fut>(sessions: Vec<String>, budget: &'static Semaphore, kick: F)
 where
     F: Fn(String, SemaphorePermit<'static>) -> Fut,
@@ -96,17 +132,41 @@ async fn dispatch(
         .await?
         .ok_or_else(|| format!("Assistant session not found: {}", session_id))?;
     let app_state = deps.app.state::<AppState>();
-    let outcome = claim(
-        &deps.pool,
+    // A manual request can reach dispatch during startup before schedule
+    // population. Restore durable cleanup ownership before any claim.
+    {
+        let mut scheduler = app_state.scheduler.lock().await;
+        crate::agents::cleanup_recovery::restore_current(
+            app_state.inner(),
+            &mut scheduler,
+            &deps.workspace_id,
+        )?;
+    }
+    // Queued manual input revokes an uncommitted scheduled claim. Committed
+    // model work finishes normally; its end dispatches the pending request.
+    if repository::has_pending_user_message(&deps.pool, session_id).await? {
+        app_state
+            .scheduler
+            .lock()
+            .await
+            .yield_to_manual(&deps.workspace_id);
+    }
+    let outcome = claim_with_cleanup_gate(
+        &app_state.scheduler,
         &deps.workspace_id,
         session_id,
-        |connection_id| {
-            app_state
-                .config_manager
-                .lock()
-                .ok()?
-                .get_provider_connection(connection_id)
-        },
+        claim(
+            &deps.pool,
+            &deps.workspace_id,
+            session_id,
+            |connection_id| {
+                app_state
+                    .config_manager
+                    .lock()
+                    .ok()?
+                    .get_provider_connection(connection_id)
+            },
+        ),
     )
     .await?;
 
@@ -382,6 +442,83 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_ownership_cannot_change_between_dispatch_check_and_db_claim() {
+        use crate::agents::{create_shared_scheduler, AgentDefinition};
+        let (_tmp, pool) = workspace_pool().await;
+        let session = repository::create_session(&pool, SessionContext::default())
+            .await
+            .unwrap();
+        let run = active_run(&pool, &session.id).await;
+        let user = send(&pool, &session.id, "queued during abandoned preparation").await;
+        let scheduler = create_shared_scheduler();
+        {
+            let mut sched = scheduler.lock().await;
+            sched.register_definition(AgentDefinition::new("main", "Main").with_workspace_id(WS));
+            sched.create_instance("main").unwrap();
+            assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        }
+        let (checked, after_check) = tokio::sync::oneshot::channel();
+        let (resume, resume_claim) = tokio::sync::oneshot::channel();
+        let dispatch = tokio::spawn({
+            let scheduler = scheduler.clone();
+            let pool = pool.clone();
+            let session_id = session.id.clone();
+            async move {
+                claim_with_cleanup_gate(&scheduler, WS, &session_id, async {
+                    checked.send(()).unwrap();
+                    resume_claim.await.unwrap();
+                    claim(&pool, WS, &session_id, |id| Some(connection(id))).await
+                })
+                .await
+                .unwrap()
+            }
+        });
+        after_check.await.unwrap();
+        // Reproduce pending cleanup + Cancel winning after the dispatch check,
+        // if ownership is free. Otherwise the existing active row protects the
+        // claim until it finishes and cleanup can then take ownership.
+        let cleanup_won = if let Ok(mut sched) = scheduler.try_lock() {
+            sched.retain_failed_cancellation("main", &session.id, &run.id, None);
+            repository::complete_run(&pool, &run.id, RunStatus::Cancelled, None)
+                .await
+                .unwrap();
+            true
+        } else {
+            false
+        };
+        resume.send(()).unwrap();
+        let outcome = dispatch.await.unwrap();
+        if !cleanup_won {
+            scheduler
+                .lock()
+                .await
+                .retain_failed_cancellation("main", &session.id, &run.id, None);
+            repository::complete_run(&pool, &run.id, RunStatus::Cancelled, None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            matches!(outcome, Kick::Busy { run_id } if run_id == run.id),
+            "queued input must not start across cleanup ownership"
+        );
+        assert_eq!(
+            signals::list_open_message_ids(&pool, &session.id)
+                .await
+                .unwrap(),
+            vec![user]
+        );
+        let blocked = claim_with_cleanup_gate(
+            &scheduler,
+            WS,
+            &session.id,
+            claim(&pool, WS, &session.id, |id| Some(connection(id))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(blocked, Kick::Busy { run_id } if run_id == run.id));
     }
 
     #[tokio::test]

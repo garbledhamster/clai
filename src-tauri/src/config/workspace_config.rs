@@ -54,9 +54,27 @@ impl std::fmt::Display for WorkspaceConfigError {
 
 impl std::error::Error for WorkspaceConfigError {}
 
+pub use crate::agents::weekly_blocks::WeeklyAllowedBlocks;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSchedule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_consent: Option<crate::agents::scripts::ScriptConsent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_consent: Option<crate::agents::scripts::ScriptConsent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_intent: Option<crate::agents::hooks::CleanupIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_completion: Option<crate::agents::hooks::CleanupCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<crate::agents::scripts::ScriptConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_consent: Option<crate::agents::scripts::ScriptConsent>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -67,6 +85,8 @@ pub struct WorkspaceSchedule {
     /// a user-chosen IANA timezone.
     #[serde(default)]
     pub kind: ScheduleKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
     /// Unix-ms wall-clock time when this workspace's manager should run
     /// next. `None` means "as soon as possible" — used for first-time
     /// scheduling before any tick has happened, and as the explicit
@@ -112,6 +132,13 @@ pub enum ScheduleKind {
     /// time. Doesn't let the user pin to a particular clock-time — for
     /// that, use `Cron`.
     Interval { interval_minutes: u32 },
+    /// Opt-in interval measured in seconds.
+    EnhancedInterval { interval_seconds: u32 },
+    /// Opt-in cron schedule with enhanced restart and wake semantics.
+    EnhancedCron {
+        expression: String,
+        timezone: String,
+    },
     /// Fire at the next wall-clock time matching a 5-field Vixie cron
     /// expression in the given IANA timezone (e.g. `0 9 * * 1-5` in
     /// `America/New_York` = weekdays at 9am NY-local across DST).
@@ -155,9 +182,23 @@ pub struct ScheduleSurface {
     /// `None` unless `enabled` — a cadence label for a schedule that cannot
     /// fire is a promise the app does not keep.
     pub kind: Option<ScheduleKind>,
+    pub allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 impl ScheduleSurface {
+    /// Enhanced scheduling is unavailable until a reliable wake source is registered.
+    pub fn blocked_reason(&self, wake_monitor_available: bool) -> Option<&'static str> {
+        if wake_monitor_available {
+            return None;
+        }
+        match self.kind {
+            Some(ScheduleKind::EnhancedInterval { .. } | ScheduleKind::EnhancedCron { .. }) => {
+                Some("Wake detection is unavailable.")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a countdown to the next run is worth showing — and, therefore,
     /// whether the in-memory scheduler is worth consulting at all.
     ///
@@ -166,11 +207,40 @@ impl ScheduleSurface {
     /// so rendering a countdown off it would tick down to a run that never
     /// happens.
     pub fn wants_countdown(&self) -> bool {
+        // Runtime blocking (wake availability and pending cleanup) is checked
+        // by the workspace status boundary against the live scheduler.
         self.enabled && !self.paused
     }
 }
 
 impl WorkspaceSchedule {
+    /// Validate and replace cadence and local-clock eligibility as one setting.
+    pub fn set_configuration(
+        &mut self,
+        kind: Option<ScheduleKind>,
+        blocks: Option<WeeklyAllowedBlocks>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match kind {
+            None => {
+                self.enabled = false;
+                self.paused = false;
+                self.next_run_at_unix_ms = None;
+            }
+            Some(kind) => {
+                if let Some(blocks) = &blocks {
+                    blocks.validate(&kind)?;
+                }
+                let next = crate::agents::schedule::compute_next_run_at(&kind, now_ms)?;
+                self.enabled = true;
+                self.kind = kind;
+                self.allowed_blocks = blocks;
+                self.next_run_at_unix_ms = Some(next);
+            }
+        }
+        Ok(())
+    }
+
     /// Derive the [`ScheduleSurface`] for this schedule.
     pub fn surface(&self) -> ScheduleSurface {
         if !self.enabled {
@@ -180,6 +250,7 @@ impl WorkspaceSchedule {
             enabled: true,
             paused: self.paused,
             kind: Some(self.kind.clone()),
+            allowed_blocks: self.allowed_blocks.clone(),
         }
     }
 }
@@ -850,10 +921,19 @@ mod schedule_surface_tests {
 
     fn schedule(enabled: bool, paused: bool, kind: ScheduleKind) -> WorkspaceSchedule {
         WorkspaceSchedule {
+            before: None,
+            after: None,
+            before_consent: None,
+            after_consent: None,
+            cleanup_intent: None,
+            cleanup_completion: None,
+            condition: None,
+            condition_consent: None,
             enabled,
             paused,
             kind,
             next_run_at_unix_ms: None,
+            allowed_blocks: None,
         }
     }
 
@@ -874,6 +954,7 @@ mod schedule_surface_tests {
                 enabled: true,
                 paused: false,
                 kind: Some(cron()),
+                allowed_blocks: None,
             }
         );
         assert!(surface.wants_countdown());
@@ -908,6 +989,19 @@ mod schedule_surface_tests {
         );
         assert!(surface.kind.is_none());
         assert!(!surface.wants_countdown());
+    }
+
+    #[test]
+    fn disabled_enhanced_schedule_has_no_wake_unavailability_reason() {
+        let surface = schedule(
+            false,
+            false,
+            ScheduleKind::EnhancedInterval {
+                interval_seconds: 15,
+            },
+        )
+        .surface();
+        assert!(surface.blocked_reason(false).is_none());
     }
 
     #[test]

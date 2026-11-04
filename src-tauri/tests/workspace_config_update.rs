@@ -197,3 +197,51 @@ fn concurrent_updates_keep_disk_and_index_in_step() {
         "the index must match the saved config"
     );
 }
+
+#[test]
+fn weekly_blocks_and_cadence_save_atomically_and_invalid_edit_preserves_both() {
+    use clai_lib::workspace_config::ScheduleKind;
+    use clai_lib::workspace_config::WeeklyAllowedBlocks;
+    let fixture = Fixture::new();
+    for kind in [
+        ScheduleKind::EnhancedInterval {
+            interval_seconds: 15,
+        },
+        ScheduleKind::EnhancedCron {
+            expression: "* * * * *".into(),
+            timezone: "UTC".into(),
+        },
+    ] {
+        let blocks = WeeklyAllowedBlocks {
+            timezone: "UTC".into(),
+            slots: vec![36],
+        };
+        fixture
+            .state
+            .update_workspace_config(WORKSPACE_ID, |config| {
+                config
+                    .schedule
+                    .set_configuration(Some(kind.clone()), Some(blocks.clone()), 0)
+            })
+            .unwrap();
+        assert_eq!(fixture.on_disk().schedule.kind, kind);
+        assert_eq!(fixture.on_disk().schedule.allowed_blocks, Some(blocks));
+        let previous = std::fs::read(workspace_config::config_path(&fixture.root)).unwrap();
+        let bad = WeeklyAllowedBlocks {
+            timezone: "Invalid/Zone".into(),
+            slots: vec![],
+        };
+        assert!(fixture
+            .state
+            .update_workspace_config(WORKSPACE_ID, |config| config.schedule.set_configuration(
+                Some(kind),
+                Some(bad),
+                0
+            ))
+            .is_err());
+        assert_eq!(
+            std::fs::read(workspace_config::config_path(&fixture.root)).unwrap(),
+            previous
+        );
+    }
+}

@@ -891,6 +891,14 @@
   white-space: nowrap;
 }
 
+.schedulePillBlocked {
+  flex-shrink: 1;
+  max-width: 20rem;
+  white-space: normal;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
 .schedulePillActive {
   background: var(--color-primary-alpha-08);
   color: var(--color-primary);

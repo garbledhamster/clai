@@ -35,6 +35,8 @@ pub fn is_context_limit_error(message: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    #[error("scheduled attempt abandoned before provider dispatch")]
+    ScheduledDispatchAbandoned,
     #[error("provider is not configured")]
     NotConfigured,
     #[error("provider transport is not implemented yet")]

@@ -53,12 +53,36 @@ pub enum AssistantEngineError {
     #[error("run connection mismatch for run {0}")]
     RunConnectionMismatch(String),
     #[error("provider error: {0}")]
-    Provider(#[from] ProviderError),
+    Provider(ProviderError),
+    #[error("scheduled attempt abandoned before provider dispatch")]
+    ScheduledDispatchAbandoned,
+    #[error("scheduled attempt abandoned with preparation to clean up")]
+    ScheduledPreparationAbandoned(crate::assistant::run_lifecycle::CliSessionBeforeStart),
     #[error("persistence error: {0}")]
     Persistence(String),
     /// The run's configuration could not be resolved; the message is shown as is.
     #[error("{0}")]
     RunConfig(String),
+}
+
+impl From<ProviderError> for AssistantEngineError {
+    fn from(error: ProviderError) -> Self {
+        match error {
+            ProviderError::ScheduledDispatchAbandoned => Self::ScheduledDispatchAbandoned,
+            error => Self::Provider(error),
+        }
+    }
+}
+
+impl From<crate::assistant::compaction::CompactionError> for AssistantEngineError {
+    fn from(error: crate::assistant::compaction::CompactionError) -> Self {
+        match error {
+            crate::assistant::compaction::CompactionError::ScheduledDispatchAbandoned => {
+                Self::ScheduledDispatchAbandoned
+            }
+            error => Self::Persistence(error.to_string()),
+        }
+    }
 }
 
 impl From<String> for AssistantEngineError {
