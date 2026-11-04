@@ -132,12 +132,20 @@ pub fn apply_workspace_schedule(
                 crate::config::workspace_config::ScheduleKind::EnhancedInterval { .. }
                     | crate::config::workspace_config::ScheduleKind::EnhancedCron { .. }
             ) {
-                if let Err(error) = sched.configure_enhanced(
-                    &instance_id,
-                    config.schedule.kind.clone(),
-                    chrono::Utc::now().timestamp_millis(),
-                    std::time::Instant::now(),
-                ) {
+                let configured = sched
+                    .configure_enhanced(
+                        &instance_id,
+                        config.schedule.kind.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                        std::time::Instant::now(),
+                    )
+                    .and_then(|()| {
+                        sched.configure_allowed_blocks(
+                            &instance_id,
+                            config.schedule.allowed_blocks.clone(),
+                        )
+                    });
+                if let Err(error) = configured {
                     tracing::warn!(%error, "Unable to configure enhanced schedule");
                     sched.set_instance_enabled(&instance_id, false);
                 }

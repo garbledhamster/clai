@@ -597,6 +597,11 @@ providerId: string | null, apiKey: string | null, authMode: AuthMode | null, bas
 
 export type WebCapabilityConfig = { enabled: boolean, };
 
+/**
+ * Selected Monday-first quarter-hours, 0..672. Empty means unrestricted.
+ */
+export type WeeklyAllowedBlocks = { timezone: string, slots: Array<number>, };
+
 export type WorkspaceAgentCreateRequest = { workspaceId: string, name: string, description: string, selectedSkillIds: Array<string>, selectedMcpServerIds: Array<string>, providerConnectionIds: Array<string>, execution: ExecutionCapabilityConfig, enabled: boolean, 
 /**
  * Optional explicit id; if absent, a fresh UUID is generated.
@@ -681,7 +686,7 @@ queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boole
  * "every Nm" / "Cron: …" label and to populate the workspace
  * settings modal.
  */
-scheduleKind: ScheduleKind | null, nextRunInSeconds: bigint | null, };
+scheduleKind: ScheduleKind | null, scheduleAllowedBlocks: WeeklyAllowedBlocks | null, nextRunInSeconds: bigint | null, };
 
 /**
  * The one expensive extra the details payload can carry: `includeFiles`
@@ -749,7 +754,7 @@ unread: boolean,
  * User starred this workspace — the rail pins it in the "Starred"
  * section. Derived from `WorkspaceConfig::starred_at > 0`.
  */
-starred: boolean, updatedAt: bigint, };
+starred: boolean, updatedAt: bigint, scheduleAllowedBlocks: WeeklyAllowedBlocks | null, };
 
 export type WorkspaceSessionBinding = { session: AssistantSession, providerConnectionId: string | null, };
 

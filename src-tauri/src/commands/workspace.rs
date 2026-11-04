@@ -260,6 +260,8 @@ pub struct WorkspaceDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_kind: Option<crate::config::workspace_config::ScheduleKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_in_seconds: Option<u64>,
 }
 
@@ -1418,6 +1420,7 @@ async fn workspace_details(
         schedule_paused: schedule.paused,
         schedule_blocked_reason,
         schedule_kind: schedule.kind,
+        schedule_allowed_blocks: schedule.allowed_blocks,
         next_run_in_seconds,
     })
 }
@@ -2740,6 +2743,8 @@ pub struct WorkspaceListEntry {
     /// section. Derived from `WorkspaceConfig::starred_at > 0`.
     pub starred: bool,
     pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 /// Create a new general workspace with a UUID and filesystem root.
@@ -3019,6 +3024,7 @@ async fn workspace_list_entries(state: &AppState) -> Result<Vec<WorkspaceListEnt
             schedule_paused: schedule.paused,
             schedule_blocked_reason,
             schedule_kind: schedule.kind,
+            schedule_allowed_blocks: schedule.allowed_blocks,
             next_run_in_seconds,
             unread: locator.last_run_completed_at > 0
                 && locator.last_run_completed_at > locator.last_opened_at,
@@ -3086,6 +3092,7 @@ pub async fn workspace_run_now(
 pub async fn workspace_set_schedule(
     workspace_id: String,
     kind: Option<crate::config::workspace_config::ScheduleKind>,
+    allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let workspace_id = resolve_workspace_id(state.inner(), Some(workspace_id))?;
@@ -3094,24 +3101,9 @@ pub async fn workspace_set_schedule(
         &workspace_id,
         true,
         |config| {
-            match kind {
-                None => {
-                    // Disabling clears the pause + next-run anchor so a future
-                    // re-enable starts from a fresh schedule.
-                    config.schedule.enabled = false;
-                    config.schedule.paused = false;
-                    config.schedule.next_run_at_unix_ms = None;
-                }
-                Some(new_kind) => {
-                    // Validate before saving — surfaces "invalid cron" /
-                    // "unknown timezone" / "interval=0" as a clean error to the UI.
-                    let now = now_millis();
-                    let next = crate::agents::schedule::compute_next_run_at(&new_kind, now)?;
-                    config.schedule.enabled = true;
-                    config.schedule.kind = new_kind;
-                    config.schedule.next_run_at_unix_ms = Some(next);
-                }
-            }
+            config
+                .schedule
+                .set_configuration(kind, allowed_blocks, now_millis())?;
             config.updated_at = now_millis();
             Ok(())
         },

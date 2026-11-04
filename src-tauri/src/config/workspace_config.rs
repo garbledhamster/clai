@@ -54,6 +54,8 @@ impl std::fmt::Display for WorkspaceConfigError {
 
 impl std::error::Error for WorkspaceConfigError {}
 
+pub use crate::agents::weekly_blocks::WeeklyAllowedBlocks;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSchedule {
@@ -67,6 +69,8 @@ pub struct WorkspaceSchedule {
     /// a user-chosen IANA timezone.
     #[serde(default)]
     pub kind: ScheduleKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
     /// Unix-ms wall-clock time when this workspace's manager should run
     /// next. `None` means "as soon as possible" — used for first-time
     /// scheduling before any tick has happened, and as the explicit
@@ -162,6 +166,7 @@ pub struct ScheduleSurface {
     /// `None` unless `enabled` — a cadence label for a schedule that cannot
     /// fire is a promise the app does not keep.
     pub kind: Option<ScheduleKind>,
+    pub allowed_blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 impl ScheduleSurface {
@@ -193,6 +198,33 @@ impl ScheduleSurface {
 }
 
 impl WorkspaceSchedule {
+    /// Validate and replace cadence and local-clock eligibility as one setting.
+    pub fn set_configuration(
+        &mut self,
+        kind: Option<ScheduleKind>,
+        blocks: Option<WeeklyAllowedBlocks>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match kind {
+            None => {
+                self.enabled = false;
+                self.paused = false;
+                self.next_run_at_unix_ms = None;
+            }
+            Some(kind) => {
+                if let Some(blocks) = &blocks {
+                    blocks.validate(&kind)?;
+                }
+                let next = crate::agents::schedule::compute_next_run_at(&kind, now_ms)?;
+                self.enabled = true;
+                self.kind = kind;
+                self.allowed_blocks = blocks;
+                self.next_run_at_unix_ms = Some(next);
+            }
+        }
+        Ok(())
+    }
+
     /// Derive the [`ScheduleSurface`] for this schedule.
     pub fn surface(&self) -> ScheduleSurface {
         if !self.enabled {
@@ -202,6 +234,7 @@ impl WorkspaceSchedule {
             enabled: true,
             paused: self.paused,
             kind: Some(self.kind.clone()),
+            allowed_blocks: self.allowed_blocks.clone(),
         }
     }
 }
@@ -876,6 +909,7 @@ mod schedule_surface_tests {
             paused,
             kind,
             next_run_at_unix_ms: None,
+            allowed_blocks: None,
         }
     }
 
@@ -896,6 +930,7 @@ mod schedule_surface_tests {
                 enabled: true,
                 paused: false,
                 kind: Some(cron()),
+                allowed_blocks: None,
             }
         );
         assert!(surface.wants_countdown());
