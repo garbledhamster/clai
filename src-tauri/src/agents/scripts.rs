@@ -124,16 +124,27 @@ pub struct ScriptApproval {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "bindings.ts")]
 pub struct ScriptResult {
-    /// A sandbox process was launched; distinguishes failed setup from partial preparation.
+    /// Some(false): known not launched. Some(true): known launched and collected.
+    /// None: legacy or uncertain launch/completion; cleanup must remain actionable.
     #[serde(default)]
     #[ts(optional)]
     pub started: Option<bool>,
+    #[serde(skip)]
+    #[ts(skip)]
+    pub(crate) start_disposition: StartDisposition,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub timed_out: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StartDisposition {
+    #[default]
+    Attempted,
+    Abandoned,
 }
 
 impl ScriptResult {
@@ -161,6 +172,7 @@ pub(crate) struct CapturedScript {
     identity: String,
     invocation: String,
     profile: SandboxProfile,
+    start_lease: Option<super::scheduler::DispatchLease>,
 }
 
 /// Backend-only, versioned consent. It is never accepted from an IPC payload.
@@ -453,43 +465,11 @@ fn capture_with_execution(
     execution: &ExecutionCapabilityConfig,
     script: &ScriptConfig,
 ) -> Result<CapturedScript, String> {
-    use std::io::Read;
     script.validate()?;
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err("Schedule scripts are unavailable: filesystem and network restrictions cannot be enforced on this platform.".into());
     }
-    let content = match &script.source {
-        ScriptSource::Inline { content } => content.clone(),
-        ScriptSource::File { path } => {
-            let path = Path::new(path);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                root.join(path)
-            };
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NONBLOCK);
-            }
-            let file = options
-                .open(&path)
-                .map_err(|e| format!("Cannot read script {}: {e}", path.display()))?;
-            if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-                return Err("Script input must be a regular file.".into());
-            }
-            let mut content = String::new();
-            file.take(SCRIPT_LIMIT + 1)
-                .read_to_string(&mut content)
-                .map_err(|e| format!("Cannot read script as UTF-8: {e}"))?;
-            content
-        }
-    };
-    if content.len() as u64 > SCRIPT_LIMIT {
-        return Err("Script is larger than 128 KiB.".into());
-    }
+    let content = read_script_content(root, script)?;
     let interpreter = resolve_interpreter(&script.interpreter)?;
     let flag = interpreter_flag(&script.interpreter)?;
     let invocation = format!(
@@ -561,7 +541,45 @@ fn capture_with_execution(
         identity,
         invocation,
         profile,
+        start_lease: None,
     })
+}
+
+fn read_script_content(root: &Path, script: &ScriptConfig) -> Result<String, String> {
+    use std::io::Read;
+    let content = match &script.source {
+        ScriptSource::Inline { content } => content.clone(),
+        ScriptSource::File { path } => {
+            let path = Path::new(path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let file = options
+                .open(&path)
+                .map_err(|e| format!("Cannot read script {}: {e}", path.display()))?;
+            if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+                return Err("Script input must be a regular file.".into());
+            }
+            let mut content = String::new();
+            file.take(SCRIPT_LIMIT + 1)
+                .read_to_string(&mut content)
+                .map_err(|e| format!("Cannot read script as UTF-8: {e}"))?;
+            content
+        }
+    };
+    if content.len() as u64 > SCRIPT_LIMIT {
+        return Err("Script is larger than 128 KiB.".into());
+    }
+    Ok(content)
 }
 
 fn env_home_display(profile: &SandboxProfile) -> String {
@@ -583,30 +601,78 @@ impl CapturedScript {
     pub fn same_approval(&self, other: &Self) -> bool {
         self.identity == other.identity
     }
-    pub async fn execute(self, state: &AppState, workspace_id: &str) -> ScriptResult {
-        let started = std::time::Instant::now();
-        let result = async {
-            let current = capture(state, workspace_id, &self.config)?;
-            if !self.same_approval(&current) { return Err("Script contents, interpreter or effective access changed. Review a fresh approval.".to_string()); }
-            invocation_policy(&current_execution(state, workspace_id)?, &self.invocation, true)?;
-            self.run().await
-        }.await;
-        script_result(result, started)
+    pub(crate) fn guard_start(mut self, lease: &super::scheduler::DispatchLease) -> Self {
+        self.start_lease = Some(lease.clone());
+        self
     }
-    async fn run(self) -> Result<crate::assistant::sandbox::SandboxCommandOutput, String> {
-        let flag = interpreter_flag(&self.config.interpreter)?;
-        crate::assistant::sandbox::run_command(SandboxCommand {
-            argv: vec![
-                self.interpreter.into_os_string(),
-                OsString::from(flag),
-                self.content.into(),
-            ],
-            cwd: self.profile.filesystem.workspace_root.clone(),
-            timeout_ms: u64::from(self.config.timeout_seconds) * 1000,
-            max_output_chars: OUTPUT_LIMIT,
-            profile: self.profile,
+
+    pub async fn execute(self, state: &AppState, workspace_id: &str) -> ScriptResult {
+        self.execute_with_clock(state, workspace_id, || {
+            chrono::Utc::now().timestamp_millis()
         })
         .await
+    }
+
+    async fn execute_with_clock(
+        self,
+        state: &AppState,
+        workspace_id: &str,
+        clock: impl Fn() -> i64 + Send + Sync,
+    ) -> ScriptResult {
+        let started = std::time::Instant::now();
+        let preparation = (|| {
+            let current = capture(state, workspace_id, &self.config)?;
+            if !self.same_approval(&current) {
+                return Err("Script contents, interpreter or effective access changed. Review a fresh approval.".to_string());
+            }
+            invocation_policy(
+                &current_execution(state, workspace_id)?,
+                &self.invocation,
+                true,
+            )?;
+            interpreter_flag(&self.config.interpreter)
+        })();
+        let flag = match preparation {
+            Ok(flag) => flag,
+            Err(error) => {
+                return ScriptResult {
+                    started: Some(false),
+                    error: Some(error),
+                    ..Default::default()
+                }
+            }
+        };
+        let check = || {
+            self.start_lease
+                .as_ref()
+                .is_none_or(|lease| lease.try_start_script(&clock))
+        };
+        let result = crate::assistant::sandbox::runner::run_command_guarded(
+            SandboxCommand {
+                argv: vec![
+                    self.interpreter.clone().into_os_string(),
+                    OsString::from(flag),
+                    self.content.clone().into(),
+                ],
+                cwd: self.profile.filesystem.workspace_root.clone(),
+                timeout_ms: u64::from(self.config.timeout_seconds) * 1000,
+                max_output_chars: OUTPUT_LIMIT,
+                profile: self.profile.clone(),
+            },
+            Some(&check),
+        )
+        .await;
+        match result {
+            Ok(None) => ScriptResult {
+                started: Some(false),
+                start_disposition: StartDisposition::Abandoned,
+                ..Default::default()
+            },
+            other => script_result(
+                other.map(|output| output.expect("admitted command output")),
+                started,
+            ),
+        }
     }
 }
 
@@ -640,6 +706,7 @@ fn script_result(
             };
             ScriptResult {
                 started: Some(true),
+                start_disposition: StartDisposition::Attempted,
                 stdout: output.stdout,
                 stderr: output.stderr,
                 exit_code: output.exit_code,
@@ -682,7 +749,7 @@ pub(crate) async fn check_condition(
     lease: &crate::agents::scheduler::DispatchLease,
 ) -> ConditionOutcome {
     condition_with_executor(state, workspace_id, pool, session_id, lease, |snapshot| {
-        snapshot.execute(state, workspace_id)
+        snapshot.guard_start(lease).execute(state, workspace_id)
     })
     .await
 }
@@ -789,13 +856,14 @@ where
             runtime.error = None;
             runtime.running = true;
         }
-        let result = execute(snapshot).await;
+        let result = execute(snapshot.guard_start(lease)).await;
+        let abandoned = result.start_disposition == StartDisposition::Abandoned;
         {
             let mut scheduler = state.scheduler.lock().await;
             let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
             runtime.record_result(ScriptPhase::Condition, result.clone());
         }
-        if !condition_eligible(pool, session_id, lease, clock()).await? {
+        if abandoned || !condition_eligible(pool, session_id, lease, clock()).await? {
             return Ok(ConditionOutcome::Abandoned);
         }
         return Ok(if result.condition_allows() {
@@ -925,9 +993,18 @@ mod tests {
         }
     }
     async fn pending(state: &AppState) -> ScriptApproval {
+        pending_for(state, ScriptPhase::Condition).await
+    }
+    async fn pending_for(state: &AppState, phase: ScriptPhase) -> ScriptApproval {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Some(approval) = state.scheduler.lock().await.script_status("ws").pending {
+                if let Some(approval) = state
+                    .scheduler
+                    .lock()
+                    .await
+                    .script_status_for("ws", phase)
+                    .pending
+                {
                     return approval;
                 }
                 tokio::task::yield_now().await;
@@ -937,7 +1014,10 @@ mod tests {
         .unwrap()
     }
     async fn respond(f: &Fixture, run: bool) {
-        let approval = pending(&f.state).await;
+        respond_for(f, ScriptPhase::Condition, run).await;
+    }
+    async fn respond_for(f: &Fixture, phase: ScriptPhase, run: bool) {
+        let approval = pending_for(&f.state, phase).await;
         crate::commands::schedule_scripts::resolve_approval(
             &f.state,
             &f.pool,
@@ -1855,13 +1935,16 @@ mod tests {
             || async { panic!("skipped preparation called model") },
         );
         let skip = async {
-            assert_eq!(pending(&f.state).await.phase, Some(ScriptPhase::Before));
+            assert_eq!(
+                pending_for(&f.state, ScriptPhase::Before).await.phase,
+                Some(ScriptPhase::Before)
+            );
             assert!(workspace_config::load(&f.root)
                 .unwrap()
                 .schedule
                 .cleanup_intent
                 .is_none());
-            respond(&f, false).await;
+            respond_for(&f, ScriptPhase::Before, false).await;
         };
         let (result, ()) = tokio::join!(attempt, skip);
         result.unwrap();
@@ -1971,7 +2054,7 @@ mod tests {
             },
         );
         let responder = async {
-            let approval = pending(&f.state).await;
+            let approval = pending_for(&f.state, ScriptPhase::After).await;
             assert_eq!(approval.phase, Some(ScriptPhase::After));
             {
                 let mut scheduler = f.state.scheduler.lock().await;
@@ -1979,7 +2062,7 @@ mod tests {
                 scheduler.yield_to_manual("ws");
                 assert!(scheduler.script_is_running("ws"));
             }
-            respond(&f, true).await;
+            respond_for(&f, ScriptPhase::After, true).await;
             started_wait.await.unwrap();
             assert!(f.state.scheduler.lock().await.script_is_running("ws"));
             assert!(workspace_config::load(&f.root)
@@ -2305,5 +2388,655 @@ mod tests {
             .schedule
             .cleanup_intent
             .is_none());
+    }
+    #[tokio::test]
+    async fn real_cleanup_launch_failure_retains_intent_until_explicit_skip() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture(None).await;
+        let interpreter = f.root.join("sh");
+        std::fs::write(
+            &interpreter,
+            format!("#!{}\n", f.root.join("missing-interpreter").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = ScriptConfig {
+            interpreter: interpreter.display().to_string(),
+            ..inline("printf unexpected > effect")
+        };
+        let intent = interrupted_cleanup(&f, &script, true).await;
+        assert!(crate::agents::cleanup_recovery::recover(&f.state, "ws")
+            .await
+            .is_err());
+        assert!(!f.root.join("effect").exists());
+        let saved = workspace_config::load(&f.root).unwrap();
+        assert_eq!(saved.schedule.cleanup_intent.unwrap().id, intent.id);
+        assert!(saved.schedule.cleanup_completion.is_none());
+        let scheduler = f.state.scheduler.lock().await;
+        assert!(scheduler.script_is_running("ws"));
+        assert!(scheduler.script_notice("ws").is_some());
+        assert!(scheduler
+            .script_status_for("ws", ScriptPhase::After)
+            .error
+            .is_some());
+        drop(scheduler);
+        assert_eq!(
+            repository::current_runs(&f.pool, &f.session.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        crate::agents::cleanup_recovery::skip_unavailable(&f.state, "ws", &intent.id)
+            .await
+            .unwrap();
+        assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+        assert!(
+            workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_completion
+                .unwrap()
+                .skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn live_after_final_capture_failure_preserves_ownership_and_original_intent() {
+        let f = hook_fixture(true, true, true).await;
+        let result = crate::agents::hooks::run_prepared_with_executor(
+            &f.state,
+            "ws",
+            &f.pool,
+            &f.session.id,
+            &f.run.id,
+            &f.lease,
+            tokio_util::sync::CancellationToken::new(),
+            |_| {},
+            |snapshot, phase| {
+                let f = &f;
+                async move {
+                    if phase == ScriptPhase::Before {
+                        return ScriptResult {
+                            started: Some(true),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        };
+                    }
+                    f.state
+                        .update_workspace_config("ws", |workspace| {
+                            workspace.main_agent.as_mut().unwrap().execution.shell.mode =
+                                ShellAccessMode::Off;
+                            Ok(())
+                        })
+                        .unwrap();
+                    let result = snapshot.execute(&f.state, "ws").await;
+                    assert_eq!(result.started, Some(false));
+                    assert!(result.error.is_some());
+                    result
+                }
+            },
+            || async {
+                assert!(f.lease.try_commit());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let saved = workspace_config::load(&f.root).unwrap();
+        assert_eq!(
+            saved.schedule.cleanup_intent.as_ref().unwrap().content,
+            "cleanup"
+        );
+        assert!(saved.schedule.cleanup_completion.is_none());
+        assert!(f.state.scheduler.lock().await.script_is_running("ws"));
+        repository::complete_run(&f.pool, &f.run.id, RunStatus::Cancelled, None)
+            .await
+            .unwrap();
+        let id = saved.schedule.cleanup_intent.unwrap().id;
+        crate::agents::cleanup_recovery::skip_unavailable(&f.state, "ws", &id)
+            .await
+            .unwrap();
+        assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_before_collection_requires_cleanup_without_model_entry() {
+        let f = hook_fixture(true, true, true).await;
+        let cleanup = AtomicUsize::new(0);
+        crate::agents::hooks::run_prepared_with_executor(
+            &f.state,
+            "ws",
+            &f.pool,
+            &f.session.id,
+            &f.run.id,
+            &f.lease,
+            tokio_util::sync::CancellationToken::new(),
+            |_| {},
+            |_, phase| {
+                let cleanup = &cleanup;
+                async move {
+                    if phase == ScriptPhase::Before {
+                        script_result(
+                            Err("collection failed after uncertain launch".into()),
+                            Instant::now(),
+                        )
+                    } else {
+                        cleanup.fetch_add(1, Ordering::SeqCst);
+                        ScriptResult {
+                            started: Some(true),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }
+                    }
+                }
+            },
+            || async { panic!("uncertain preparation entered model") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleanup.load(Ordering::SeqCst), 1);
+        assert!(workspace_config::load(&f.root)
+            .unwrap()
+            .schedule
+            .cleanup_intent
+            .is_none());
+    }
+
+    async fn assert_manual_and_due_admission(f: &Fixture) {
+        use crate::assistant::types::{AuthMode, ContentPart, ProviderConnection};
+        let message = repository::create_user_message_with_content(
+            &f.pool,
+            f.session.id.clone(),
+            vec![ContentPart::Text {
+                text: "queued manual after cleanup".into(),
+            }],
+            Some("conn"),
+        )
+        .await
+        .unwrap();
+        let admitted = crate::assistant::dispatcher::claim_with_cleanup_gate(
+            &f.state.scheduler,
+            "ws",
+            &f.session.id,
+            crate::assistant::dispatcher::claim(&f.pool, "ws", &f.session.id, |id| {
+                Some(ProviderConnection {
+                    id: id.into(),
+                    name: id.into(),
+                    protocol_id: "openai".into(),
+                    provider_id: "openai".into(),
+                    auth_mode: AuthMode::DeveloperApiKey,
+                    base_url: None,
+                    secret_ref: String::new(),
+                    model_id: "model".into(),
+                    account_label: None,
+                    enabled: true,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+            }),
+        )
+        .await
+        .unwrap();
+        let crate::assistant::dispatcher::Kick::Started {
+            run, message_ids, ..
+        } = admitted
+        else {
+            panic!("cleanup gate stranded queued manual input");
+        };
+        assert_eq!(message_ids, vec![message.id]);
+        repository::complete_run(&f.pool, &run.id, RunStatus::Completed, None)
+            .await
+            .unwrap();
+        let mut scheduler = f.state.scheduler.lock().await;
+        assert!(!scheduler.script_is_running("ws"));
+        assert!(scheduler.script_notice("ws").is_none());
+        // A subsequent due schedule can claim this workspace again.
+        let now = Instant::now() - Duration::from_secs(30);
+        scheduler.set_wake_monitor_available(true, 0, now);
+        scheduler.register_definition(
+            crate::agents::AgentDefinition::new("next", "Next").with_workspace_id("ws"),
+        );
+        scheduler.create_instance("next").unwrap();
+        scheduler
+            .configure_enhanced(
+                "next",
+                workspace_config::ScheduleKind::EnhancedInterval {
+                    interval_seconds: 15,
+                },
+                0,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .next_ready_at(15_000, now + Duration::from_secs(15))
+                .as_deref(),
+            Some("next")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_prefilter_cannot_restore_completed_or_skipped_cleanup() {
+        for completion in ["live", "skip", "recovery"] {
+            let f = fixture(None).await;
+            let intent = interrupted_cleanup(&f, &inline("exit 0"), true).await;
+            let (observed, observed_wait) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let reader = async {
+                // This is the same cheap prefilter used by recovery polling.
+                let stale = workspace_config::load(&f.root).unwrap();
+                assert_eq!(stale.schedule.cleanup_intent.unwrap().id, intent.id);
+                observed.send(()).unwrap();
+                released.await.unwrap();
+                let mut scheduler = f.state.scheduler.lock().await;
+                let current = crate::agents::cleanup_recovery::restore_current(
+                    &f.state,
+                    &mut scheduler,
+                    "ws",
+                )
+                .unwrap();
+                assert!(current.schedule.cleanup_intent.is_none());
+                assert!(!scheduler.script_is_running("ws"));
+                assert!(scheduler.script_notice("ws").is_none());
+            };
+            let writer = async {
+                observed_wait.await.unwrap();
+                if completion == "skip" {
+                    let mut scheduler = f.state.scheduler.lock().await;
+                    crate::agents::cleanup_recovery::restore_current(
+                        &f.state,
+                        &mut scheduler,
+                        "ws",
+                    )
+                    .unwrap();
+                    drop(scheduler);
+                    crate::agents::cleanup_recovery::skip_unavailable(&f.state, "ws", &intent.id)
+                        .await
+                        .unwrap();
+                } else if completion == "recovery" {
+                    crate::agents::cleanup_recovery::recover_with_executor(
+                        &f.state,
+                        "ws",
+                        |_| async {
+                            ScriptResult {
+                                started: Some(true),
+                                exit_code: Some(0),
+                                ..Default::default()
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    crate::agents::cleanup_recovery::record_completion(
+                        &f.state,
+                        "ws",
+                        &intent.id,
+                        Some(ScriptResult {
+                            started: Some(true),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                release.send(()).unwrap();
+            };
+            tokio::join!(reader, writer);
+            // Also repair a stale runtime gate when a recovery caller finds no
+            // authoritative intent; that early return must release ownership.
+            {
+                let mut scheduler = f.state.scheduler.lock().await;
+                let runtime = scheduler.scripts.entry("ws".into()).or_default();
+                runtime.cleanup_owned = true;
+                runtime.cleanup_interrupted = true;
+            }
+            crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+                panic!("completed cleanup replayed")
+            })
+            .await
+            .unwrap();
+            assert_manual_and_due_admission(&f).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restarts_during_before_and_model_recover_only_bound_after_even_after_another_interruption(
+    ) {
+        for (held_phase, disabled) in [("before", false), ("model", true)] {
+            let f = hook_fixture(true, true, true).await;
+            let entered = tokio::sync::Notify::new();
+            {
+                let attempt = crate::agents::hooks::run_prepared_with_executor(
+                    &f.state,
+                    "ws",
+                    &f.pool,
+                    &f.session.id,
+                    &f.run.id,
+                    &f.lease,
+                    tokio_util::sync::CancellationToken::new(),
+                    |_| {},
+                    |_, phase| {
+                        let entered = &entered;
+                        async move {
+                            assert_eq!(phase, ScriptPhase::Before);
+                            if held_phase == "before" {
+                                entered.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            ScriptResult {
+                                started: Some(true),
+                                exit_code: Some(0),
+                                ..Default::default()
+                            }
+                        }
+                    },
+                    || async {
+                        assert_eq!(held_phase, "model");
+                        assert!(f.lease.try_commit());
+                        entered.notify_one();
+                        std::future::pending::<Result<(), crate::agents::runner::RunnerError>>()
+                            .await
+                    },
+                );
+                tokio::select! {
+                    result = attempt => panic!("attempt was meant to be interrupted: {result:?}"),
+                    () = entered.notified() => {},
+                }
+            }
+            let intent = workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .unwrap();
+            repository::complete_run(&f.pool, &f.run.id, RunStatus::Cancelled, None)
+                .await
+                .unwrap();
+            f.state
+                .update_workspace_config("ws", |workspace| {
+                    workspace.schedule.enabled = !disabled;
+                    Ok(())
+                })
+                .unwrap();
+            *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+            let recovery_entered = tokio::sync::Notify::new();
+            {
+                let recovery = crate::agents::cleanup_recovery::recover_with_executor(
+                    &f.state,
+                    "ws",
+                    |snapshot| {
+                        let intent = &intent;
+                        let recovery_entered = &recovery_entered;
+                        async move {
+                            assert_eq!(snapshot.content, intent.content);
+                            assert_eq!(snapshot.content, "cleanup");
+                            recovery_entered.notify_one();
+                            std::future::pending::<ScriptResult>().await
+                        }
+                    },
+                );
+                tokio::select! {
+                    result = recovery => panic!("recovery was meant to be interrupted: {result:?}"),
+                    () = recovery_entered.notified() => {},
+                }
+            }
+            assert_eq!(
+                workspace_config::load(&f.root)
+                    .unwrap()
+                    .schedule
+                    .cleanup_intent
+                    .unwrap()
+                    .id,
+                intent.id
+            );
+            *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+            let calls = AtomicUsize::new(0);
+            crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |snapshot| {
+                let calls = &calls;
+                async move {
+                    assert_eq!(snapshot.content, "cleanup");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    ScriptResult {
+                        started: Some(true),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let saved = workspace_config::load(&f.root).unwrap();
+            assert_eq!(saved.schedule.enabled, !disabled);
+            assert!(saved.schedule.cleanup_intent.is_none());
+            assert_eq!(
+                saved.schedule.cleanup_completion.unwrap().intent_id,
+                intent.id
+            );
+            assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+        }
+    }
+
+    async fn revoke_start(f: &Fixture, reason: &str, wall: &std::sync::atomic::AtomicI64) {
+        if reason == "block" {
+            wall.fetch_add(30 * 60_000, Ordering::SeqCst);
+            return;
+        }
+        let mut scheduler = f.state.scheduler.lock().await;
+        match reason {
+            "manual" => scheduler.yield_to_manual("ws"),
+            "disable" => {
+                scheduler.set_instance_enabled("main", false);
+            }
+            "pause" => scheduler.pause("test pause".into()),
+            "wake" => {
+                scheduler.wake_signal().will_sleep();
+                scheduler.wake_signal().did_wake();
+            }
+            _ => panic!("unknown revocation"),
+        }
+    }
+
+    fn current_block() -> (i64, crate::agents::weekly_blocks::WeeklyAllowedBlocks) {
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Utc::now();
+        let slot = now.weekday().num_days_from_monday() * 96 + now.hour() * 4 + now.minute() / 15;
+        (
+            now.timestamp_millis(),
+            crate::agents::weekly_blocks::WeeklyAllowedBlocks {
+                timezone: "UTC".into(),
+                // Keep setup independent of proximity to a real quarter-hour.
+                // The controlled clock closes both adjacent slots at final admission.
+                slots: vec![slot as u16, ((slot + 1) % 672) as u16],
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn final_spawn_rechecks_condition_and_before_after_early_eligibility() {
+        for phase in [ScriptPhase::Condition, ScriptPhase::Before] {
+            for reason in ["block", "manual", "disable", "pause", "wake"] {
+                let (open, blocks) = current_block();
+                let script = inline("printf started > forbidden-start");
+                let f = fixture_at(
+                    (phase == ScriptPhase::Condition).then(|| script.clone()),
+                    Some(blocks),
+                    open,
+                )
+                .await;
+                let consent = capture(&f.state, "ws", &script).unwrap().consent();
+                f.state
+                    .update_workspace_config("ws", |workspace| {
+                        if phase == ScriptPhase::Condition {
+                            workspace.schedule.condition_consent = Some(consent);
+                        } else {
+                            workspace.schedule.before = Some(script);
+                            workspace.schedule.before_consent = Some(consent);
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let wall = std::sync::atomic::AtomicI64::new(open);
+                let boundary = tokio::sync::Notify::new();
+                let release = tokio::sync::Notify::new();
+                let execute = |snapshot: CapturedScript| {
+                    let f = &f;
+                    let wall = &wall;
+                    let boundary = &boundary;
+                    let release = &release;
+                    async move {
+                        // Earlier eligibility passed. Hold final setup until the
+                        // lease is revoked, then use the actual sandbox boundary.
+                        boundary.notify_one();
+                        release.notified().await;
+                        snapshot
+                            .execute_with_clock(&f.state, "ws", || wall.load(Ordering::SeqCst))
+                            .await
+                    }
+                };
+                let revoke = async {
+                    boundary.notified().await;
+                    revoke_start(&f, reason, &wall).await;
+                    release.notify_one();
+                };
+                if phase == ScriptPhase::Condition {
+                    let attempt = condition_attempt(
+                        &f.state,
+                        "ws",
+                        &f.pool,
+                        &f.session.id,
+                        &f.lease,
+                        execute,
+                        || wall.load(Ordering::SeqCst),
+                    );
+                    let (result, ()) = tokio::join!(attempt, revoke);
+                    let outcome = result.unwrap();
+                    assert!(matches!(outcome, ConditionOutcome::Abandoned));
+                    let model = crate::agents::runner::run_condition_then(
+                        async { outcome },
+                        &f.pool,
+                        &f.run.id,
+                        |_| {},
+                        || async { panic!("abandoned condition entered model") },
+                    )
+                    .await;
+                    assert!(matches!(
+                        model,
+                        Err(crate::agents::runner::RunnerError::ScheduledDispatchAbandoned)
+                    ));
+                } else {
+                    let attempt = crate::agents::hooks::run_prepared_with_executor(
+                        &f.state,
+                        "ws",
+                        &f.pool,
+                        &f.session.id,
+                        &f.run.id,
+                        &f.lease,
+                        tokio_util::sync::CancellationToken::new(),
+                        |_| {},
+                        |snapshot, phase| {
+                            assert_eq!(phase, ScriptPhase::Before);
+                            execute(snapshot)
+                        },
+                        || async { panic!("abandoned before entered model") },
+                    );
+                    let (result, ()) = tokio::join!(attempt, revoke);
+                    assert!(matches!(
+                        result,
+                        Err(crate::agents::runner::RunnerError::ScheduledDispatchAbandoned)
+                    ));
+                }
+                assert!(
+                    !f.root.join("forbidden-start").exists(),
+                    "{phase:?}: {reason}"
+                );
+                assert!(!f.lease.is_committed());
+                assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn condition_launch_does_not_commit_and_later_manual_revocation_discards_true_result() {
+        let script = inline("printf started > condition-started");
+        let f = fixture(Some(script.clone())).await;
+        let consent = capture(&f.state, "ws", &script).unwrap().consent();
+        f.state
+            .update_workspace_config("ws", |workspace| {
+                workspace.schedule.condition_consent = Some(consent);
+                Ok(())
+            })
+            .unwrap();
+        let outcome = condition_with_executor(
+            &f.state,
+            "ws",
+            &f.pool,
+            &f.session.id,
+            &f.lease,
+            |snapshot| async {
+                let result = snapshot.execute(&f.state, "ws").await;
+                assert_eq!(result.started, Some(true));
+                assert_eq!(result.exit_code, Some(0));
+                assert!(!f.lease.is_committed());
+                f.state.scheduler.lock().await.yield_to_manual("ws");
+                result
+            },
+        )
+        .await;
+        assert!(matches!(outcome, ConditionOutcome::Abandoned));
+        assert!(f.root.join("condition-started").exists());
+        assert!(!f.lease.is_committed());
+    }
+
+    #[tokio::test]
+    async fn real_after_executes_outside_closed_start_block_and_disabled_schedule() {
+        let f = fixture(None).await;
+        f.state
+            .update_workspace_config("ws", |workspace| {
+                workspace.schedule.enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        f.state
+            .scheduler
+            .lock()
+            .await
+            .set_instance_enabled("main", false);
+        let result = capture(&f.state, "ws", &inline("printf cleaned > after-started"))
+            .unwrap()
+            .execute_with_clock(&f.state, "ws", || i64::MAX)
+            .await;
+        assert_eq!(result.started, Some(true));
+        assert_eq!(result.exit_code, Some(0));
+        assert!(f.root.join("after-started").exists());
+    }
+    #[tokio::test]
+    async fn recovery_records_completed_timeout_once_and_does_not_retry_it() {
+        let f = fixture(None).await;
+        let intent = interrupted_cleanup(&f, &inline("exit 0"), true).await;
+        crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+            ScriptResult {
+                started: Some(true),
+                timed_out: true,
+                error: Some("cleanup timed out".into()),
+                ..Default::default()
+            }
+        })
+        .await
+        .unwrap();
+        let saved = workspace_config::load(&f.root).unwrap();
+        assert!(saved.schedule.cleanup_intent.is_none());
+        let completion = saved.schedule.cleanup_completion.unwrap();
+        assert_eq!(completion.intent_id, intent.id);
+        assert!(completion.result.unwrap().timed_out);
+        *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+        crate::agents::cleanup_recovery::recover_with_executor(&f.state, "ws", |_| async {
+            panic!("completed timeout retried")
+        })
+        .await
+        .unwrap();
+        assert!(!f.state.scheduler.lock().await.script_is_running("ws"));
     }
 }

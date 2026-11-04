@@ -101,6 +101,23 @@ impl DispatchLease {
         true
     }
 
+    /// Admit one script phase without committing any subsequent model work.
+    pub(crate) fn try_start_script(&self, clock: impl FnOnce() -> i64) -> bool {
+        let Ok(state) = self.signal.0.lock() else {
+            return false;
+        };
+        self.claim_valid.load(Ordering::Relaxed)
+            && self
+                .allowed_blocks
+                .as_ref()
+                .is_none_or(|blocks| blocks.is_allowed(clock()))
+            && !state.sleeping
+            && state.generation == self.generation
+            && self
+                .cron_clock_generation
+                .is_none_or(|generation| state.clock_generation == generation)
+    }
+
     /// Whether this claim still belongs to the current wake/cron-clock timing.
     /// Manual revocation does not itself discard a due check; a wake or clock
     /// change must rearm it even when manual input is also waiting.

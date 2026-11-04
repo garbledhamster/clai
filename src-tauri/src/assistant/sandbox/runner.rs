@@ -43,7 +43,19 @@ pub struct SandboxCommandOutput {
     pub stderr: String,
 }
 
+pub(crate) type StartCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
 pub async fn run_command(command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
+    run_command_guarded(command, None)
+        .await?
+        .ok_or_else(|| "Command start was abandoned".into())
+}
+
+/// Admission is evaluated by the backend after setup, directly before spawn.
+pub(crate) async fn run_command_guarded(
+    command: SandboxCommand,
+    start_check: Option<StartCheck<'_>>,
+) -> Result<Option<SandboxCommandOutput>, String> {
     if command.argv.is_empty() {
         return Err("Sandbox command argv cannot be empty".to_string());
     }
@@ -56,17 +68,20 @@ pub async fn run_command(command: SandboxCommand) -> Result<SandboxCommandOutput
 
     #[cfg(target_os = "linux")]
     {
-        super::linux_bwrap::run(command).await
+        super::linux_bwrap::run_guarded(command, start_check).await
     }
 
     #[cfg(target_os = "macos")]
     {
-        super::macos_seatbelt::run(command).await
+        super::macos_seatbelt::run_guarded(command, start_check).await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        super::unsupported::run(command).await
+        if start_check.is_some_and(|check| !check()) {
+            return Ok(None);
+        }
+        super::unsupported::run(command).await.map(Some)
     }
 }
 

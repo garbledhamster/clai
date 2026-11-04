@@ -322,8 +322,8 @@ impl AppState {
             .write()
             .map_err(|e| format!("Workspace index lock error: {}", e))?
             .attach_pool(workspace_id.to_string(), pool.clone());
-        let workspace = workspace_config::load(&root).map_err(|error| error.to_string())?;
-        agents::cleanup_recovery::restore_runtime(&mut *self.scheduler.lock().await, &workspace);
+        let mut scheduler = self.scheduler.lock().await;
+        agents::cleanup_recovery::restore_current(self, &mut scheduler, workspace_id)?;
         Ok(pool)
     }
 }

@@ -381,65 +381,15 @@ async fn run_claimed_instance(
                     let _ = emit_event(app_handle, &workspace_id, &session, None, event);
                 },
                 || async {
-                    run_condition_then(
-                        async {
-                            if enhanced && !manual {
-                                if let Some(lease) = dispatch_lease.as_ref() {
-                                    return super::scripts::check_condition(
-                                        state.inner(),
-                                        &workspace_id,
-                                        &workspace_pool,
-                                        &session.id,
-                                        lease,
-                                    )
-                                    .await;
-                                }
-                            }
-                            super::scripts::ConditionOutcome::Allow
-                        },
+                    run_scheduled_turn(
+                        app_handle,
+                        &workspace_id,
                         &workspace_pool,
-                        &run.id,
-                        |event| {
-                            let _ = emit_event(app_handle, &workspace_id, &session, None, event);
-                        },
-                        || async {
-                            let start = || {
-                                run_scheduled_agent(
-                                    app_handle,
-                                    &agent_config.workspace_id,
-                                    &workspace_pool,
-                                    &session,
-                                    &connection,
-                                    run.clone(),
-                                    registration.token(),
-                                )
-                            };
-                            if enhanced && !manual {
-                                if let Some(lease) = dispatch_lease.as_ref() {
-                                    return super::hooks::run_prepared(
-                                        state.inner(),
-                                        &workspace_id,
-                                        &workspace_pool,
-                                        &session.id,
-                                        &run.id,
-                                        lease,
-                                        registration.token(),
-                                        |event| {
-                                            let _ = emit_event(
-                                                app_handle,
-                                                &workspace_id,
-                                                &session,
-                                                None,
-                                                event,
-                                            );
-                                        },
-                                        start,
-                                    )
-                                    .await;
-                                }
-                            }
-                            start().await
-                        },
+                        &session,
+                        &connection,
+                        &run,
+                        dispatch_lease.as_ref().filter(|_| enhanced && !manual),
+                        registration.token(),
                     )
                     .await
                 },
@@ -458,7 +408,7 @@ async fn run_claimed_instance(
         None => Ok(()),
     };
 
-    if let Err(e) = complete_tick_and_persist(
+    complete_tick_and_persist(
         state.inner(),
         scheduler,
         instance_id,
@@ -467,19 +417,91 @@ async fn run_claimed_instance(
         ran,
     )
     .await
-    {
-        tracing::warn!(workspace_id = %agent_config.workspace_id, error = %e,
+    .unwrap_or_else(|error| {
+        tracing::warn!(workspace_id = %agent_config.workspace_id, %error,
             "Failed to persist run completion to workspace config");
-    }
+    });
 
+    kick_pending_manual(app_handle, &workspace_id, &workspace_pool).await
+}
+
+async fn kick_pending_manual(
+    app_handle: &AppHandle,
+    workspace_id: &str,
+    pool: &DbPool,
+) -> Result<(), RunnerError> {
     // Engine completion may have deferred manual input behind cleanup ownership.
-    for pending_session in crate::assistant::signals::sessions_with_pending(&workspace_pool)
+    for session in crate::assistant::signals::sessions_with_pending(pool)
         .await
         .map_err(RunnerError::AssistantPersistence)?
     {
-        kick_after_abandon(app_handle, &workspace_id, &workspace_pool, &pending_session).await;
+        kick_after_abandon(app_handle, workspace_id, pool, &session).await;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_scheduled_turn(
+    app_handle: &AppHandle,
+    workspace_id: &str,
+    workspace_pool: &DbPool,
+    session: &AssistantSession,
+    connection: &ProviderConnection,
+    run: &AssistantRun,
+    lease: Option<&super::scheduler::DispatchLease>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), RunnerError> {
+    run_condition_then(
+        async {
+            if let Some(lease) = lease {
+                return super::scripts::check_condition(
+                    app_handle.state::<AppState>().inner(),
+                    workspace_id,
+                    workspace_pool,
+                    &session.id,
+                    lease,
+                )
+                .await;
+            }
+            super::scripts::ConditionOutcome::Allow
+        },
+        workspace_pool,
+        &run.id,
+        |event| {
+            let _ = emit_event(app_handle, workspace_id, session, None, event);
+        },
+        || async {
+            let start = || {
+                run_scheduled_agent(
+                    app_handle,
+                    workspace_id,
+                    workspace_pool,
+                    session,
+                    connection,
+                    run.clone(),
+                    cancel.clone(),
+                )
+            };
+            if let Some(lease) = lease {
+                return super::hooks::run_prepared(
+                    app_handle.state::<AppState>().inner(),
+                    workspace_id,
+                    workspace_pool,
+                    &session.id,
+                    &run.id,
+                    lease,
+                    cancel.clone(),
+                    |event| {
+                        let _ = emit_event(app_handle, workspace_id, session, None, event);
+                    },
+                    start,
+                )
+                .await;
+            }
+            start().await
+        },
+    )
+    .await
 }
 
 /// The condition owns the queued run but does not start provider/model work.

@@ -58,7 +58,7 @@ export default function ScheduleCondition({ workspaceId, phase = 'condition', va
   const [operation, setOperation] = useState<'preview' | 'run' | 'skip' | 'authorize' | null>(null);
   const busy = operation !== null;
   const pending = preview ?? (status?.pending?.id !== dismissedId ? status?.pending : null);
-  const savedResult = JSON.stringify(status?.result ?? null);
+  const savedResult = JSON.stringify(status?.result ? { ...status.result, durationMs: Number(status.result.durationMs) } : null);
   const latestResult = result && result.previousSaved === savedResult ? result.value : status?.result;
   const visibleError = error || (status?.error === latestResult?.error ? null : status?.error);
   const actionLocked = approvalDisabled || busy || !!status?.running;

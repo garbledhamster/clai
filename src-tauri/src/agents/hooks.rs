@@ -134,6 +134,19 @@ pub(crate) fn clear_intent(state: &AppState, workspace_id: &str, id: &str) -> Re
     Ok(())
 }
 
+async fn release_unused_intent(
+    state: &AppState,
+    workspace_id: &str,
+    id: &str,
+) -> Result<(), String> {
+    let mut scheduler = state.scheduler.lock().await;
+    clear_intent(state, workspace_id, id)?;
+    let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
+    runtime.cleanup_owned = false;
+    runtime.cleanup_interrupted = false;
+    Ok(())
+}
+
 async fn eligible(
     pool: &DbPool,
     session_id: &str,
@@ -271,6 +284,17 @@ where
         runtime.error = None;
     }
     let mut result = execute(snapshot, phase).await;
+    if result.start_disposition == scripts::StartDisposition::Abandoned {
+        state
+            .scheduler
+            .lock()
+            .await
+            .scripts
+            .entry(workspace_id.into())
+            .or_default()
+            .running = false;
+        return result;
+    }
     scripts::normalize_result(phase, &mut result);
     state
         .scheduler
@@ -350,41 +374,17 @@ where
     E: FnMut(CapturedScript, ScriptPhase) -> EF,
     EF: std::future::Future<Output = ScriptResult>,
 {
-    let (workspace, _) = state
-        .resolve_workspace_roster(workspace_id)
-        .map_err(RunnerError::AssistantPersistence)?;
-    let after = capture_phase(
+    let context = AttemptContext {
         state,
         workspace_id,
-        ScriptPhase::After,
-        workspace.schedule.after.as_ref(),
-    )
-    .await?;
-    let before = capture_phase(
-        state,
-        workspace_id,
-        ScriptPhase::Before,
-        workspace.schedule.before.as_ref(),
-    )
-    .await?;
-    let before = match before {
-        Some(snapshot) => {
-            approve_phase(
-                state,
-                workspace_id,
-                pool,
-                session_id,
-                lease,
-                &cancel,
-                ScriptPhase::Before,
-                snapshot,
-                None,
-            )
-            .await?
-        }
-        None => None,
+        pool,
+        session_id,
+        run_id,
+        lease,
+        cancel: &cancel,
     };
-    if workspace.schedule.before.is_some() && before.is_none() {
+    let (after, before, before_skipped, consent) = context.prepare_phases().await?;
+    if before_skipped {
         state
             .scheduler
             .lock()
@@ -401,147 +401,267 @@ where
     {
         return Err(RunnerError::ScheduledDispatchAbandoned);
     }
-    let intent = if let Some(snapshot) = &after {
-        // Set ownership while ordered with all manual claims; durable persistence
-        // precedes the external process and cannot be skipped on write failure.
-        let mut scheduler = state.scheduler.lock().await;
-        let intent = persist_intent(
-            state,
-            workspace_id,
-            session_id,
-            run_id,
-            snapshot,
-            workspace.schedule.after_consent.clone(),
-        )
-        .map_err(RunnerError::AssistantPersistence)?;
-        scheduler
-            .scripts
-            .entry(workspace_id.into())
-            .or_default()
-            .cleanup_owned = true;
-        Some(intent)
-    } else {
-        None
-    };
-    // Persistence can take long enough for a block to close or manual input to
-    // arrive. Check again before the first external side effect.
+    let intent = context.bind_intent(after.as_ref(), consent).await?;
     if !eligible(pool, session_id, lease, &cancel)
         .await
         .map_err(RunnerError::AssistantPersistence)?
     {
         if let Some(intent) = &intent {
-            clear_intent(state, workspace_id, &intent.id)
-                .map_err(RunnerError::AssistantPersistence)?;
-            state
-                .scheduler
-                .lock()
+            release_unused_intent(state, workspace_id, &intent.id)
                 .await
-                .scripts
-                .entry(workspace_id.into())
-                .or_default()
-                .cleanup_owned = false;
+                .map_err(RunnerError::AssistantPersistence)?;
         }
         return Err(RunnerError::ScheduledDispatchAbandoned);
     }
-    let prepared = if let Some(snapshot) = before {
+    let (prepared, allows, abandoned) = if let Some(snapshot) = before {
         let result = execute_phase(
             state,
             workspace_id,
             ScriptPhase::Before,
-            snapshot,
+            snapshot.guard_start(lease),
             &mut execute,
         )
         .await;
-        (result.started.unwrap_or(false), result.condition_allows())
+        (
+            result.started != Some(false),
+            result.condition_allows(),
+            result.start_disposition == scripts::StartDisposition::Abandoned,
+        )
     } else {
-        (false, true)
+        (false, true, false)
     };
     let admission = eligible(pool, session_id, lease, &cancel).await;
-    let outcome = match admission {
-        Ok(true) if prepared.1 => start().await,
-        Ok(false) if !prepared.0 && prepared.1 && !cancel.is_cancelled() => {
-            Err(RunnerError::ScheduledDispatchAbandoned)
-        }
-        Ok(_) => cancel_queued(pool, run_id, &mut emit).await,
-        Err(error) => Err(RunnerError::AssistantPersistence(error)),
-    };
-    // Provider commitment tells us whether an engine call actually started.
-    let cleanup_required = prepared.0 || lease.is_committed();
-    if let Some(intent) = intent {
-        let completion = if cleanup_required {
-            let approved = approve_phase(
-                state,
-                workspace_id,
-                pool,
-                session_id,
-                lease,
-                &cancel,
-                ScriptPhase::After,
-                after.unwrap(),
-                intent.unattended_consent.clone(),
-            )
-            .await;
-            match approved {
-                Ok(Some(snapshot)) => {
-                    let result = execute_phase(
-                        state,
-                        workspace_id,
-                        ScriptPhase::After,
-                        snapshot,
-                        &mut execute,
-                    )
-                    .await;
-                    if result.started == Some(false) {
-                        let error = result
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Cleanup did not start.".into());
-                        let mut scheduler = state.scheduler.lock().await;
-                        scheduler
-                            .scripts
-                            .entry(workspace_id.into())
-                            .or_default()
-                            .cleanup_interrupted = true;
-                        return Err(RunnerError::AssistantPersistence(error));
-                    }
-                    Some(result)
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    let mut scheduler = state.scheduler.lock().await;
-                    let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
-                    runtime.cleanup_interrupted = true;
-                    runtime.error = Some(format!("Cleanup remains pending: {error}"));
-                    return Err(error);
-                }
+    let outcome = if abandoned {
+        Err(RunnerError::ScheduledDispatchAbandoned)
+    } else {
+        match admission {
+            Ok(true) if allows => start().await,
+            Ok(false) if !prepared && allows && !cancel.is_cancelled() => {
+                Err(RunnerError::ScheduledDispatchAbandoned)
             }
+            Ok(_) => cancel_queued(pool, run_id, &mut emit).await,
+            Err(error) => Err(RunnerError::AssistantPersistence(error)),
+        }
+    };
+    context
+        .finish_cleanup(
+            intent,
+            after,
+            prepared || lease.is_committed(),
+            &mut execute,
+        )
+        .await?;
+    finalize_prepared_outcome(pool, run_id, prepared, outcome, &mut emit).await
+}
+
+struct AttemptContext<'a> {
+    state: &'a AppState,
+    workspace_id: &'a str,
+    pool: &'a DbPool,
+    session_id: &'a str,
+    run_id: &'a str,
+    lease: &'a DispatchLease,
+    cancel: &'a CancellationToken,
+}
+
+impl AttemptContext<'_> {
+    async fn prepare_phases(
+        &self,
+    ) -> Result<
+        (
+            Option<CapturedScript>,
+            Option<CapturedScript>,
+            bool,
+            Option<ScriptConsent>,
+        ),
+        RunnerError,
+    > {
+        let Self {
+            state,
+            workspace_id,
+            pool,
+            session_id,
+            lease,
+            cancel,
+            ..
+        } = *self;
+        let (workspace, _) = state
+            .resolve_workspace_roster(workspace_id)
+            .map_err(RunnerError::AssistantPersistence)?;
+        let after = capture_phase(
+            state,
+            workspace_id,
+            ScriptPhase::After,
+            workspace.schedule.after.as_ref(),
+        )
+        .await?;
+        let before = capture_phase(
+            state,
+            workspace_id,
+            ScriptPhase::Before,
+            workspace.schedule.before.as_ref(),
+        )
+        .await?;
+        let before = match before {
+            Some(snapshot) => {
+                approve_phase(
+                    state,
+                    workspace_id,
+                    pool,
+                    session_id,
+                    lease,
+                    cancel,
+                    ScriptPhase::Before,
+                    snapshot,
+                    None,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let before_skipped = workspace.schedule.before.is_some() && before.is_none();
+        Ok((
+            after,
+            before,
+            before_skipped,
+            workspace.schedule.after_consent,
+        ))
+    }
+
+    async fn bind_intent(
+        &self,
+        after: Option<&CapturedScript>,
+        consent: Option<ScriptConsent>,
+    ) -> Result<Option<CleanupIntent>, RunnerError> {
+        let Self {
+            state,
+            workspace_id,
+            session_id,
+            run_id,
+            ..
+        } = *self;
+        let intent = if let Some(snapshot) = after {
+            // Set ownership while ordered with all manual claims; durable persistence
+            // precedes the external process and cannot be skipped on write failure.
+            let mut scheduler = state.scheduler.lock().await;
+            let intent = persist_intent(state, workspace_id, session_id, run_id, snapshot, consent)
+                .map_err(RunnerError::AssistantPersistence)?;
+            scheduler
+                .scripts
+                .entry(workspace_id.into())
+                .or_default()
+                .cleanup_owned = true;
+            Some(intent)
         } else {
             None
         };
-        let recorded = if cleanup_required {
-            finish_intent(state, workspace_id, &intent.id, completion)
-        } else {
-            clear_intent(state, workspace_id, &intent.id)
-        };
-        if let Err(error) = recorded {
-            let mut scheduler = state.scheduler.lock().await;
-            let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
-            runtime.cleanup_interrupted = true;
-            runtime.error = Some(error.clone());
-            return Err(RunnerError::AssistantPersistence(error));
-        }
-        state
-            .scheduler
-            .lock()
-            .await
-            .scripts
-            .entry(workspace_id.into())
-            .or_default()
-            .cleanup_owned = false;
+        Ok(intent)
     }
+
+    async fn finish_cleanup<E, EF>(
+        &self,
+        intent: Option<CleanupIntent>,
+        after: Option<CapturedScript>,
+        cleanup_required: bool,
+        execute: &mut E,
+    ) -> Result<(), RunnerError>
+    where
+        E: FnMut(CapturedScript, ScriptPhase) -> EF,
+        EF: std::future::Future<Output = ScriptResult>,
+    {
+        let Self {
+            state,
+            workspace_id,
+            pool,
+            session_id,
+            lease,
+            cancel,
+            ..
+        } = *self;
+        if let Some(intent) = intent {
+            let completion = if cleanup_required {
+                let approved = approve_phase(
+                    state,
+                    workspace_id,
+                    pool,
+                    session_id,
+                    lease,
+                    cancel,
+                    ScriptPhase::After,
+                    after.unwrap(),
+                    intent.unattended_consent.clone(),
+                )
+                .await;
+                match approved {
+                    Ok(Some(snapshot)) => {
+                        let result = execute_phase(
+                            state,
+                            workspace_id,
+                            ScriptPhase::After,
+                            snapshot,
+                            execute,
+                        )
+                        .await;
+                        if result.started != Some(true) {
+                            let error = result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Cleanup did not start.".into());
+                            let mut scheduler = state.scheduler.lock().await;
+                            scheduler
+                                .scripts
+                                .entry(workspace_id.into())
+                                .or_default()
+                                .cleanup_interrupted = true;
+                            return Err(RunnerError::AssistantPersistence(error));
+                        }
+                        Some(result)
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        let mut scheduler = state.scheduler.lock().await;
+                        let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
+                        runtime.cleanup_interrupted = true;
+                        runtime.error = Some(format!("Cleanup remains pending: {error}"));
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let recorded = if cleanup_required {
+                super::cleanup_recovery::record_completion(
+                    state,
+                    workspace_id,
+                    &intent.id,
+                    completion,
+                )
+                .await
+            } else {
+                release_unused_intent(state, workspace_id, &intent.id).await
+            };
+            if let Err(error) = recorded {
+                let mut scheduler = state.scheduler.lock().await;
+                let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
+                runtime.cleanup_interrupted = true;
+                runtime.error = Some(error.clone());
+                return Err(RunnerError::AssistantPersistence(error));
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn finalize_prepared_outcome(
+    pool: &DbPool,
+    run_id: &str,
+    prepared: bool,
+    outcome: Result<(), RunnerError>,
+    mut emit: impl FnMut(crate::assistant::events::AssistantUiEvent),
+) -> Result<(), RunnerError> {
     // Once preparation began this was an attempt, even if its start lease later
     // expired. Finish its cadence after cleanup; do not carry it into a new block.
-    if prepared.0 {
+    if prepared {
         match outcome {
             Err(RunnerError::ScheduledPreparationAbandoned(previous)) => {
                 if let Some(run) = crate::assistant::repository::get_run(pool, run_id)

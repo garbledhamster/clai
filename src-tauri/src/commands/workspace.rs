@@ -1402,92 +1402,31 @@ async fn workspace_details(
     let tasks =
         list_workspace_task_responses(&workspace_pool, state, &descriptor.workspace_id).await?;
 
-    // Workspace-level schedule (no longer per-agent). The scheduled tick
-    // invokes the default agent.
-    let enabled: Option<bool> = None;
-    let schedule_config = state
-        .workspace_root(&descriptor.workspace_id)
-        .and_then(|root| workspace_config::load(&root).ok())
-        .map(|config| config.schedule)
-        .unwrap_or_default();
-    let schedule_before = schedule_config.before.clone();
-    let schedule_after = schedule_config.after.clone();
-    let schedule_before_unattended = Some(schedule_config.before_consent.is_some());
-    let schedule_after_unattended = Some(schedule_config.after_consent.is_some());
-    let schedule_cleanup_pending = Some(schedule_config.cleanup_intent.is_some());
-    let schedule_cleanup_id = schedule_config
-        .cleanup_intent
-        .as_ref()
-        .map(|intent| intent.id.clone());
-    let schedule_cleanup_interrupted = Some(
-        state
-            .scheduler
-            .lock()
-            .await
-            .scripts
-            .get(&descriptor.workspace_id)
-            .is_some_and(|runtime| runtime.cleanup_interrupted),
-    );
-    let (schedule_before_status, schedule_after_status) = {
-        let scheduler = state.scheduler.lock().await;
-        (
-            Some(scheduler.script_status_for(
-                &descriptor.workspace_id,
-                crate::agents::scripts::ScriptPhase::Before,
-            )),
-            Some(scheduler.script_status_for(
-                &descriptor.workspace_id,
-                crate::agents::scripts::ScriptPhase::After,
-            )),
-        )
-    };
-    let schedule_condition = schedule_config.condition.clone();
-    let schedule_condition_unattended = Some(schedule_config.condition_consent.is_some());
-    let schedule = schedule_config.surface();
-    let schedule_script_status = Some(
-        state
-            .scheduler
-            .lock()
-            .await
-            .script_status(&descriptor.workspace_id),
-    );
-    let (next_run_in_seconds, schedule_blocked_reason, schedule_waiting_reason) = {
-        let scheduler = state.scheduler.lock().await;
-        let reason = scheduler
-            .pending_cancellation_reason(&descriptor.workspace_id)
-            .or_else(|| schedule.blocked_reason(scheduler.wake_monitor_available()))
-            .map(str::to_owned);
-        let next = match default_workspace_agent_id.as_deref() {
-            Some(manager_id) if schedule.wants_countdown() && reason.is_none() => {
-                let instance_id = AgentInstance::instance_id_for(manager_id);
-                scheduler.seconds_until_next_run(&instance_id)
-            }
-            _ => None,
-        };
-        let waiting = scheduler
-            .script_notice(&descriptor.workspace_id)
-            .or_else(|| {
-                default_workspace_agent_id
-                    .as_deref()
-                    .and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
-            })
-            .map(str::to_owned);
-        (next, reason, waiting)
-    };
+    let schedule_response = workspace_schedule_response(
+        state,
+        &descriptor.workspace_id,
+        default_workspace_agent_id.as_deref(),
+    )
+    .await;
+    let schedule = schedule_response.config.surface();
 
     Ok(WorkspaceDetails {
-        schedule_before,
-        schedule_after,
-        schedule_before_unattended,
-        schedule_after_unattended,
-        schedule_before_status,
-        schedule_after_status,
-        schedule_cleanup_pending,
-        schedule_cleanup_id,
-        schedule_cleanup_interrupted,
-        schedule_condition,
-        schedule_condition_unattended,
-        schedule_script_status,
+        schedule_before: schedule_response.config.before.clone(),
+        schedule_after: schedule_response.config.after.clone(),
+        schedule_before_unattended: Some(schedule_response.config.before_consent.is_some()),
+        schedule_after_unattended: Some(schedule_response.config.after_consent.is_some()),
+        schedule_before_status: Some(schedule_response.before_status),
+        schedule_after_status: Some(schedule_response.after_status),
+        schedule_cleanup_pending: Some(schedule_response.config.cleanup_intent.is_some()),
+        schedule_cleanup_id: schedule_response
+            .config
+            .cleanup_intent
+            .as_ref()
+            .map(|intent| intent.id.clone()),
+        schedule_cleanup_interrupted: Some(schedule_response.cleanup_interrupted),
+        schedule_condition: schedule_response.config.condition.clone(),
+        schedule_condition_unattended: Some(schedule_response.config.condition_consent.is_some()),
+        schedule_script_status: Some(schedule_response.condition_status),
         workspace_id: descriptor.workspace_id,
         kind: descriptor.kind,
         title: descriptor.title,
@@ -1507,15 +1446,68 @@ async fn workspace_details(
         artifact_count_capped: artifact_stats.capped,
         artifact_latest_modified_at: artifact_stats.latest_modified_at,
         queued_message_ids,
-        enabled,
+        enabled: None,
         schedule_enabled: schedule.enabled,
         schedule_paused: schedule.paused,
-        schedule_blocked_reason,
-        schedule_waiting_reason,
+        schedule_blocked_reason: schedule_response.blocked_reason,
+        schedule_waiting_reason: schedule_response.waiting_reason,
         schedule_kind: schedule.kind,
         schedule_allowed_blocks: schedule.allowed_blocks,
-        next_run_in_seconds,
+        next_run_in_seconds: schedule_response.next_run_in_seconds,
     })
+}
+
+struct WorkspaceScheduleResponse {
+    config: workspace_config::WorkspaceSchedule,
+    before_status: crate::agents::scripts::ScriptStatus,
+    after_status: crate::agents::scripts::ScriptStatus,
+    condition_status: crate::agents::scripts::ScriptStatus,
+    cleanup_interrupted: bool,
+    next_run_in_seconds: Option<u64>,
+    blocked_reason: Option<String>,
+    waiting_reason: Option<String>,
+}
+
+async fn workspace_schedule_response(
+    state: &AppState,
+    workspace_id: &str,
+    manager_id: Option<&str>,
+) -> WorkspaceScheduleResponse {
+    let config = state
+        .workspace_root(workspace_id)
+        .and_then(|root| workspace_config::load(&root).ok())
+        .map(|config| config.schedule)
+        .unwrap_or_default();
+    let schedule = config.surface();
+    let scheduler = state.scheduler.lock().await;
+    let blocked_reason = scheduler
+        .pending_cancellation_reason(workspace_id)
+        .or_else(|| schedule.blocked_reason(scheduler.wake_monitor_available()))
+        .map(str::to_owned);
+    let next_run_in_seconds = manager_id
+        .filter(|_| schedule.wants_countdown() && blocked_reason.is_none())
+        .and_then(|id| scheduler.seconds_until_next_run(&AgentInstance::instance_id_for(id)));
+    let waiting_reason = scheduler
+        .script_notice(workspace_id)
+        .or_else(|| {
+            manager_id.and_then(|id| scheduler.waiting_reason(&AgentInstance::instance_id_for(id)))
+        })
+        .map(str::to_owned);
+    WorkspaceScheduleResponse {
+        config,
+        before_status: scheduler
+            .script_status_for(workspace_id, crate::agents::scripts::ScriptPhase::Before),
+        after_status: scheduler
+            .script_status_for(workspace_id, crate::agents::scripts::ScriptPhase::After),
+        condition_status: scheduler.script_status(workspace_id),
+        cleanup_interrupted: scheduler
+            .scripts
+            .get(workspace_id)
+            .is_some_and(|runtime| runtime.cleanup_interrupted),
+        next_run_in_seconds,
+        blocked_reason,
+        waiting_reason,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3202,6 +3194,10 @@ pub async fn workspace_run_now(
 /// `next_run_at_unix_ms` is recomputed against the new mode so the
 /// schedule is exact ("next run at ...") from the user's perspective.
 #[tauri::command]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Tauri named command arguments preserve the existing IPC payload"
+)]
 pub async fn workspace_set_schedule(
     workspace_id: String,
     kind: Option<crate::config::workspace_config::ScheduleKind>,

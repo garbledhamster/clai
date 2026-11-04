@@ -1,5 +1,6 @@
 //! Restart recovery for the existing singleton cleanup intent. No replay of
 //! condition, preparation or model work: only the bound after script is retried.
+use std::collections::hash_map::Entry;
 use std::future::Future;
 
 use tauri::Manager;
@@ -23,19 +24,47 @@ pub(crate) fn restore_runtime(scheduler: &mut Scheduler, workspace: &WorkspaceCo
         runtime.phase = ScriptPhase::After;
         runtime.error = Some(RECOVERY_EXPLANATION.into());
     }
-    if !runtime.results.contains_key(&ScriptPhase::After) {
-        if let Some(result) = workspace
+    if workspace.schedule.cleanup_intent.is_none()
+        && runtime.cleanup_interrupted
+        && !runtime.running
+    {
+        runtime.cleanup_owned = false;
+        runtime.cleanup_interrupted = false;
+        runtime.recovery_active = false;
+        runtime.pending = None;
+        runtime.error = None;
+    }
+    let restored_result = match runtime.results.entry(ScriptPhase::After) {
+        Entry::Vacant(entry) => workspace
             .schedule
             .cleanup_completion
             .as_ref()
-            .and_then(|c| c.result.clone())
-        {
-            runtime.results.insert(ScriptPhase::After, result.clone());
-            if !runtime.cleanup_owned && runtime.pending.is_none() && !runtime.running {
-                runtime.record_result(ScriptPhase::After, result);
-            }
+            .and_then(|completion| completion.result.clone())
+            .inspect(|result| {
+                entry.insert(result.clone());
+            }),
+        Entry::Occupied(_) => None,
+    };
+    if let Some(result) = restored_result {
+        if !runtime.cleanup_owned && runtime.pending.is_none() && !runtime.running {
+            runtime.record_result(ScriptPhase::After, result);
         }
     }
+}
+
+/// Call with the scheduler guard: every restoring read is ordered with release.
+pub(crate) fn restore_current(
+    state: &AppState,
+    scheduler: &mut Scheduler,
+    workspace_id: &str,
+) -> Result<WorkspaceConfig, String> {
+    let root = state
+        .workspace_root(workspace_id)
+        .ok_or("Workspace not found.")?;
+    let workspace =
+        crate::config::workspace_config::load(&root).map_err(|error| error.to_string())?;
+    restore_runtime(scheduler, &workspace);
+    Ok(workspace)
 }
 
 /// Poll independently of schedule admission. Each workspace owns one detached
@@ -55,8 +84,12 @@ pub(crate) async fn poll(app: &tauri::AppHandle) {
         }
         let should_start = {
             let mut scheduler = state.scheduler.lock().await;
-            restore_runtime(&mut scheduler, &workspace);
-            let runtime = &scheduler.scripts[&workspace.id];
+            // The outside-lock load is only a prefilter. Reload under the same
+            // scheduler ordering as durable completion and ownership release.
+            let Ok(current) = restore_current(state.inner(), &mut scheduler, &workspace.id) else {
+                continue;
+            };
+            let runtime = &scheduler.scripts[&current.id];
             runtime.cleanup_interrupted
                 && !runtime.recovery_active
                 && !runtime.running
@@ -124,13 +157,12 @@ where
     E: FnOnce(CapturedScript) -> EF,
     EF: Future<Output = ScriptResult>,
 {
-    let (workspace, _) = state.resolve_workspace_roster(workspace_id)?;
-    let Some(intent) = workspace.schedule.cleanup_intent.clone() else {
-        return Ok(());
-    };
-    {
+    let intent = {
         let mut scheduler = state.scheduler.lock().await;
-        restore_runtime(&mut scheduler, &workspace);
+        let workspace = restore_current(state, &mut scheduler, workspace_id)?;
+        let Some(intent) = workspace.schedule.cleanup_intent else {
+            return Ok(());
+        };
         if scheduler.workspace_has_scheduled_claim(workspace_id) {
             return Ok(());
         }
@@ -139,7 +171,8 @@ where
             return Ok(());
         }
         runtime.recovery_active = true;
-    }
+        intent
+    };
     let outcome = recover_attempt(state, workspace_id, &intent, execute).await;
     let mut scheduler = state.scheduler.lock().await;
     let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
@@ -212,7 +245,7 @@ where
     scripts::normalize_result(ScriptPhase::After, &mut result);
     // Policy/source/setup failures before launch remain actionable. A process
     // that started and exited unsuccessfully is a completed failure.
-    if result.started == Some(false) {
+    if result.started != Some(true) {
         let error = result
             .error
             .clone()

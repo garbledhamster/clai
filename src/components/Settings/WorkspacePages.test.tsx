@@ -248,7 +248,7 @@ const ENHANCED = { ...DETAILS, scheduleEnabled: true,
 } as WorkspaceDetails;
 const APPROVAL: ScriptApproval = { id: 'approval-1', purpose: 'test', content: 'exit 1',
   interpreter: '/bin/sh', timeoutSeconds: 30, access: 'Restricted shell. Workspace read/write. Network off.' };
-const RESULT = { stdout: 'no work', stderr: '', exitCode: 1, durationMs: 12, timedOut: false, error: null } as ScriptResult;
+const RESULT: ScriptResult = { stdout: 'no work', stderr: '', exitCode: 1, durationMs: 12n, timedOut: false, error: null };
 
 describe('schedule condition', () => {
   it('saves the condition, cadence and blocks together and preserves its draft during polling', async () => {
@@ -327,7 +327,7 @@ describe('schedule condition', () => {
     } })));
     expect(screen.getByText('new work')).toBeInTheDocument();
     expect(screen.queryByText('no work')).not.toBeInTheDocument();
-    expect(screen.getByRole('region', { name: 'Condition result' })).toHaveTextContent('Condition true · Exit 0');
+    expect(screen.getByRole('region', { name: 'Condition result' })).toHaveTextContent('Condition true · Exit 0 · 12 ms');
   });
 
   it('shows a renewed scheduled snapshot after a stale approval is rejected', async () => {
