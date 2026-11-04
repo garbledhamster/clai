@@ -503,7 +503,8 @@ export type ScriptPhase = "condition" | "before" | "after";
 
 export type ScriptResult = { 
 /**
- * A sandbox process was launched; distinguishes failed setup from partial preparation.
+ * Some(false): known not launched. Some(true): known launched and collected.
+ * None: legacy or uncertain launch/completion; cleanup must remain actionable.
  */
 started?: boolean, stdout: string, stderr: string, exitCode: number | null, durationMs: bigint, timedOut: boolean, error: string | null, };
 

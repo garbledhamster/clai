@@ -2702,50 +2702,53 @@ mod tests {
         }
     }
 
+    async fn interrupt_attempt_at_phase(f: &Fixture, held_phase: &str) {
+        let entered = tokio::sync::Notify::new();
+        {
+            let attempt = crate::agents::hooks::run_prepared_with_executor(
+                &f.state,
+                "ws",
+                &f.pool,
+                &f.session.id,
+                &f.run.id,
+                &f.lease,
+                tokio_util::sync::CancellationToken::new(),
+                |_| {},
+                |_, phase| {
+                    let entered = &entered;
+                    async move {
+                        assert_eq!(phase, ScriptPhase::Before);
+                        if held_phase == "before" {
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        ScriptResult {
+                            started: Some(true),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }
+                    }
+                },
+                || async {
+                    assert_eq!(held_phase, "model");
+                    assert!(f.lease.try_commit());
+                    entered.notify_one();
+                    std::future::pending::<Result<(), crate::agents::runner::RunnerError>>().await
+                },
+            );
+            tokio::select! {
+                result = attempt => panic!("attempt was meant to be interrupted: {result:?}"),
+                () = entered.notified() => {},
+            }
+        }
+    }
+
     #[tokio::test]
     async fn restarts_during_before_and_model_recover_only_bound_after_even_after_another_interruption(
     ) {
         for (held_phase, disabled) in [("before", false), ("model", true)] {
             let f = hook_fixture(true, true, true).await;
-            let entered = tokio::sync::Notify::new();
-            {
-                let attempt = crate::agents::hooks::run_prepared_with_executor(
-                    &f.state,
-                    "ws",
-                    &f.pool,
-                    &f.session.id,
-                    &f.run.id,
-                    &f.lease,
-                    tokio_util::sync::CancellationToken::new(),
-                    |_| {},
-                    |_, phase| {
-                        let entered = &entered;
-                        async move {
-                            assert_eq!(phase, ScriptPhase::Before);
-                            if held_phase == "before" {
-                                entered.notify_one();
-                                std::future::pending::<()>().await;
-                            }
-                            ScriptResult {
-                                started: Some(true),
-                                exit_code: Some(0),
-                                ..Default::default()
-                            }
-                        }
-                    },
-                    || async {
-                        assert_eq!(held_phase, "model");
-                        assert!(f.lease.try_commit());
-                        entered.notify_one();
-                        std::future::pending::<Result<(), crate::agents::runner::RunnerError>>()
-                            .await
-                    },
-                );
-                tokio::select! {
-                    result = attempt => panic!("attempt was meant to be interrupted: {result:?}"),
-                    () = entered.notified() => {},
-                }
-            }
+            interrupt_attempt_at_phase(&f, held_phase).await;
             let intent = workspace_config::load(&f.root)
                 .unwrap()
                 .schedule

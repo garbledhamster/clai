@@ -301,6 +301,16 @@ async fn claimed_instance_details(
     ))
 }
 
+async fn claimed_run_flags(scheduler: &SharedScheduler, instance_id: &str) -> (bool, bool) {
+    let scheduler = scheduler.lock().await;
+    (
+        scheduler.is_enhanced(instance_id),
+        scheduler
+            .get_instance(instance_id)
+            .is_some_and(|instance| instance.manual_run_pending),
+    )
+}
+
 /// Runs an instance already claimed by [`claim_next_instance`]. Every `Ok`
 /// path releases the scheduler slot itself; errors are released by
 /// [`release_slot_on_error`].
@@ -337,12 +347,7 @@ async fn run_claimed_instance(
     let session =
         ensure_workspace_manager_session(app_handle, &workspace_pool, &agent_config).await?;
 
-    let enhanced = scheduler.lock().await.is_enhanced(instance_id);
-    let manual = scheduler
-        .lock()
-        .await
-        .get_instance(instance_id)
-        .is_some_and(|instance| instance.manual_run_pending);
+    let (enhanced, manual) = claimed_run_flags(scheduler, instance_id).await;
     let run = start_tick_run(
         &workspace_pool,
         &session,
