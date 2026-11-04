@@ -112,6 +112,13 @@ pub enum ScheduleKind {
     /// time. Doesn't let the user pin to a particular clock-time — for
     /// that, use `Cron`.
     Interval { interval_minutes: u32 },
+    /// Opt-in interval measured in seconds.
+    EnhancedInterval { interval_seconds: u32 },
+    /// Opt-in cron schedule with enhanced restart and wake semantics.
+    EnhancedCron {
+        expression: String,
+        timezone: String,
+    },
     /// Fire at the next wall-clock time matching a 5-field Vixie cron
     /// expression in the given IANA timezone (e.g. `0 9 * * 1-5` in
     /// `America/New_York` = weekdays at 9am NY-local across DST).
@@ -158,6 +165,19 @@ pub struct ScheduleSurface {
 }
 
 impl ScheduleSurface {
+    /// Enhanced scheduling is unavailable until a reliable wake source is registered.
+    pub fn blocked_reason(&self, wake_monitor_available: bool) -> Option<&'static str> {
+        if wake_monitor_available {
+            return None;
+        }
+        match self.kind {
+            Some(ScheduleKind::EnhancedInterval { .. } | ScheduleKind::EnhancedCron { .. }) => {
+                Some("Wake detection is unavailable.")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a countdown to the next run is worth showing — and, therefore,
     /// whether the in-memory scheduler is worth consulting at all.
     ///
@@ -166,6 +186,8 @@ impl ScheduleSurface {
     /// so rendering a countdown off it would tick down to a run that never
     /// happens.
     pub fn wants_countdown(&self) -> bool {
+        // Runtime blocking (wake availability and pending cleanup) is checked
+        // by the workspace status boundary against the live scheduler.
         self.enabled && !self.paused
     }
 }
@@ -908,6 +930,19 @@ mod schedule_surface_tests {
         );
         assert!(surface.kind.is_none());
         assert!(!surface.wants_countdown());
+    }
+
+    #[test]
+    fn disabled_enhanced_schedule_has_no_wake_unavailability_reason() {
+        let surface = schedule(
+            false,
+            false,
+            ScheduleKind::EnhancedInterval {
+                interval_seconds: 15,
+            },
+        )
+        .surface();
+        assert!(surface.blocked_reason(false).is_none());
     }
 
     #[test]

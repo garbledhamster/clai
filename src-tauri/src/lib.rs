@@ -390,6 +390,21 @@ pub fn run() {
         .manage(state)
         // Setup hook - runs after app is built, gives us AppHandle
         .setup(move |app| {
+            // Enable enhanced scheduling only after main-thread power/clock
+            // observer registration succeeds; unsupported platforms fail closed.
+            match runner_scheduler.try_lock() {
+                Ok(mut scheduler) => {
+                    if let Err(error) = agents::init::initialize_wake_monitor(
+                        &mut scheduler,
+                        agents::wake_monitor::install,
+                    ) {
+                        tracing::warn!(%error, "Power and clock notifications unavailable");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not initialize power and clock notifications");
+                }
+            }
             // Keep the app-managed skills repository current without making
             // startup depend on network availability.
             let app_handle = app.handle().clone();
@@ -554,6 +569,9 @@ pub fn run() {
             // reparented to init and leak. The frontend's per-component
             // `terminal_close` only covers a graceful React unmount.
             if let tauri::RunEvent::Exit = event {
+                if let Err(error) = agents::wake_monitor::uninstall() {
+                    tracing::warn!(%error, "Could not remove power and clock observers");
+                }
                 app_handle.state::<AppState>().terminals.close_all();
             }
         });

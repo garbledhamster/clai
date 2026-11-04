@@ -79,6 +79,9 @@ pub async fn run_session_turn(
 
         let stream = match stream_result {
             Ok(s) => s,
+            Err(ProviderError::ScheduledDispatchAbandoned) => {
+                return Err(AssistantEngineError::ScheduledDispatchAbandoned)
+            }
             Err(e) => {
                 if !state.retried_after_context_compaction && is_context_limit_error(&e.to_string())
                 {
@@ -387,7 +390,7 @@ async fn start_api_turn(
                     session_id: session.id.clone(),
                     role: trigger_content.role.clone(),
                     content: trigger_content.content.clone(),
-                    provider_metadata: None,
+                    provider_metadata: Some(serde_json::json!({"source": "api-trigger"})),
                     run_id: Some(run_id.clone()),
                 },
             )
@@ -460,6 +463,9 @@ async fn prepare_api_request(
             }
             // Nothing eligible yet; the forced paths can still compact more.
             Ok(None) => {}
+            Err(compaction::CompactionError::ScheduledDispatchAbandoned) => {
+                return Err(AssistantEngineError::ScheduledDispatchAbandoned)
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %session.id,
@@ -556,6 +562,9 @@ async fn try_context_limit_recovery(
                 "Context-limit recovery found no compactable assistant history"
             );
             state.compaction_attempt.record_nothing_to_compact();
+        }
+        Err(compaction::CompactionError::ScheduledDispatchAbandoned) => {
+            return Err(AssistantEngineError::ScheduledDispatchAbandoned)
         }
         Err(error) => {
             tracing::warn!(

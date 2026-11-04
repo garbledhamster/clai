@@ -22,6 +22,7 @@ const entry = (
   runningTaskCount: 0n,
   scheduleEnabled: false,
   schedulePaused: false,
+  scheduleBlockedReason: null,
   scheduleKind: null,
   nextRunInSeconds: null,
   unread: false,
@@ -67,6 +68,25 @@ const renderRail = (
 ) => render(rail(workspaces, overrides));
 
 describe('WorkspaceRail sections', () => {
+  it.each([false, true])('shows pending run cleanup when schedule enabled is %s', (enabled) => {
+    renderRail([entry('a', 'Alpha', { scheduleEnabled: enabled,
+      scheduleBlockedReason: 'Cancellation failed; messages may wait while cleanup retries.' })]);
+    expect(screen.getByText('Cancellation failed; messages may wait while cleanup retries.')).toHaveAttribute('title', 'Cancellation failed; messages may wait while cleanup retries.');
+  });
+
+  it('does not display schedule unavailability for an ordinary disabled schedule', () => {
+    renderRail([entry('a', 'Alpha')]);
+    expect(screen.queryByText(/Wake detection is unavailable/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Cancellation failed; messages may wait while cleanup retries.')).not.toBeInTheDocument();
+  });
+
+  it('shows when a schedule cannot run because wake detection is unavailable', () => {
+    renderRail([entry('a', 'Alpha', { scheduleEnabled: true,
+      scheduleKind: { type: 'enhancedInterval', intervalSeconds: 15 },
+      scheduleBlockedReason: 'Wake detection is unavailable.' })]);
+    expect(screen.getByText('Wake detection is unavailable.')).toHaveAttribute('title', 'Wake detection is unavailable.');
+  });
+
   it('renders a plain headerless list when nothing is starred or in attention', () => {
     renderRail([
       entry('a', 'Alpha', { updatedAt: 3n }),

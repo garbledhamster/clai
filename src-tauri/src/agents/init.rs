@@ -15,6 +15,20 @@ pub fn initialize_scheduler(_scheduler: &SharedScheduler, _config_manager: &Conf
     // intentionally empty
 }
 
+/// Main-thread startup boundary: availability follows observer registration.
+pub fn initialize_wake_monitor(
+    scheduler: &mut crate::agents::scheduler::Scheduler,
+    register: impl FnOnce(crate::agents::scheduler::WakeSignal) -> Result<(), String>,
+) -> Result<(), String> {
+    let result = register(scheduler.wake_signal());
+    scheduler.set_wake_monitor_available(
+        result.is_ok(),
+        chrono::Utc::now().timestamp_millis(),
+        std::time::Instant::now(),
+    );
+    result
+}
+
 /// Populates the scheduler with scheduled workspace-local agents from workspace configs.
 ///
 /// Called after workspace storage is initialized. Reads every workspace
@@ -74,6 +88,12 @@ pub fn apply_workspace_schedule(
         return;
     };
 
+    // Preserve the active slot; apply the latest saved settings after it exits.
+    if sched.running_instance().map(String::as_str) == Some(agent.id.as_str()) {
+        sched.defer_reconcile(&agent.id);
+        return;
+    }
+
     // Always start clean: drop any prior instance(s) for this agent. Cheap
     // when there is none; safe when there is one of either polarity.
     sched.remove_instances_for_agent(&agent.id);
@@ -107,11 +127,92 @@ pub fn apply_workspace_schedule(
             // was actually due — the `Instant` `next_run_at` doesn't
             // survive process restart.
             sched.set_instance_next_run_at(&instance_id, config.schedule.next_run_at_unix_ms);
+            if matches!(
+                config.schedule.kind,
+                crate::config::workspace_config::ScheduleKind::EnhancedInterval { .. }
+                    | crate::config::workspace_config::ScheduleKind::EnhancedCron { .. }
+            ) {
+                if let Err(error) = sched.configure_enhanced(
+                    &instance_id,
+                    config.schedule.kind.clone(),
+                    chrono::Utc::now().timestamp_millis(),
+                    std::time::Instant::now(),
+                ) {
+                    tracing::warn!(%error, "Unable to configure enhanced schedule");
+                    sched.set_instance_enabled(&instance_id, false);
+                }
+            }
             if config.schedule.paused {
                 sched.set_instance_enabled(&instance_id, false);
             }
         }
     }
+}
+
+/// Save and apply settings while holding the scheduler lock, preserving write order.
+pub async fn update_schedule_and_reconcile(
+    state: &AppState,
+    workspace_id: &str,
+    invalidates_completion: bool,
+    mutate: impl FnOnce(&mut crate::config::WorkspaceConfig) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut sched = state.scheduler.lock().await;
+    let ((), config) = state.update_workspace_config(workspace_id, mutate)?;
+    if invalidates_completion {
+        sched.invalidate_pending_cancellation_rearm(workspace_id);
+        sched.invalidate_running_completion(config.main_agent_id());
+    }
+    apply_with_legacy_deadline(&mut sched, &config, !invalidates_completion);
+    Ok(())
+}
+
+fn apply_with_legacy_deadline(
+    sched: &mut crate::agents::scheduler::Scheduler,
+    config: &crate::config::WorkspaceConfig,
+    preserve: bool,
+) {
+    use crate::config::workspace_config::ScheduleKind;
+    let id = config.main_agent_id();
+    let previous = if preserve
+        && config.schedule.enabled
+        && !sched.completion_is_invalidated(id)
+        && matches!(
+            config.schedule.kind,
+            ScheduleKind::Interval { .. } | ScheduleKind::Cron { .. }
+        ) {
+        sched
+            .get_instance(id)
+            .filter(|instance| !instance.is_running)
+            .map(|instance| instance.next_run_at)
+    } else {
+        None
+    };
+    apply_workspace_schedule(sched, config);
+    if let Some(deadline) = previous {
+        if let Some(instance) = sched.get_instance_mut(id) {
+            instance.next_run_at = deadline;
+        }
+    }
+}
+
+/// Retry deferred settings after a run. Failed reads remain pending for the next poll.
+/// Callers hold the scheduler lock while loading so settings writes cannot overtake it.
+pub fn reconcile_deferred(
+    sched: &mut crate::agents::scheduler::Scheduler,
+    load: impl Fn(&str) -> Result<crate::config::WorkspaceConfig, String>,
+) -> Result<(), String> {
+    let mut first_error = None;
+    for (_instance_id, workspace_id) in sched.deferred_reconciliations() {
+        match load(&workspace_id) {
+            Ok(config) => apply_with_legacy_deadline(sched, &config, true),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Clears all agent instances.
@@ -150,6 +251,116 @@ mod tests {
                 interval_minutes: 5,
             },
         )
+    }
+
+    #[test]
+    fn failed_deferred_load_is_retried_and_reenables_the_legacy_schedule() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        let mut sched = crate::agents::scheduler::Scheduler::new();
+        apply_workspace_schedule(&mut sched, &config);
+        let running = sched.next_ready().unwrap();
+        apply_workspace_schedule(&mut sched, &config);
+        sched.complete_agent(&running, true, i64::MAX);
+        assert!(reconcile_deferred(&mut sched, |_| Err("temporary read failure".into())).is_err());
+        assert!(sched.next_ready().is_none());
+        reconcile_deferred(&mut sched, |_| Ok(config.clone())).unwrap();
+        assert!(sched.get_instance(&running).unwrap().enabled);
+        assert!(sched.deferred_reconciliations().is_empty());
+    }
+
+    #[test]
+    fn changing_schedule_does_not_release_active_run() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        let mut scheduler = crate::agents::scheduler::Scheduler::new();
+        apply_workspace_schedule(&mut scheduler, &config);
+        let running = scheduler.next_ready().unwrap();
+        config.schedule.kind = ScheduleKind::EnhancedInterval {
+            interval_seconds: 15,
+        };
+        apply_workspace_schedule(&mut scheduler, &config);
+        assert_eq!(
+            scheduler.running_instance().map(String::as_str),
+            Some(running.as_str())
+        );
+        assert!(scheduler.next_ready().is_none());
+        scheduler.complete_agent(&running, true, i64::MAX);
+        assert!(scheduler.take_deferred_reconcile(&running));
+        apply_workspace_schedule(&mut scheduler, &config);
+        assert!(scheduler.next_ready().is_none()); // Wake detection remains unavailable.
+    }
+
+    #[test]
+    fn disabling_schedule_does_not_release_active_run() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        let mut scheduler = crate::agents::scheduler::Scheduler::new();
+        apply_workspace_schedule(&mut scheduler, &config);
+        let running = scheduler.next_ready().unwrap();
+        config.schedule.enabled = false;
+        apply_workspace_schedule(&mut scheduler, &config);
+        assert_eq!(
+            scheduler.running_instance().map(String::as_str),
+            Some(running.as_str())
+        );
+        assert!(scheduler.next_ready().is_none());
+    }
+
+    #[test]
+    fn startup_enables_enhanced_schedules_only_after_observer_registration_succeeds() {
+        use crate::agents::scheduler::Scheduler;
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use std::time::{Duration, Instant};
+        for available in [true, false] {
+            let mut config =
+                WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+            config.schedule.enabled = true;
+            config.schedule.kind = ScheduleKind::EnhancedInterval {
+                interval_seconds: 15,
+            };
+            let mut scheduler = Scheduler::new();
+            apply_workspace_schedule(&mut scheduler, &config);
+            let registration = initialize_wake_monitor(&mut scheduler, |_| {
+                if available {
+                    Ok(())
+                } else {
+                    Err("observer unavailable".into())
+                }
+            });
+            assert_eq!(registration.is_ok(), available);
+            assert_eq!(
+                scheduler
+                    .next_ready_at(16_000, Instant::now() + Duration::from_secs(16))
+                    .is_some(),
+                available
+            );
+        }
+    }
+
+    #[test]
+    fn enhanced_schedule_does_not_run_without_wake_detection() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::EnhancedInterval {
+            interval_seconds: 15,
+        };
+        let mut scheduler = crate::agents::scheduler::Scheduler::new();
+        apply_workspace_schedule(&mut scheduler, &config);
+        assert!(scheduler.next_ready().is_none());
     }
 
     #[tokio::test]

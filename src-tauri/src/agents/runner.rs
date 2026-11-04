@@ -141,6 +141,16 @@ pub fn start_agent_runner(app_handle: AppHandle, scheduler: SharedScheduler) {
         "Starting agent runner"
     );
 
+    // Cleanup must progress even while another scheduled turn is active.
+    let cleanup_app = app_handle.clone();
+    let cleanup_scheduler = scheduler.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+            retry_pending_cancellations(&cleanup_app, &cleanup_scheduler).await;
+        }
+    });
+
     // Use Tauri's async runtime to spawn the background task
     tauri::async_runtime::spawn(async move {
         tracing::info!("Agent runner background task started");
@@ -169,6 +179,18 @@ async fn run_next_agent(
     app_handle: &AppHandle,
     scheduler: &SharedScheduler,
 ) -> Result<(), RunnerError> {
+    {
+        let state = app_handle.state::<AppState>();
+        let mut sched = scheduler.lock().await;
+        if let Err(error) = crate::agents::init::reconcile_deferred(&mut sched, |workspace_id| {
+            let root = state
+                .workspace_root(workspace_id)
+                .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+            workspace_config::load(&root).map_err(|error| error.to_string())
+        }) {
+            tracing::warn!(%error, "Deferred schedule reconciliation will be retried");
+        }
+    }
     let Some(instance_id) = claim_next_instance(scheduler).await else {
         tracing::debug!("No agents ready");
         return Ok(());
@@ -227,6 +249,26 @@ async fn release_slot_on_error(
     result
 }
 
+async fn claimed_instance_details(
+    scheduler: &SharedScheduler,
+    instance_id: &str,
+) -> Result<
+    (
+        String,
+        String,
+        Option<crate::agents::scheduler::DispatchLease>,
+    ),
+    RunnerError,
+> {
+    let mut sched = scheduler.lock().await;
+    let instance = sched
+        .get_instance(instance_id)
+        .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.to_string()))?;
+    let workspace_id = instance.workspace_id.clone();
+    let agent_id = instance.agent_id.clone();
+    Ok((workspace_id, agent_id, sched.take_claimed_dispatch_lease()))
+}
+
 /// Runs an instance already claimed by [`claim_next_instance`]. Every `Ok`
 /// path releases the scheduler slot itself; errors are released by
 /// [`release_slot_on_error`].
@@ -241,19 +283,8 @@ async fn run_claimed_instance(
 ) -> Result<(), RunnerError> {
     let state = app_handle.state::<AppState>();
 
-    tracing::info!(instance_id = %instance_id, "Running agent");
-
-    // Get the instance details
-    let (workspace_id, agent_id) = {
-        let sched = scheduler.lock().await;
-        let instance = sched
-            .get_instance(instance_id)
-            .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.to_string()))?;
-
-        (instance.workspace_id.clone(), instance.agent_id.clone())
-    };
-
-    tracing::debug!(agent_id = %agent_id, "Got agent instance");
+    let (workspace_id, agent_id, dispatch_lease) =
+        claimed_instance_details(scheduler, instance_id).await?;
 
     let agent_config = load_workspace_agent_as_config(state.inner(), &workspace_id, &agent_id)?
         .ok_or_else(|| RunnerError::AgentNotFound(agent_id.clone()))?;
@@ -264,11 +295,6 @@ async fn run_claimed_instance(
 
     // Check if the automation is still enabled.
     if !agent_config.enabled {
-        tracing::info!(
-            agent_id = %agent_id,
-            "Automation is no longer enabled, removing instance"
-        );
-
         // Remove the instance from scheduler
         {
             let mut sched = scheduler.lock().await;
@@ -277,8 +303,6 @@ async fn run_claimed_instance(
 
         return Ok(());
     }
-
-    tracing::debug!(agent_name = %agent_config.name, "Got agent config");
 
     let connection = resolve_agent_connection(state.inner(), &agent_config)?;
 
@@ -307,58 +331,228 @@ async fn run_claimed_instance(
     let ran = run.is_some();
     let result = match run {
         Some(run) => {
-            run_scheduled_agent(
-                app_handle,
-                &agent_config.workspace_id,
+            let engine_run = run.clone();
+            let registration = runtime::register_run(
+                runtime::LiveRunKey::new(&workspace_id, &session.id),
+                &run.id,
+            );
+            let cancel_token = registration.token();
+            let outcome = run_queued_with_preflight(
                 &workspace_pool,
                 &session,
-                &connection,
-                run,
+                &run,
+                scheduler,
+                instance_id,
+                dispatch_lease.as_ref(),
+                |event| {
+                    let _ = emit_event(app_handle, &workspace_id, &session, None, event);
+                },
+                || {
+                    run_scheduled_agent(
+                        app_handle,
+                        &agent_config.workspace_id,
+                        &workspace_pool,
+                        &session,
+                        &connection,
+                        engine_run,
+                        cancel_token,
+                    )
+                },
             )
-            .await
+            .await;
+            drop(registration);
+            match outcome? {
+                StartOutcome::AbandonedOnSleepOrClockChange => {
+                    kick_after_abandon(app_handle, &workspace_id, &workspace_pool, &session.id)
+                        .await;
+                    return Ok(());
+                }
+                StartOutcome::Finished(result) => result,
+            }
         }
         None => Ok(()),
     };
 
-    // Mark agent complete
-    let success = match &result {
-        Ok(()) => {
-            tracing::info!(instance_id = %instance_id, "Agent completed successfully");
-            true
-        }
-        Err(e) => {
-            tracing::error!(instance_id = %instance_id, error = %e, "Agent execution error");
-            false
-        }
-    };
-    let next_run_at_unix_ms = complete_tick(scheduler, instance_id, success, &agent_config).await;
-
-    // Persist the new next-run wall-clock time (so an app restart
-    // resumes the schedule instead of firing immediately) and, when the
-    // tick ran, the run-completion stamp (so the workspace rail can flag the
-    // result as unread until the user opens the workspace). Best-effort: a
-    // write failure here only loses the restart-survival guarantee
-    // for this one workspace until the next successful tick.
-    if let Err(e) = persist_workspace_run_completion(
+    let success = log_tick_result(instance_id, &result);
+    if let Err(e) = complete_tick_and_persist(
         state.inner(),
-        &agent_config.workspace_id,
-        next_run_at_unix_ms,
+        scheduler,
+        instance_id,
+        success,
+        &agent_config,
         ran,
-    ) {
-        tracing::warn!(
-            workspace_id = %agent_config.workspace_id,
-            error = %e,
-            "Failed to persist run completion to workspace config"
-        );
+    )
+    .await
+    {
+        tracing::warn!(workspace_id = %agent_config.workspace_id, error = %e,
+            "Failed to persist run completion to workspace config");
     }
 
     Ok(())
 }
 
+async fn kick_after_abandon(app: &AppHandle, workspace_id: &str, pool: &DbPool, session_id: &str) {
+    let deps = AssistantDeps {
+        workspace_id: workspace_id.to_string(),
+        pool: pool.clone(),
+        app: app.clone(),
+    };
+    dispatcher::kick_logged(&deps, session_id).await;
+}
+
+fn log_tick_result(instance_id: &str, result: &Result<(), RunnerError>) -> bool {
+    match result {
+        Ok(()) => {
+            tracing::info!(instance_id = %instance_id, "Agent completed successfully");
+            true
+        }
+        Err(error) => {
+            tracing::error!(instance_id = %instance_id, %error, "Agent execution error");
+            false
+        }
+    }
+}
+
+enum StartOutcome {
+    Finished(Result<(), RunnerError>),
+    AbandonedOnSleepOrClockChange,
+}
+
+/// Check a queued attempt before engine entry. Later provider boundaries still
+/// need their own guard; this preflight does not commit the lease.
+#[allow(clippy::too_many_arguments)]
+async fn run_queued_with_preflight<Fut>(
+    pool: &DbPool,
+    session: &AssistantSession,
+    run: &AssistantRun,
+    scheduler: &SharedScheduler,
+    instance_id: &str,
+    lease: Option<&crate::agents::scheduler::DispatchLease>,
+    mut emit: impl FnMut(AssistantUiEvent),
+    start: impl FnOnce() -> Fut,
+) -> Result<StartOutcome, RunnerError>
+where
+    Fut: std::future::Future<Output = Result<(), RunnerError>>,
+{
+    let previous_cli_session = if lease.is_none_or(|lease| lease.is_current()) {
+        match crate::assistant::provider_dispatch::with_scheduled_dispatch(lease.cloned(), start())
+            .await
+        {
+            Err(RunnerError::ScheduledDispatchAbandoned) => None,
+            Err(RunnerError::ScheduledPreparationAbandoned(previous)) => Some(previous),
+            result => return Ok(StartOutcome::Finished(result)),
+        }
+    } else {
+        None
+    };
+    if run.session_id != session.id {
+        return Err(RunnerError::AssistantPersistence(
+            "Scheduled run session mismatch".into(),
+        ));
+    }
+    let cleanup = async {
+        crate::assistant::run_lifecycle::rollback_scheduled_preparation(
+            pool,
+            run,
+            previous_cli_session.as_ref(),
+            &mut emit,
+        )
+        .await?;
+        crate::assistant::run_lifecycle::cancel_run_with_sink(pool, &run.id, &mut emit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if let Err(error) = cleanup {
+        scheduler.lock().await.retain_failed_cancellation(
+            instance_id,
+            &session.id,
+            &run.id,
+            previous_cli_session,
+        );
+        return Err(RunnerError::AssistantPersistence(error));
+    }
+    scheduler.lock().await.abandon_enhanced_claim(instance_id);
+    Ok(StartOutcome::AbandonedOnSleepOrClockChange)
+}
+
+async fn retry_abandoned_cancellation(
+    pool: &DbPool,
+    scheduler: &SharedScheduler,
+    workspace_id: &str,
+    expected_run_id: &str,
+    mut emit: impl FnMut(AssistantUiEvent),
+) -> Result<(), String> {
+    let pending = scheduler
+        .lock()
+        .await
+        .pending_cancellations()
+        .into_iter()
+        .find(|pending| pending.workspace_id == workspace_id && pending.run_id == expected_run_id)
+        .ok_or_else(|| "Pending cancellation changed".to_string())?;
+    if let Some(run) = repository::get_run(pool, &pending.run_id).await? {
+        crate::assistant::run_lifecycle::rollback_scheduled_preparation(
+            pool,
+            &run,
+            pending.previous_cli_session.as_ref(),
+            &mut emit,
+        )
+        .await?;
+    }
+    match repository::get_run(pool, &pending.run_id).await? {
+        Some(run) if run.status.is_active() => {
+            crate::assistant::run_lifecycle::cancel_run_with_sink(pool, &pending.run_id, emit)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Some(run) if run.status == RunStatus::Cancelled => {
+            emit(AssistantUiEvent::RunCancelled { run });
+        }
+        _ => {}
+    }
+    scheduler
+        .lock()
+        .await
+        .finish_pending_cancellation(workspace_id, &pending.run_id);
+    Ok(())
+}
+
+/// Retry abandoned run cleanup independently of other workspaces' active turns.
+async fn retry_pending_cancellations(app: &AppHandle, scheduler: &SharedScheduler) {
+    let pending = scheduler.lock().await.pending_cancellations();
+    let state = app.state::<AppState>();
+    for item in pending {
+        let result = async {
+            let pool = state.workspace_db(&item.workspace_id).await?;
+            let session = repository::get_session(&pool, &item.session_id).await?;
+            retry_abandoned_cancellation(
+                &pool,
+                scheduler,
+                &item.workspace_id,
+                &item.run_id,
+                |event| {
+                    if let Some(session) = &session {
+                        let _ = emit_event(app, &item.workspace_id, session, None, event);
+                    }
+                },
+            )
+            .await?;
+            if let Some(session) = session {
+                kick_after_abandon(app, &item.workspace_id, &pool, &session.id).await;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(workspace_id = %item.workspace_id, %error, "Scheduled run cancellation remains pending");
+        }
+    }
+}
+
 /// Releases the scheduler slot and schedules the next fire. Returns the next
 /// fire time, `None` when the schedule cannot compute one.
-async fn complete_tick(
-    scheduler: &SharedScheduler,
+fn complete_tick_locked(
+    sched: &mut crate::agents::scheduler::Scheduler,
     instance_id: &str,
     success: bool,
     agent_config: &AgentConfig,
@@ -384,7 +578,6 @@ async fn complete_tick(
             None
         }
     };
-    let mut sched = scheduler.lock().await;
     // When we can't compute a next time, pass `i64::MAX` so the
     // scheduler parks the instance indefinitely. The user has to
     // fix the schedule via the UI before it ticks again.
@@ -405,6 +598,27 @@ async fn complete_tick(
         );
     }
     next_run_at_unix_ms
+}
+
+async fn complete_tick_and_persist(
+    state: &AppState,
+    scheduler: &SharedScheduler,
+    instance_id: &str,
+    success: bool,
+    agent_config: &AgentConfig,
+    ran: bool,
+) -> Result<(), String> {
+    let mut sched = scheduler.lock().await;
+    let unchanged = !sched.completion_is_invalidated(instance_id);
+    let next = complete_tick_locked(&mut sched, instance_id, success, agent_config);
+    persist_workspace_run_completion(
+        state,
+        &agent_config.workspace_id,
+        next,
+        ran,
+        &agent_config.schedule_kind,
+        unchanged,
+    )
 }
 
 /// Which scheduler tick [`start_tick_run`] is starting.
@@ -474,6 +688,8 @@ pub(crate) fn persist_workspace_run_completion(
     workspace_id: &str,
     next_run_at_unix_ms: Option<i64>,
     ran: bool,
+    attempted_kind: &crate::config::workspace_config::ScheduleKind,
+    schedule_unchanged: bool,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
     // Atomic RMW: `workspace_mark_opened` fires from the FE the moment a
@@ -482,7 +698,10 @@ pub(crate) fn persist_workspace_run_completion(
     // clobbered by the other writer's stale copy (the schedule then
     // re-fired on every app restart).
     state.update_workspace_config(workspace_id, |config| {
-        config.schedule.next_run_at_unix_ms = next_run_at_unix_ms;
+        if schedule_unchanged && config.schedule.enabled && &config.schedule.kind == attempted_kind
+        {
+            config.schedule.next_run_at_unix_ms = next_run_at_unix_ms;
+        }
         if ran {
             config.last_run_completed_at = now;
         }
@@ -499,6 +718,8 @@ pub(crate) fn persist_workspace_run_completion(
 /// Errors that can occur in the agent runner.
 #[derive(Debug)]
 pub enum RunnerError {
+    ScheduledDispatchAbandoned,
+    ScheduledPreparationAbandoned(crate::assistant::run_lifecycle::CliSessionBeforeStart),
     /// Agent instance not found.
     InstanceNotFound(String),
     /// Agent config not found in ConfigManager.
@@ -514,6 +735,12 @@ pub enum RunnerError {
 impl std::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RunnerError::ScheduledPreparationAbandoned(_) => {
+                write!(f, "scheduled preparation cleanup required")
+            }
+            RunnerError::ScheduledDispatchAbandoned => {
+                write!(f, "scheduled attempt abandoned before provider dispatch")
+            }
             RunnerError::InstanceNotFound(id) => write!(f, "Agent instance not found: {}", id),
             RunnerError::AgentNotFound(id) => write!(f, "Agent config not found: {}", id),
             RunnerError::AssistantPersistence(msg) => {
@@ -592,6 +819,7 @@ async fn run_scheduled_agent(
     session: &AssistantSession,
     connection: &ProviderConnection,
     run: AssistantRun,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), RunnerError> {
     let deps = AssistantDeps {
         workspace_id: workspace_id.to_string(),
@@ -607,11 +835,6 @@ async fn run_scheduled_agent(
         "Starting scheduled assistant run"
     );
 
-    // Registered like every other run, so `assistant_cancel_run(workspace_id,
-    // run.id)` and mid-run delivery reach it.
-    let run_registration =
-        runtime::register_run(runtime::LiveRunKey::new(workspace_id, &session.id), &run.id);
-    let cancel_token = run_registration.token();
     let input = RunTurnInput {
         session_id: session.id.clone(),
         run_id: Some(run.id.clone()),
@@ -620,11 +843,24 @@ async fn run_scheduled_agent(
         cancel_token,
     };
     let result = engine::run_session_turn(&deps, input).await;
-    drop(run_registration);
-
-    dispatcher::kick_logged(&deps, &session.id).await;
+    if !matches!(
+        result,
+        Err(engine::AssistantEngineError::ScheduledDispatchAbandoned
+            | engine::AssistantEngineError::ScheduledPreparationAbandoned(_))
+    ) {
+        dispatcher::kick_logged(&deps, &session.id).await;
+    }
 
     result.map_err(|error| {
+        if let engine::AssistantEngineError::ScheduledPreparationAbandoned(previous) = error {
+            return RunnerError::ScheduledPreparationAbandoned(previous);
+        }
+        if matches!(
+            error,
+            engine::AssistantEngineError::ScheduledDispatchAbandoned
+        ) {
+            return RunnerError::ScheduledDispatchAbandoned;
+        }
         tracing::warn!(
             run_id = %run.id,
             connection_id = %connection.id,
@@ -658,6 +894,262 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("No provider configured"));
         assert!(text.contains("agent-1"));
+    }
+
+    #[tokio::test]
+    async fn settings_write_waits_for_reconciliation_and_wins_after_old_snapshot() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use crate::workspace_index::WorkspaceIndex;
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        workspace_config::save(&root, &config).unwrap();
+        let mut index = WorkspaceIndex::default();
+        index.insert_config(root.clone(), &config);
+        let cm = crate::ConfigManager::new_for_tests(
+            crate::config::AppConfig::default(),
+            temp.path().join("app.json"),
+        );
+        let state = Arc::new(AppState::new_for_tests(cm, index).unwrap());
+        let mut sched = state.scheduler.lock().await;
+        let stale_snapshot = workspace_config::load(&root).unwrap();
+        let writer_state = state.clone();
+        let writer = tokio::spawn(async move {
+            crate::agents::init::update_schedule_and_reconcile(&writer_state, "ws", true, |c| {
+                c.schedule.enabled = false;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished());
+        assert!(workspace_config::load(&root).unwrap().schedule.enabled);
+        crate::agents::init::apply_workspace_schedule(&mut sched, &stale_snapshot);
+        drop(sched);
+        writer.await.unwrap();
+        assert!(!workspace_config::load(&root).unwrap().schedule.enabled);
+        assert_eq!(state.scheduler.lock().await.next_ready(), None);
+    }
+
+    #[tokio::test]
+    async fn pausing_an_active_run_keeps_its_completion_anchor() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use crate::workspace_index::WorkspaceIndex;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        workspace_config::save(&root, &config).unwrap();
+        let mut index = WorkspaceIndex::default();
+        index.insert_config(root.clone(), &config);
+        let cm = crate::ConfigManager::new_for_tests(
+            crate::config::AppConfig::default(),
+            temp.path().join("app.json"),
+        );
+        let state = AppState::new_for_tests(cm, index).unwrap();
+        {
+            let mut sched = state.scheduler.lock().await;
+            crate::agents::init::apply_workspace_schedule(&mut sched, &config);
+            assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        }
+        let agent = load_workspace_agent_as_config(&state, "ws", "main")
+            .unwrap()
+            .unwrap();
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", false, |c| {
+            c.schedule.paused = true;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        complete_tick_and_persist(&state, &state.scheduler, "main", true, &agent, true)
+            .await
+            .unwrap();
+        let saved = workspace_config::load(&root).unwrap();
+        assert!(saved.schedule.paused);
+        assert!(saved.schedule.next_run_at_unix_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn same_kind_disable_and_reenable_preserves_new_anchor_on_old_completion() {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use crate::workspace_index::WorkspaceIndex;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        workspace_config::save(&root, &config).unwrap();
+        let mut index = WorkspaceIndex::default();
+        index.insert_config(root.clone(), &config);
+        let cm = crate::ConfigManager::new_for_tests(
+            crate::config::AppConfig::default(),
+            temp.path().join("app.json"),
+        );
+        let state = AppState::new_for_tests(cm, index).unwrap();
+        {
+            let mut sched = state.scheduler.lock().await;
+            crate::agents::init::apply_workspace_schedule(&mut sched, &config);
+            assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        }
+        let agent = load_workspace_agent_as_config(&state, "ws", "main")
+            .unwrap()
+            .unwrap();
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", true, |c| {
+            c.schedule.enabled = false;
+            c.schedule.next_run_at_unix_ms = None;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", true, |c| {
+            c.schedule.enabled = true;
+            c.schedule.next_run_at_unix_ms = Some(123_456);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        complete_tick_and_persist(&state, &state.scheduler, "main", true, &agent, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace_config::load(&root)
+                .unwrap()
+                .schedule
+                .next_run_at_unix_ms,
+            Some(123_456)
+        );
+    }
+
+    fn retry_test_workspace() -> (tempfile::TempDir, std::path::PathBuf, AppState) {
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use crate::workspace_index::WorkspaceIndex;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        config.schedule.enabled = true;
+        config.schedule.kind = ScheduleKind::Interval {
+            interval_minutes: 1,
+        };
+        workspace_config::save(&root, &config).unwrap();
+        let mut index = WorkspaceIndex::default();
+        index.insert_config(root.clone(), &config);
+        let cm = crate::ConfigManager::new_for_tests(
+            crate::config::AppConfig::default(),
+            temp.path().join("app.json"),
+        );
+        let state = AppState::new_for_tests(cm, index).unwrap();
+        (temp, root, state)
+    }
+
+    #[tokio::test]
+    async fn failed_start_keeps_retry_after_deferred_pause_and_resume() {
+        use crate::config::workspace_config::ScheduleKind;
+        let (_temp, root, state) = retry_test_workspace();
+        {
+            let config = workspace_config::load(&root).unwrap();
+            let mut sched = state.scheduler.lock().await;
+            crate::agents::init::apply_workspace_schedule(&mut sched, &config);
+            assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        }
+        for paused in [true, false] {
+            crate::agents::init::update_schedule_and_reconcile(&state, "ws", false, |c| {
+                c.schedule.paused = paused;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let result = release_slot_on_error(&state.scheduler, "main", async {
+            Err(RunnerError::NoProviderConfigured("main".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        let mut sched = state.scheduler.lock().await;
+        let retry = sched.get_instance("main").unwrap().next_run_at.unwrap();
+        crate::agents::init::reconcile_deferred(&mut sched, |_| {
+            workspace_config::load(&root).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(sched.next_ready(), None);
+        assert_eq!(sched.get_instance("main").unwrap().next_run_at, Some(retry));
+
+        assert!(sched.force_ready("main"));
+        assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        drop(sched);
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", false, |c| {
+            c.schedule.paused = true;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let _ = release_slot_on_error(&state.scheduler, "main", async {
+            Err(RunnerError::NoProviderConfigured("main".into()))
+        })
+        .await;
+        let paused_retry = {
+            let mut sched = state.scheduler.lock().await;
+            let retry = sched.get_instance("main").unwrap().next_run_at.unwrap();
+            crate::agents::init::reconcile_deferred(&mut sched, |_| {
+                workspace_config::load(&root).map_err(|e| e.to_string())
+            })
+            .unwrap();
+            assert!(!sched.get_instance("main").unwrap().enabled);
+            retry
+        };
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", false, |c| {
+            c.schedule.paused = false;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let mut sched = state.scheduler.lock().await;
+        assert_eq!(sched.next_ready(), None);
+        assert_eq!(
+            sched.get_instance("main").unwrap().next_run_at,
+            Some(paused_retry)
+        );
+
+        assert!(sched.force_ready("main"));
+        assert_eq!(sched.next_ready().as_deref(), Some("main"));
+        drop(sched);
+        crate::agents::init::update_schedule_and_reconcile(&state, "ws", true, |c| {
+            c.schedule.kind = ScheduleKind::Interval {
+                interval_minutes: 2,
+            };
+            c.schedule.next_run_at_unix_ms = Some(chrono::Utc::now().timestamp_millis() + 120_000);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let _ = release_slot_on_error(&state.scheduler, "main", async {
+            Err(RunnerError::NoProviderConfigured("main".into()))
+        })
+        .await;
+        let mut sched = state.scheduler.lock().await;
+        let failed_retry = sched.get_instance("main").unwrap().next_run_at.unwrap();
+        crate::agents::init::reconcile_deferred(&mut sched, |_| {
+            workspace_config::load(&root).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let replacement = sched.get_instance("main").unwrap().next_run_at.unwrap();
+        assert!(replacement < failed_retry);
+        assert_eq!(
+            workspace_config::load(&root).unwrap().schedule.kind,
+            ScheduleKind::Interval {
+                interval_minutes: 2
+            }
+        );
     }
 
     #[tokio::test]
@@ -757,6 +1249,622 @@ mod tests {
                 .expect("scheduled agent resolves");
         assert_eq!(agent.workspace_id, "ws-ok");
         assert!(agent.schedule_enabled);
+    }
+
+    mod sleep_preflight {
+        use super::*;
+        use crate::agents::{scheduler::Scheduler, AgentDefinition};
+        use crate::assistant::types::{AuthMode, SessionContext};
+        use crate::config::workspace_config::ScheduleKind;
+        use crate::db::test_support::workspace_pool;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+        use tokio::sync::Mutex;
+
+        fn connection() -> ProviderConnection {
+            ProviderConnection {
+                id: "conn".into(),
+                name: "conn".into(),
+                protocol_id: "openai".into(),
+                provider_id: "openai".into(),
+                auth_mode: AuthMode::DeveloperApiKey,
+                base_url: None,
+                secret_ref: String::new(),
+                model_id: "model".into(),
+                account_label: None,
+                enabled: true,
+                created_at: 0,
+                updated_at: 0,
+            }
+        }
+
+        async fn fixture(
+            manual: bool,
+        ) -> (
+            tempfile::TempDir,
+            DbPool,
+            AssistantSession,
+            AssistantRun,
+            SharedScheduler,
+            Option<crate::agents::scheduler::DispatchLease>,
+        ) {
+            let (tmp, pool) = workspace_pool().await;
+            let session = repository::create_session(&pool, SessionContext::default())
+                .await
+                .unwrap();
+            let mut scheduler = Scheduler::new();
+            scheduler.register_definition(
+                AgentDefinition::new("agent", "Agent").with_workspace_id("ws"),
+            );
+            let id = scheduler.create_instance("agent").unwrap();
+            let start = Instant::now() - Duration::from_secs(30);
+            scheduler
+                .configure_enhanced(
+                    &id,
+                    ScheduleKind::EnhancedInterval {
+                        interval_seconds: 15,
+                    },
+                    0,
+                    start,
+                )
+                .unwrap();
+            scheduler.set_wake_monitor_available(!manual, 0, start);
+            if manual {
+                assert!(scheduler.force_ready("agent"));
+            }
+            assert_eq!(
+                scheduler.next_ready_at(15_000, start + Duration::from_secs(15)),
+                Some(id.clone())
+            );
+            let lease = scheduler.take_claimed_dispatch_lease();
+            let run = start_tick_run(
+                &pool,
+                &session,
+                &connection(),
+                TickContext {
+                    instance_id: &id,
+                    agent_id: "agent",
+                    manual,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            (
+                tmp,
+                pool,
+                session,
+                run,
+                Arc::new(Mutex::new(scheduler)),
+                lease,
+            )
+        }
+
+        #[tokio::test]
+        async fn abandoned_scheduled_run_cancels_releases_and_rearms_without_provider_call() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            let signal = scheduler.lock().await.wake_signal();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let peer = barrier.clone();
+            let notifications = tokio::spawn(async move {
+                peer.wait().await;
+                signal.will_sleep();
+                signal.did_wake();
+                peer.wait().await;
+            });
+            barrier.wait().await;
+            barrier.wait().await;
+            notifications.await.unwrap();
+            // An intervening poll may consume the wake while the run is still claimed.
+            assert_eq!(scheduler.lock().await.next_ready(), None);
+            let calls = AtomicUsize::new(0);
+            let mut events = Vec::new();
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |e| events.push(e),
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                StartOutcome::AbandonedOnSleepOrClockChange
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                repository::get_run(&pool, &run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Cancelled
+            );
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                events.as_slice(),
+                [AssistantUiEvent::RunCancelled { .. }]
+            ));
+            let mut sched = scheduler.lock().await;
+            assert!(!sched.is_running());
+            let after = Instant::now();
+            assert_eq!(
+                sched.next_ready_at(0, after + Duration::from_secs(14)),
+                None
+            );
+            assert_eq!(
+                sched
+                    .next_ready_at(0, after + Duration::from_secs(16))
+                    .as_deref(),
+                Some("agent")
+            );
+        }
+
+        async fn preparation_message(
+            pool: &DbPool,
+            session: &AssistantSession,
+            run: &AssistantRun,
+            source: &str,
+            role: crate::assistant::types::MessageRole,
+            text: &str,
+        ) -> crate::assistant::types::AssistantMessage {
+            repository::create_message(
+                pool,
+                repository::CreateMessageParams {
+                    session_id: session.id.clone(),
+                    role,
+                    content: vec![crate::assistant::types::ContentPart::Text { text: text.into() }],
+                    provider_metadata: Some(serde_json::json!({"source": source})),
+                    run_id: Some(run.id.clone()),
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn api_abandonment_removes_boundary_before_the_next_manual_turn() {
+            use crate::assistant::{compaction_service, types::MessageRole};
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            let user = repository::create_user_message(
+                &pool,
+                session.id.clone(),
+                "manual input".into(),
+                Some("conn"),
+            )
+            .await
+            .unwrap();
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async {
+                    preparation_message(
+                        &pool,
+                        &session,
+                        &run,
+                        "api-trigger",
+                        MessageRole::User,
+                        "abandoned scheduled instruction",
+                    )
+                    .await;
+                    Err(RunnerError::ScheduledDispatchAbandoned)
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                StartOutcome::AbandonedOnSleepOrClockChange
+            ));
+            let next = compaction_service::load_with_pending(&pool, &session.id)
+                .await
+                .unwrap();
+            assert_eq!(
+                next.messages().len(),
+                1,
+                "the abandoned API boundary must not reach the next model"
+            );
+            assert_eq!(next.messages()[0].id, user.id);
+            assert_eq!(
+                crate::assistant::signals::list_open_content(&pool, &session.id)
+                    .await
+                    .unwrap()[0]
+                    .message
+                    .id,
+                user.id
+            );
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        async fn abandoned_cli_start(
+            pool: &DbPool,
+            session: &AssistantSession,
+            run: &AssistantRun,
+        ) -> RunnerError {
+            use crate::assistant::types::MessageRole;
+            preparation_message(
+                pool,
+                session,
+                run,
+                "claude-code-trigger",
+                MessageRole::User,
+                "abandoned schedule marker",
+            )
+            .await;
+            preparation_message(
+                pool,
+                session,
+                run,
+                "claude-code",
+                MessageRole::Assistant,
+                "",
+            )
+            .await;
+            let mut prepared = session.clone();
+            prepared.context.cli_session_id = Some("unlaunched-session".into());
+            repository::update_session(pool, &prepared).await.unwrap();
+            RunnerError::ScheduledPreparationAbandoned(
+                crate::assistant::run_lifecycle::CliSessionBeforeStart {
+                    id: session.context.cli_session_id.clone(),
+                    provider: session.context.cli_session_provider.clone(),
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn failed_cli_preparation_cleanup_blocks_manual_work_until_retry_succeeds() {
+            use crate::assistant::compaction_service;
+            let (_tmp, pool, mut session, mut run, scheduler, lease) = fixture(false).await;
+            run.protocol_id = "claude-code".into();
+            sqlx::query("UPDATE assistant_runs SET protocol_id = 'claude-code' WHERE id = ?")
+                .bind(&run.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            session.context.cli_session_id = Some("original-session".into());
+            session.context.cli_session_provider = Some("claude-code".into());
+            session = repository::update_session(&pool, &session).await.unwrap();
+            let user = repository::create_user_message(
+                &pool,
+                session.id.clone(),
+                "queued manual input".into(),
+                Some("conn"),
+            )
+            .await
+            .unwrap();
+            sqlx::query("CREATE TRIGGER reject_preparation_delete BEFORE DELETE ON assistant_messages WHEN json_extract(OLD.provider_metadata_json, '$.source') = 'claude-code-trigger' BEGIN SELECT RAISE(ABORT, 'injected preparation cleanup failure'); END").execute(&pool).await.unwrap();
+            let result = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async { Err(abandoned_cli_start(&pool, &session, &run).await) },
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "cleanup failure must not become successful abandonment"
+            );
+            assert!(
+                repository::active_run_id(&pool, &session.id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "manual dispatch must stay blocked"
+            );
+            assert!(scheduler
+                .lock()
+                .await
+                .pending_cancellation_reason("ws")
+                .is_some());
+            repository::complete_run(&pool, &run.id, RunStatus::Cancelled, None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(dispatcher::defer_for_cleanup(&*scheduler.lock().await, "ws", &session.id),
+                Some(dispatcher::Kick::Busy { run_id }) if run_id == run.id)
+            );
+            assert!(
+                retry_abandoned_cancellation(&pool, &scheduler, "ws", &run.id, |_| {})
+                    .await
+                    .is_err()
+            );
+            sqlx::query("DROP TRIGGER reject_preparation_delete")
+                .execute(&pool)
+                .await
+                .unwrap();
+            retry_abandoned_cancellation(&pool, &scheduler, "ws", &run.id, |_| {})
+                .await
+                .unwrap();
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(scheduler
+                .lock()
+                .await
+                .pending_cancellation_reason("ws")
+                .is_none());
+            assert!(
+                dispatcher::defer_for_cleanup(&*scheduler.lock().await, "ws", &session.id)
+                    .is_none()
+            );
+            let restored = repository::get_session(&pool, &session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored.context.cli_session_id.as_deref(),
+                Some("original-session")
+            );
+            let next = compaction_service::load_with_pending(&pool, &session.id)
+                .await
+                .unwrap();
+            assert_eq!(next.messages().len(), 1);
+            assert_eq!(next.messages()[0].id, user.id);
+            assert_eq!(
+                crate::assistant::signals::list_open_content(&pool, &session.id)
+                    .await
+                    .unwrap()[0]
+                    .message
+                    .id,
+                user.id
+            );
+        }
+
+        #[tokio::test]
+        async fn committed_engine_attempt_finishes_after_sleep_without_cancellation() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            let signal = scheduler.lock().await.wake_signal();
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async {
+                    repository::update_run_status(&pool, &run.id, RunStatus::Running, None)
+                        .await
+                        .map_err(RunnerError::AssistantPersistence)?;
+                    crate::assistant::provider_dispatch::commit_provider_dispatch()
+                        .map_err(|_| RunnerError::ScheduledDispatchAbandoned)?;
+                    signal.will_sleep();
+                    tokio::task::yield_now().await;
+                    // A later operation belongs to the same active attempt.
+                    crate::assistant::provider_dispatch::commit_provider_dispatch()
+                        .map_err(|_| RunnerError::ScheduledDispatchAbandoned)?;
+                    repository::complete_run(&pool, &run.id, RunStatus::Completed, None)
+                        .await
+                        .map_err(RunnerError::AssistantPersistence)?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, StartOutcome::Finished(Ok(()))));
+            assert_eq!(
+                repository::get_run(&pool, &run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Completed
+            );
+        }
+
+        #[tokio::test]
+        async fn sleep_after_engine_entry_cancels_and_rearms_without_dispatch() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            let signal = scheduler.lock().await.wake_signal();
+            let calls = AtomicUsize::new(0);
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async {
+                    tokio::task::yield_now().await;
+                    signal.will_sleep();
+                    signal.did_wake();
+                    crate::assistant::provider_dispatch::commit_provider_dispatch()
+                        .map_err(|_| RunnerError::ScheduledDispatchAbandoned)?;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                StartOutcome::AbandonedOnSleepOrClockChange
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                repository::get_run(&pool, &run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Cancelled
+            );
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            let mut sched = scheduler.lock().await;
+            assert!(!sched.is_running());
+            let after = Instant::now();
+            assert_eq!(
+                sched.next_ready_at(0, after + Duration::from_secs(14)),
+                None
+            );
+            assert_eq!(
+                sched
+                    .next_ready_at(0, after + Duration::from_secs(16))
+                    .as_deref(),
+                Some("agent")
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_cancellation_stays_visible_and_recovers_without_blocking_the_scheduler() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(false).await;
+            let signal = scheduler.lock().await.wake_signal();
+            signal.will_sleep();
+            signal.did_wake();
+            sqlx::query("CREATE TRIGGER reject_cancel BEFORE UPDATE OF status ON assistant_runs WHEN NEW.status = 'cancelled' BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END")
+                .execute(&pool).await.unwrap();
+            let calls = AtomicUsize::new(0);
+            let result = release_slot_on_error(&scheduler, "agent", async {
+                run_queued_with_preflight(
+                    &pool,
+                    &session,
+                    &run,
+                    &scheduler,
+                    "agent",
+                    lease.as_ref(),
+                    |_| {},
+                    || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+                .map(|_| ())
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_some());
+            {
+                let mut sched = scheduler.lock().await;
+                assert!(!sched.is_running());
+                assert!(sched.pending_cancellation_reason("ws").is_some());
+                assert_eq!(sched.next_ready(), None);
+                sched.register_definition(
+                    AgentDefinition::new("other", "Other").with_workspace_id("other-ws"),
+                );
+                let other = sched.create_instance("other").unwrap();
+                assert_eq!(sched.next_ready(), Some(other.clone()));
+                sched.complete_agent(&other, true, i64::MAX);
+            }
+            assert!(
+                retry_abandoned_cancellation(&pool, &scheduler, "ws", &run.id, |_| {})
+                    .await
+                    .is_err()
+            );
+            assert!(scheduler
+                .lock()
+                .await
+                .pending_cancellation_reason("ws")
+                .is_some());
+            sqlx::query("DROP TRIGGER reject_cancel")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            retry_abandoned_cancellation(&pool, &scheduler, "ws", &run.id, |event| {
+                events.push(event);
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [AssistantUiEvent::RunCancelled { .. }]
+            ));
+            assert!(repository::active_run_id(&pool, &session.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(scheduler
+                .lock()
+                .await
+                .pending_cancellation_reason("ws")
+                .is_none());
+            let next = repository::create_run_if_idle(
+                &pool,
+                CreateRunParams {
+                    session_id: session.id.clone(),
+                    status: RunStatus::Queued,
+                    trigger: RunTrigger::UserMessage,
+                    connection_id: "conn".into(),
+                    protocol_id: "openai".into(),
+                    model_id: "model".into(),
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(next.is_some(), "a manual turn may start after cleanup");
+        }
+
+        #[tokio::test]
+        async fn manual_run_is_not_cancelled_by_the_scheduled_sleep_guard() {
+            let (_tmp, pool, session, run, scheduler, lease) = fixture(true).await;
+            assert!(lease.is_none());
+            scheduler.lock().await.wake_signal().will_sleep();
+            let calls = AtomicUsize::new(0);
+            let outcome = run_queued_with_preflight(
+                &pool,
+                &session,
+                &run,
+                &scheduler,
+                "agent",
+                lease.as_ref(),
+                |_| {},
+                || async {
+                    crate::assistant::provider_dispatch::commit_provider_dispatch()
+                        .map_err(|_| RunnerError::ScheduledDispatchAbandoned)?;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, StartOutcome::Finished(Ok(()))));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                repository::get_run(&pool, &run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Queued
+            );
+        }
     }
 
     mod busy_tick {
@@ -870,9 +1978,9 @@ mod tests {
             );
             agent.workspace_id = "ws".into();
             let before = chrono::Utc::now().timestamp_millis();
-            let next = complete_tick(&scheduler, &instance_id, true, &agent)
-                .await
-                .unwrap();
+            let next =
+                complete_tick_locked(&mut *scheduler.lock().await, &instance_id, true, &agent)
+                    .unwrap();
             assert!(
                 next > before,
                 "the schedule must advance past the skipped tick"

@@ -350,6 +350,7 @@ async fn run_cli_json_command_with_timeout(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    crate::assistant::provider_dispatch::commit_provider_dispatch()?;
     let mut child = command.spawn().map_err(|e| {
         ProviderError::RequestFailed(format!(
             "Failed to launch {} summarizer: {}",

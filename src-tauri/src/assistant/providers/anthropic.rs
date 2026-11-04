@@ -141,12 +141,14 @@ impl ProviderAdapter for AnthropicAdapter {
         let body = build_request_body(&request);
 
         let client = Client::new();
-        let resp = client
+        let builder = client
             .post(&url)
             .header("x-api-key", &api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("Content-Type", "application/json")
-            .json(&body)
+            .json(&body);
+        crate::assistant::provider_dispatch::commit_provider_dispatch()?;
+        let resp = builder
             .send()
             .await
             .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;

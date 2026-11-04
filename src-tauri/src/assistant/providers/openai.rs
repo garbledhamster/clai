@@ -163,6 +163,7 @@ impl ProviderAdapter for OpenAiAdapter {
         for (name, value) in catalog_extra_headers(connection) {
             builder = builder.header(name, value);
         }
+        crate::assistant::provider_dispatch::commit_provider_dispatch()?;
         let resp = builder
             .send()
             .await

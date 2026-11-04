@@ -483,7 +483,8 @@ pub async fn assistant_compact_session(
         compaction::VERBATIM_TAIL_MAX_TOKENS,
         &mut conversation,
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
 
     let Some(outcome) = outcome else {
         return Ok(AssistantCompactionResult {

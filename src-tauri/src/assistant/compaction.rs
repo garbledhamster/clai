@@ -254,6 +254,29 @@ pub fn should_auto_compact(
     conversation.estimated_tokens() >= budget / 5 * 4
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    #[error("scheduled attempt abandoned before provider dispatch")]
+    ScheduledDispatchAbandoned,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for CompactionError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<ProviderError> for CompactionError {
+    fn from(error: ProviderError) -> Self {
+        match error {
+            ProviderError::ScheduledDispatchAbandoned => Self::ScheduledDispatchAbandoned,
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
 /// Summarize the eligible prefix and return the data needed to commit it.
 /// The conversation and database remain untouched until the caller commits.
 #[allow(clippy::too_many_arguments)]
@@ -265,7 +288,7 @@ pub async fn prepare_compaction(
     run_id: Option<&str>,
     verbatim_tail_tokens: usize,
     conversation: &RunConversation,
-) -> Result<Option<PreparedCompaction>, String> {
+) -> Result<Option<PreparedCompaction>, CompactionError> {
     prepare_with(
         &session.id,
         &connection.protocol_id,
@@ -287,7 +310,7 @@ pub async fn prepare_context_limit_recovery(
     summary_working_dir: Option<&Path>,
     run_id: &str,
     conversation: &RunConversation,
-) -> Result<Option<PreparedCompaction>, String> {
+) -> Result<Option<PreparedCompaction>, CompactionError> {
     prepare_compaction(
         session,
         connection,
@@ -301,7 +324,7 @@ pub async fn prepare_context_limit_recovery(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn prepare_with<F, Fut>(
+async fn prepare_with<F, Fut, E>(
     session_id: &str,
     protocol_id: &str,
     model_id: &str,
@@ -310,10 +333,10 @@ async fn prepare_with<F, Fut>(
     verbatim_tail_tokens: usize,
     conversation: &RunConversation,
     summarize: F,
-) -> Result<Option<PreparedCompaction>, String>
+) -> Result<Option<PreparedCompaction>, E>
 where
     F: FnOnce(Vec<AssistantMessage>) -> Fut,
-    Fut: Future<Output = Result<String, String>>,
+    Fut: Future<Output = Result<String, E>>,
 {
     let Some(plan) = plan_compaction(conversation, verbatim_tail_tokens) else {
         return Ok(None);
@@ -348,8 +371,8 @@ async fn summarize_window(
     summary_working_dir: Option<&Path>,
     source_run_id: Option<&str>,
     messages: &[AssistantMessage],
-) -> Result<String, String> {
-    let adapter = providers::resolve_connection_adapter(connection).map_err(|e| e.to_string())?;
+) -> Result<String, CompactionError> {
+    let adapter = providers::resolve_connection_adapter(connection)?;
     let transcript = transcript_for_summary(messages);
     let request = CompletionRequest {
         run_id: compaction_summary_run_id(session, source_run_id),
@@ -376,14 +399,14 @@ async fn summarize_window(
     let mut stream = adapter
         .stream_sessionless_completion(connection, request, summary_working_dir)
         .await
-        .map_err(provider_error_message)?;
+        .map_err(CompactionError::from)?;
     let mut summary = String::new();
     let mut stop_reason: Option<String> = None;
     while let Some(event) = stream.next().await {
-        match event.map_err(provider_error_message)? {
+        match event.map_err(CompactionError::from)? {
             ProviderEvent::TextDelta { text } => summary.push_str(&text),
             ProviderEvent::StopReason { reason } => stop_reason = Some(reason),
-            ProviderEvent::ProviderError { message } => return Err(message),
+            ProviderEvent::ProviderError { message } => return Err(message.into()),
             ProviderEvent::MessageStart
             | ProviderEvent::ThinkingDelta { .. }
             | ProviderEvent::ThinkingSignature { .. }
@@ -393,7 +416,7 @@ async fn summarize_window(
         }
     }
 
-    finish_summary(summary, stop_reason.as_deref())
+    finish_summary(summary, stop_reason.as_deref()).map_err(CompactionError::from)
 }
 
 /// Stop reasons that mean the provider cut generation at its output-token
@@ -613,10 +636,6 @@ fn safe_suffix(value: &str, max_bytes: usize) -> &str {
         start += 1;
     }
     &value[start..]
-}
-
-fn provider_error_message(error: ProviderError) -> String {
-    error.to_string()
 }
 
 #[cfg(test)]

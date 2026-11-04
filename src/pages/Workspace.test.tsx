@@ -185,6 +185,7 @@ const detailsFor = (
   enabled: true,
   scheduleEnabled: false,
   schedulePaused: false,
+  scheduleBlockedReason: null,
   scheduleKind: null,
   nextRunInSeconds: null,
   ...overrides,
@@ -315,6 +316,24 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe('Workspace schedule cleanup status', () => {
+  it.each([false, true])('shows the cleanup reason when schedule enabled is %s', async (enabled) => {
+    const reason = 'Cancellation failed; messages may wait while cleanup retries.';
+    getWorkspaceDetails.mockImplementation(async (_workspaceId, options) =>
+      detailsFor(options, { scheduleEnabled: enabled, scheduleBlockedReason: reason })
+    );
+    renderWorkspace();
+    expect(await screen.findByText(reason)).toBeVisible();
+  });
+
+  it('does not show schedule unavailability for an ordinary disabled schedule', async () => {
+    renderWorkspace();
+    await screen.findByRole('button', { name: /memories/i });
+    expect(screen.queryByText(/Wake detection is unavailable/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Paused')).not.toBeInTheDocument();
+  });
 });
 
 describe('Workspace details poll', () => {

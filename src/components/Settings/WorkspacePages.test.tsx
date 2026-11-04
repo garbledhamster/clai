@@ -70,6 +70,60 @@ describe('SchedulePage', () => {
     });
   });
 
+  it('requires explicit enhanced scheduling and validates its 15-second minimum', async () => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    render(<SchedulePage ref={ref} workspaceId="ws-1" details={DETAILS} saving={false} />);
+    await user.click(screen.getByRole('switch', { name: 'Run on a recurring schedule' }));
+    await user.click(screen.getByRole('switch', { name: 'Use enhanced scheduling' }));
+    const input = screen.getByLabelText('Interval in seconds');
+    await user.clear(input);
+    await user.type(input, '14');
+    expect((await submit(ref))?.ok).toBe(false);
+    expect(mockInvoke).not.toHaveBeenCalledWith('workspace_set_schedule', expect.anything());
+    await user.clear(input);
+    await user.type(input, '15');
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
+      workspaceId: 'ws-1', kind: { type: 'enhancedInterval', intervalSeconds: 15 },
+    });
+  });
+
+  it('shows why an enhanced schedule is paused when wake detection is unavailable', () => {
+    const details = { ...DETAILS, scheduleEnabled: true,
+      scheduleKind: { type: 'enhancedInterval', intervalSeconds: 15 },
+      scheduleBlockedReason: 'Wake detection is unavailable.' } as unknown as WorkspaceDetails;
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={details} saving={false} />);
+    expect(screen.getByText('Wake detection is unavailable.')).toBeInTheDocument();
+    expect(screen.queryByText('Running')).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])('shows pending cleanup when schedule enabled is %s', (enabled) => {
+    const details = { ...DETAILS, scheduleEnabled: enabled, scheduleBlockedReason: 'Cancellation failed; messages may wait while cleanup retries.' } as WorkspaceDetails;
+    render(<SchedulePage ref={createRef()} workspaceId="ws-1" details={details} saving={false} />);
+    expect(screen.getByText('Cancellation failed; messages may wait while cleanup retries.')).toBeInTheDocument();
+    if (!enabled) {
+      expect(screen.queryByText(/The main agent runs when you message it/)).not.toBeInTheDocument();
+    }
+  });
+
+  it('preserves an enhanced cron draft across status refreshes', async () => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    const details = { ...DETAILS, scheduleEnabled: true, scheduleKind: { type: 'enhancedCron', expression: '0 9 * * *', timezone: 'UTC' } } as unknown as WorkspaceDetails;
+    const page = (value: WorkspaceDetails) => <SchedulePage ref={ref} workspaceId="ws-1" details={value} saving={false} />;
+    const { rerender } = render(page(details));
+    const input = screen.getByLabelText('Cron expression');
+    await user.clear(input);
+    await user.type(input, '0 10 * * *');
+    await act(async () => { rerender(page({ ...details, schedulePaused: true })); });
+    expect(screen.getByLabelText('Cron expression')).toHaveValue('0 10 * * *');
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
+      workspaceId: 'ws-1', kind: { type: 'enhancedCron', expression: '0 10 * * *', timezone: 'UTC' },
+    });
+  });
+
   it('switches to cron in the host timezone, previews the next runs and validates the expression', async () => {
     const user = userEvent.setup();
     const ref = createRef<SectionHandle>();

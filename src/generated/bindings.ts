@@ -483,7 +483,7 @@ export type SandboxSessionBusConfig = "deny" | "allow";
  * surfacing as a confusing save error when the user's interval was
  * actually 24h.
  */
-export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { "type": "cron", expression: string, 
+export type ScheduleKind = { "type": "interval", intervalMinutes: number, } | { "type": "enhancedInterval", intervalSeconds: number, } | { "type": "enhancedCron", expression: string, timezone: string, } | { "type": "cron", expression: string, 
 /**
  * IANA timezone name. Empty / unknown values are rejected by
  * `compute_next_run_at` at save time so an invalid string can't
@@ -674,7 +674,7 @@ artifactLatestModifiedAt: bigint,
  * "Queued" chip + remove affordance; live updates flow through the
  * `QueuedMessagesDelivered` / `MessageDeleted` events.
  */
-queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boolean, schedulePaused: boolean, 
+queuedMessageIds: Array<string>, enabled: boolean | null, scheduleEnabled: boolean, schedulePaused: boolean, scheduleBlockedReason: string | null, 
 /**
  * The workspace's schedule mode (interval vs cron). Empty when the
  * workspace isn't scheduled. The frontend reads this to render the
@@ -732,7 +732,7 @@ export type WorkspaceFileContent = { path: string, viewer: string, content: stri
 
 export type WorkspaceFileEntry = { path: string, relativePath: string, name: string, viewer: string, size: bigint | null, updatedAt: bigint | null, preview: string | null, };
 
-export type WorkspaceListEntry = { id: string, kind: string, title: string, agentId: string | null, enabled: boolean, messageCount: bigint, runningTaskCount: bigint, scheduleEnabled: boolean, schedulePaused: boolean, 
+export type WorkspaceListEntry = { id: string, kind: string, title: string, agentId: string | null, enabled: boolean, messageCount: bigint, runningTaskCount: bigint, scheduleEnabled: boolean, schedulePaused: boolean, scheduleBlockedReason: string | null, 
 /**
  * Schedule mode (interval vs cron). Empty when the workspace is
  * not scheduled. The Fleet card reads this to render the cadence

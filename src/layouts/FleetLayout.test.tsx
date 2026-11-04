@@ -79,6 +79,7 @@ const entry = (
   runningTaskCount: 0n,
   scheduleEnabled: false,
   schedulePaused: false,
+  scheduleBlockedReason: null,
   scheduleKind: null,
   nextRunInSeconds: null,
   unread: false,

@@ -132,7 +132,8 @@ export const GeneralPage = ({ ref, workspaceId, details, saving, onDirtyChange }
 
 type ScheduleDraft =
   | { type: 'interval'; intervalMinutes: number }
-  | { type: 'cron'; expression: string; timezone: string };
+  | { type: 'enhancedInterval'; intervalSeconds: number }
+  | { type: 'cron' | 'enhancedCron'; expression: string; timezone: string };
 
 // One click for the common cases; the expression stays editable below.
 const CRON_PRESETS = [
@@ -145,6 +146,9 @@ const CRON_PRESETS = [
 ];
 
 const draftFrom = (kind: ScheduleKind | null | undefined): ScheduleDraft => {
+  const enhanced = kind;
+  if (enhanced?.type === 'enhancedInterval') return { ...enhanced };
+  if (enhanced?.type === 'enhancedCron') return { ...enhanced };
   if (kind?.type === 'cron') {
     return { type: 'cron', expression: kind.expression || '', timezone: kind.timezone || '' };
   }
@@ -220,8 +224,8 @@ export const SchedulePage = ({
 
   // Next fire times for the cron being typed, so it can be checked before Save.
   useEffect(() => {
-    const expression = draft.type === 'cron' ? draft.expression.trim() : '';
-    const timezone = draft.type === 'cron' ? draft.timezone.trim() : '';
+    const expression = draft.type === 'cron' || draft.type === 'enhancedCron' ? draft.expression.trim() : '';
+    const timezone = draft.type === 'cron' || draft.type === 'enhancedCron' ? draft.timezone.trim() : '';
     if (!enabled || !expression || !timezone) {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- clears the preview when there is nothing to preview; the fetch below is async.
       setPreview([]);
@@ -244,6 +248,7 @@ export const SchedulePage = ({
   }, [enabled, draft]);
 
   const paused = !!details?.schedulePaused;
+  const blockedReason = details?.scheduleBlockedReason;
   const savedOn = !!details?.scheduleEnabled;
 
   useReportDirty(
@@ -253,15 +258,24 @@ export const SchedulePage = ({
 
   const setType = (type: 'interval' | 'cron') => {
     setDraft((prev) => {
-      if (prev.type === type) return prev;
+      const enhanced = prev.type === 'enhancedInterval' || prev.type === 'enhancedCron';
+      if ((type === 'interval' && (prev.type === 'interval' || prev.type === 'enhancedInterval')) ||
+          (type === 'cron' && (prev.type === 'cron' || prev.type === 'enhancedCron'))) return prev;
       return type === 'cron'
-        ? { type: 'cron', expression: '0 * * * *', timezone: hostTimezone || 'UTC' }
-        : { type: 'interval', intervalMinutes: 30 };
+        ? { type: enhanced ? 'enhancedCron' : 'cron', expression: '0 * * * *', timezone: hostTimezone || 'UTC' }
+        : enhanced ? { type: 'enhancedInterval', intervalSeconds: 1800 } : { type: 'interval', intervalMinutes: 30 };
     });
   };
 
   const build = useCallback((): { ok: true; kind: ScheduleKind | null } | { ok: false; error: string } => {
     if (!enabled) return { ok: true, kind: null };
+    if (draft.type === 'enhancedInterval') {
+      const seconds = Number(draft.intervalSeconds);
+      if (!Number.isInteger(seconds) || seconds < 15 || seconds > 4294967295) {
+        return { ok: false, error: 'Interval must be a whole number of at least 15 seconds.' };
+      }
+      return { ok: true, kind: { type: 'enhancedInterval', intervalSeconds: seconds } as ScheduleKind };
+    }
     if (draft.type === 'interval') {
       const mins = Number(draft.intervalMinutes);
       if (!Number.isFinite(mins) || mins < 1 || mins > 1440) {
@@ -273,7 +287,7 @@ export const SchedulePage = ({
     const timezone = draft.timezone.trim();
     if (!expression) return { ok: false, error: 'Cron expression is required.' };
     if (!timezone) return { ok: false, error: 'Timezone is required.' };
-    return { ok: true, kind: { type: 'cron', expression, timezone } as ScheduleKind };
+    return { ok: true, kind: { type: draft.type, expression, timezone } as ScheduleKind };
   }, [enabled, draft]);
 
   const runCommand = useCallback(async (call: () => Promise<unknown>, fallback: string) => {
@@ -331,13 +345,25 @@ export const SchedulePage = ({
               disabled={busy}
             />
 
+            <Switch
+              label="Use enhanced scheduling"
+              hint="Use second intervals and restart schedules after sleep."
+              checked={draft.type === 'enhancedInterval' || draft.type === 'enhancedCron'}
+              onChange={(checked) => setDraft((prev) => {
+                if (prev.type === 'interval') return checked ? { type: 'enhancedInterval', intervalSeconds: prev.intervalMinutes * 60 } : prev;
+                if (prev.type === 'enhancedInterval') return checked ? prev : { type: 'interval', intervalMinutes: Math.max(1, Math.ceil(prev.intervalSeconds / 60)) };
+                return { ...prev, type: checked ? 'enhancedCron' : 'cron' };
+              })}
+              disabled={off}
+            />
+
             <div className={form.segmented} role="group" aria-label="Schedule type">
               {(['interval', 'cron'] as const).map((type) => (
                 <button
                   key={type}
                   type="button"
                   className={form.segment}
-                  aria-pressed={draft.type === type}
+                  aria-pressed={type === 'interval' ? draft.type === 'interval' || draft.type === 'enhancedInterval' : draft.type === 'cron' || draft.type === 'enhancedCron'}
                   onClick={() => setType(type)}
                   disabled={off}
                 >
@@ -346,7 +372,14 @@ export const SchedulePage = ({
               ))}
             </div>
 
-            {draft.type === 'interval' ? (
+            {draft.type === 'enhancedInterval' ? (
+              <div className={form.field}>
+                <label className={form.label} htmlFor="ws-interval-seconds">Interval in seconds</label>
+                <input id="ws-interval-seconds" className={form.input} type="number" min={15} step={1}
+                  value={draft.intervalSeconds} onChange={(e) => setDraft({ type: 'enhancedInterval', intervalSeconds: Number(e.target.value) })} disabled={off} />
+                <p className={form.hint}>Counted from when the previous run finishes; timing is best effort.</p>
+              </div>
+            ) : draft.type === 'interval' ? (
               <div className={form.field}>
                 <label className={form.label} htmlFor="ws-interval">Every</label>
                 <IntervalSelect
@@ -434,10 +467,10 @@ export const SchedulePage = ({
                 <div className={styles.status}>
                   <span className={styles.statusLabel}>
                     <span
-                      className={`${styles.dot} ${paused ? styles.dotPaused : styles.dotRunning}`}
+                      className={`${styles.dot} ${paused || blockedReason ? styles.dotPaused : styles.dotRunning}`}
                       aria-hidden="true"
                     />
-                    {paused ? 'Paused' : 'Running'}
+                    {paused || blockedReason ? 'Paused' : 'Running'}
                   </span>
                   <span className={styles.statusActions}>
                     {!paused && (
@@ -463,15 +496,16 @@ export const SchedulePage = ({
                     </button>
                   </span>
                 </div>
-              ) : (
+              ) : !blockedReason ? (
                 <p className={form.lede}>
                   Not scheduled. The main agent runs when you message it.
                 </p>
-              )}
+              ) : null}
+              {blockedReason && <p className={form.lede}>{blockedReason}</p>}
             </div>
           </section>
 
-          {draft.type === 'cron' && enabled && (
+          {(draft.type === 'cron' || draft.type === 'enhancedCron') && enabled && (
             <section className={form.panel}>
               <header className={form.panelHeader}>
                 <h3 id="schedule-next" className={form.panelTitle}>Next runs</h3>

@@ -30,6 +30,73 @@ use crate::assistant::types::{
 use crate::db::DbPool;
 use serde_json::Value;
 
+#[derive(Clone, Debug)]
+pub struct CliSessionBeforeStart {
+    pub(crate) id: Option<String>,
+    pub(crate) provider: Option<String>,
+}
+
+/// Roll back generated preparation before releasing an abandoned scheduled run.
+/// Failed rollback leaves the run active; the scheduler retries the same snapshot.
+pub(crate) async fn rollback_scheduled_preparation(
+    pool: &crate::db::DbPool,
+    run: &crate::assistant::types::AssistantRun,
+    previous: Option<&CliSessionBeforeStart>,
+    mut emit: impl FnMut(AssistantUiEvent),
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM assistant_messages WHERE session_id = ? AND run_id = ? \
+         AND (json_extract(provider_metadata_json, '$.source') IN ('api-trigger', ?) \
+         OR (role = 'assistant' AND json_extract(provider_metadata_json, '$.source') = ?))",
+    )
+    .bind(&run.session_id)
+    .bind(&run.id)
+    .bind(format!("{}-trigger", run.protocol_id))
+    .bind(&run.protocol_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    for id in &ids {
+        sqlx::query("DELETE FROM session_signals WHERE message_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query("DELETE FROM assistant_messages WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(previous) = previous {
+        // Reload context inside the transaction so unrelated session edits survive.
+        let context: String =
+            sqlx::query_scalar("SELECT context_json FROM assistant_sessions WHERE id = ?")
+                .bind(&run.session_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| error.to_string())?;
+        let mut context: crate::assistant::types::SessionContext =
+            serde_json::from_str(&context).map_err(|error| error.to_string())?;
+        context.cli_session_id = previous.id.clone();
+        context.cli_session_provider = previous.provider.clone();
+        let updated_at = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE assistant_sessions SET context_json = ?, updated_at = ? WHERE id = ?")
+            .bind(serde_json::to_string(&context).map_err(|error| error.to_string())?)
+            .bind(updated_at)
+            .bind(&run.session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    tx.commit().await.map_err(|error| error.to_string())?;
+    for message_id in ids {
+        emit(AssistantUiEvent::MessageDeleted { message_id });
+    }
+    Ok(())
+}
+
 /// Reuse the run the caller was handed, or open a new one.
 ///
 /// A supplied `run_id` must belong to the same connection the turn is running
@@ -110,21 +177,24 @@ pub(crate) async fn cancel_run(
     session: &AssistantSession,
     run_id: &str,
 ) -> Result<(), AssistantEngineError> {
+    cancel_run_with_sink(&deps.pool, run_id, |event| {
+        let _ = deps.emit(session, Some(run_id), event);
+    })
+    .await
+}
+
+pub(crate) async fn cancel_run_with_sink(
+    pool: &DbPool,
+    run_id: &str,
+    mut emit: impl FnMut(AssistantUiEvent),
+) -> Result<(), AssistantEngineError> {
     for tool_call in
-        repository::fail_running_tool_calls_for_run(&deps.pool, run_id, "Run cancelled").await?
+        repository::fail_running_tool_calls_for_run(pool, run_id, "Run cancelled").await?
     {
-        let _ = deps.emit(
-            session,
-            Some(run_id),
-            AssistantUiEvent::ToolCallFailed { tool_call },
-        );
+        emit(AssistantUiEvent::ToolCallFailed { tool_call });
     }
-    let run = repository::complete_run(&deps.pool, run_id, RunStatus::Cancelled, None).await?;
-    let _ = deps.emit(
-        session,
-        Some(run_id),
-        AssistantUiEvent::RunCancelled { run },
-    );
+    let run = repository::complete_run(pool, run_id, RunStatus::Cancelled, None).await?;
+    emit(AssistantUiEvent::RunCancelled { run });
     Ok(())
 }
 

@@ -28,7 +28,7 @@ use crate::assistant::repository::{self, CreateMessageParams};
 use crate::assistant::run_context::RunContext;
 use crate::assistant::run_lifecycle::{
     cancel_run, complete_run, fail_run, record_tool_call_result, record_tool_call_started,
-    resolve_run_id, MissingToolCall, ToolCallOutcome,
+    resolve_run_id, CliSessionBeforeStart, MissingToolCall, ToolCallOutcome,
 };
 use crate::assistant::signals;
 use crate::assistant::system_prompt::build_system_prompt;
@@ -265,6 +265,10 @@ pub async fn run_session_turn(
     connection: ProviderConnection,
 ) -> Result<(), AssistantEngineError> {
     let run_id = resolve_run_id(deps, &session, &connection, &input).await?;
+    let previous_cli_session = CliSessionBeforeStart {
+        id: session.context.cli_session_id.clone(),
+        provider: session.context.cli_session_provider.clone(),
+    };
 
     let run = repository::update_run_status(&deps.pool, &run_id, RunStatus::Running, None).await?;
     let _ = deps.emit(
@@ -355,6 +359,11 @@ pub async fn run_session_turn(
             }
             // Nothing eligible yet; the forced paths can still compact more.
             Ok(None) => {}
+            Err(compaction::CompactionError::ScheduledDispatchAbandoned) => {
+                return Err(AssistantEngineError::ScheduledPreparationAbandoned(
+                    previous_cli_session,
+                ));
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %session.id,
@@ -554,6 +563,11 @@ pub async fn run_session_turn(
                         );
                         compaction_attempt.record_nothing_to_compact();
                     }
+                    Err(compaction::CompactionError::ScheduledDispatchAbandoned) => {
+                        return Err(AssistantEngineError::ScheduledPreparationAbandoned(
+                            previous_cli_session,
+                        ))
+                    }
                     Err(error) => {
                         tracing::warn!(
                             session_id = %session.id,
@@ -577,6 +591,9 @@ pub async fn run_session_turn(
             let had_warnings = had_warnings.load(Ordering::Relaxed);
             complete_run(deps, &session, &run_id, had_warnings).await
         }
+        Err(LocalAgentRunError::ScheduledDispatchAbandoned) => Err(
+            AssistantEngineError::ScheduledPreparationAbandoned(previous_cli_session),
+        ),
         Err(LocalAgentRunError::Cancelled) => cancel_run(deps, &session, &run_id).await,
         Err(LocalAgentRunError::Failed { message }) => {
             let message = if should_recover_cli_context_limit(&message) {
@@ -1248,12 +1265,7 @@ async fn run_claude_turn(
         command.arg("--debug-file").arg(&debug_path);
     }
 
-    let mut child = command.spawn().map_err(|e| {
-        LocalAgentRunError::failed(format!(
-            "Failed to launch `{}`: {}. Is Claude Code installed and on PATH?",
-            binary, e
-        ))
-    })?;
+    let mut child = spawn_cli_provider(&mut command, CliProviderRuntime::ClaudeCode, &binary)?;
     // With mid-run input the stdin handle stays open for the whole run —
     // it is the channel queued user messages are delivered through. In
     // legacy mode it is closed right after the prompt, as before.
@@ -1575,12 +1587,7 @@ async fn run_codex_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|e| {
-        LocalAgentRunError::failed(format!(
-            "Failed to launch `{}`: {}. Is Codex CLI installed and on PATH?",
-            binary, e
-        ))
-    })?;
+    let mut child = spawn_cli_provider(&mut command, CliProviderRuntime::Codex, &binary)?;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin
@@ -1772,8 +1779,7 @@ async fn run_codex_turn_app_server(
         ],
         Some(workspace_root),
     );
-    let mut transport =
-        aps::AppServerTransport::spawn(command).map_err(LocalAgentRunError::failed)?;
+    let mut transport = spawn_codex_app_server(command)?;
 
     let stderr_tail: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
@@ -2567,12 +2573,7 @@ async fn run_opencode_turn(
     }
     command.arg("--dir").arg(workspace_root);
 
-    let mut child = command.spawn().map_err(|e| {
-        LocalAgentRunError::failed(format!(
-            "Failed to launch `{}`: {}. Is OpenCode installed and on PATH?",
-            binary, e
-        ))
-    })?;
+    let mut child = spawn_cli_provider(&mut command, CliProviderRuntime::OpenCode, &binary)?;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin
@@ -4956,7 +4957,35 @@ fn spawn_stderr_logger(
     });
 }
 
+fn spawn_cli_provider(
+    command: &mut Command,
+    runtime: CliProviderRuntime,
+    binary: &str,
+) -> Result<tokio::process::Child, LocalAgentRunError> {
+    commit_cli_dispatch()?;
+    command.spawn().map_err(|error| {
+        LocalAgentRunError::failed(format!(
+            "Failed to launch `{binary}`: {error}. Is {} installed and on PATH?",
+            runtime.display_name(),
+        ))
+    })
+}
+
+fn spawn_codex_app_server(
+    command: Command,
+) -> Result<codex_app_server::AppServerTransport, LocalAgentRunError> {
+    commit_cli_dispatch()?;
+    codex_app_server::AppServerTransport::spawn(command).map_err(LocalAgentRunError::failed)
+}
+
+fn commit_cli_dispatch() -> Result<(), LocalAgentRunError> {
+    crate::assistant::provider_dispatch::commit_provider_dispatch()
+        .map_err(|_| LocalAgentRunError::ScheduledDispatchAbandoned)
+}
+
+#[derive(Debug)]
 enum LocalAgentRunError {
+    ScheduledDispatchAbandoned,
     Cancelled,
     Failed { message: String },
 }
@@ -4970,6 +4999,9 @@ impl LocalAgentRunError {
 
     fn message(self) -> String {
         match self {
+            LocalAgentRunError::ScheduledDispatchAbandoned => {
+                "scheduled attempt abandoned before provider dispatch".to_string()
+            }
             LocalAgentRunError::Cancelled => "run cancelled".to_string(),
             LocalAgentRunError::Failed { message, .. } => message,
         }
@@ -4984,6 +5016,181 @@ impl From<String> for LocalAgentRunError {
 
 #[cfg(test)]
 mod tests {
+    async fn prepared_cli_run(
+        pool: &crate::db::DbPool,
+        session_id: &str,
+    ) -> crate::assistant::types::AssistantRun {
+        use crate::assistant::{
+            repository,
+            types::{RunStatus, RunTrigger},
+        };
+        repository::create_run(
+            pool,
+            repository::CreateRunParams {
+                session_id: session_id.into(),
+                status: RunStatus::Running,
+                trigger: RunTrigger::Scheduled,
+                connection_id: "connection".into(),
+                protocol_id: "claude-code".into(),
+                model_id: "model".into(),
+                error: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn abandoning_cli_preparation_preserves_the_next_turn_input_and_original_session() {
+        use super::*;
+        use crate::assistant::types::SessionContext;
+        use crate::db::test_support::workspace_pool;
+        let (_tmp, pool) = workspace_pool().await;
+        for previous_id in [None, Some("existing-thread")] {
+            let mut session = repository::create_session(&pool, SessionContext::default())
+                .await
+                .unwrap();
+            let previous = CliSessionBeforeStart {
+                id: previous_id.map(str::to_owned),
+                provider: previous_id.map(|_| "claude-code".into()),
+            };
+            let user = repository::create_user_message(
+                &pool,
+                session.id.clone(),
+                "next manual input".into(),
+                Some("connection"),
+            )
+            .await
+            .unwrap();
+            let run = prepared_cli_run(&pool, &session.id).await;
+            session.context.cli_session_id = Some("prepared-but-never-launched".into());
+            session.context.cli_session_provider = Some("claude-code".into());
+            session = repository::update_session(&pool, &session).await.unwrap();
+            for (role, source, text) in [
+                (
+                    MessageRole::User,
+                    "claude-code-trigger",
+                    "abandoned schedule marker",
+                ),
+                (MessageRole::Assistant, "claude-code", ""),
+            ] {
+                repository::create_message(
+                    &pool,
+                    CreateMessageParams {
+                        session_id: session.id.clone(),
+                        role,
+                        content: vec![ContentPart::Text { text: text.into() }],
+                        provider_metadata: Some(serde_json::json!({"source": source})),
+                        run_id: Some(run.id.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let mut events = Vec::new();
+            crate::assistant::run_lifecycle::rollback_scheduled_preparation(
+                &pool,
+                &run,
+                Some(&previous),
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+            let restored = repository::get_session(&pool, &session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.context.cli_session_id, previous.id);
+            assert_eq!(restored.context.cli_session_provider, previous.provider);
+            let mut next = compaction_service::load_with_pending(&pool, &session.id)
+                .await
+                .unwrap();
+            let prompt = fresh_cli_session_context_prompt_from_current_queue(
+                &pool,
+                &session.id,
+                &mut next,
+                "next manual input".into(),
+            )
+            .await
+            .unwrap();
+            assert!(!prompt.contains("abandoned schedule marker"));
+            assert!(prompt.contains("next manual input"));
+            assert_eq!(next.messages().len(), 1);
+            assert_eq!(
+                signals::list_open_content(&pool, &session.id)
+                    .await
+                    .unwrap()[0]
+                    .message
+                    .id,
+                user.id
+            );
+            assert_eq!(events.len(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sleeping_claim_never_launches_normal_cli_or_codex_app_server() {
+        use super::*;
+        use crate::agents::scheduler::WakeSignal;
+        use crate::assistant::provider_dispatch::with_scheduled_dispatch;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("launched");
+        let binary = tmp.path().join("fake-cli");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for runtime in [
+            CliProviderRuntime::ClaudeCode,
+            CliProviderRuntime::Codex,
+            CliProviderRuntime::OpenCode,
+        ] {
+            let signal = WakeSignal::default();
+            let lease = signal.dispatch_lease().unwrap();
+            // Represents sleep while the command and prompt were being prepared.
+            signal.will_sleep();
+            signal.did_wake();
+            let result = with_scheduled_dispatch(Some(lease), async {
+                spawn_cli_provider(
+                    &mut Command::new(&binary),
+                    runtime,
+                    binary.to_str().unwrap(),
+                )
+            })
+            .await;
+            assert!(matches!(
+                result,
+                Err(LocalAgentRunError::ScheduledDispatchAbandoned)
+            ));
+            assert!(!marker.exists());
+        }
+        let signal = WakeSignal::default();
+        let lease = signal.dispatch_lease().unwrap();
+        signal.will_sleep();
+        let result = with_scheduled_dispatch(Some(lease), async {
+            spawn_codex_app_server(Command::new(&binary))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(LocalAgentRunError::ScheduledDispatchAbandoned)
+        ));
+        assert!(!marker.exists());
+        // The identical launch path still works for manual requests while sleeping.
+        let mut child = spawn_cli_provider(
+            &mut Command::new(&binary),
+            CliProviderRuntime::ClaudeCode,
+            binary.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert!(marker.exists());
+    }
+
     use super::*;
 
     fn test_message(id: &str, role: MessageRole, content: Vec<ContentPart>) -> AssistantMessage {

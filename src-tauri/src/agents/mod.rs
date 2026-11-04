@@ -36,6 +36,7 @@ pub mod schedule;
 pub mod scheduler;
 pub mod tmp;
 pub mod types;
+pub mod wake_monitor;
 
 // Re-export main types for convenience
 pub use types::AgentDefinition;

@@ -49,7 +49,11 @@ export const formatScheduleLabel = (
     if (!Number.isFinite(minutes) || minutes <= 0) return null;
     return `every ${minutes}m`;
   }
-  if (kind.type === 'cron') {
+  if (kind.type === 'enhancedInterval') {
+    const seconds = Number(kind.intervalSeconds);
+    return Number.isFinite(seconds) && seconds >= 15 ? `every ${seconds}s` : null;
+  }
+  if (kind.type === 'cron' || kind.type === 'enhancedCron') {
     const expr = (kind.expression || '').trim();
     if (!expr) return null;
     return `cron: ${expr}`;
