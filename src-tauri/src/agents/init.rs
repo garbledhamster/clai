@@ -351,6 +351,92 @@ mod tests {
     }
 
     #[test]
+    fn persisted_overdue_schedules_restart_with_enhanced_freshness_and_legacy_catchup() {
+        use crate::agents::{schedule::compute_next_run_at, scheduler::Scheduler};
+        use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
+        use chrono::Timelike;
+        use std::time::{Duration, Instant};
+        // Keep the cron occurrence safely ahead of test setup, including when
+        // this test happens to begin near a minute/hour boundary.
+        let cron_minute = (chrono::Utc::now().minute() + 2) % 60;
+        for kind in [
+            ScheduleKind::EnhancedInterval {
+                interval_seconds: 15,
+            },
+            ScheduleKind::EnhancedCron {
+                expression: format!("{cron_minute} * * * *"),
+                timezone: "UTC".into(),
+            },
+            ScheduleKind::Interval {
+                interval_minutes: 5,
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let overdue = chrono::Utc::now().timestamp_millis() - 120_000;
+            let mut saved = WorkspaceConfig::new(
+                "restart-workspace".into(),
+                "Restart".into(),
+                0,
+                "main".into(),
+            );
+            saved.schedule.enabled = true;
+            saved.schedule.kind = kind.clone();
+            saved.schedule.next_run_at_unix_ms = Some(overdue);
+            workspace_config::save(directory.path(), &saved).unwrap();
+            drop(saved);
+            let loaded = workspace_config::load(directory.path()).unwrap();
+            assert_eq!(loaded.schedule.kind, kind);
+            assert_eq!(loaded.schedule.next_run_at_unix_ms, Some(overdue));
+            let mut restarted = Scheduler::new();
+            // Match app startup: register observers before loading schedules.
+            let before_startup = Instant::now();
+            initialize_wake_monitor(&mut restarted, |_| Ok(())).unwrap();
+            apply_workspace_schedule(&mut restarted, &loaded);
+            let after_startup = Instant::now();
+            let wall = chrono::Utc::now().timestamp_millis();
+            let first = restarted.next_ready();
+            if matches!(kind, ScheduleKind::Interval { .. }) {
+                assert_eq!(
+                    first.as_deref(),
+                    Some("main"),
+                    "legacy overdue anchors retain ready-now behavior"
+                );
+                continue;
+            }
+            assert!(
+                first.is_none(),
+                "enhanced {kind:?} must not replay its persisted overdue anchor"
+            );
+            if matches!(kind, ScheduleKind::EnhancedInterval { .. }) {
+                assert_eq!(
+                    restarted
+                        .next_ready_at(wall + 14_000, before_startup + Duration::from_secs(14)),
+                    None
+                );
+                assert_eq!(
+                    restarted
+                        .next_ready_at(wall + 16_000, after_startup + Duration::from_secs(16))
+                        .as_deref(),
+                    Some("main")
+                );
+            } else {
+                let future = compute_next_run_at(&kind, wall).unwrap();
+                assert!(future > wall);
+                assert_eq!(
+                    restarted.next_ready_at(future - 1, after_startup + Duration::from_secs(1)),
+                    None
+                );
+                assert_eq!(
+                    restarted
+                        .next_ready_at(future, after_startup + Duration::from_secs(2))
+                        .as_deref(),
+                    Some("main")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn enhanced_schedule_does_not_run_without_wake_detection() {
         use crate::config::workspace_config::{ScheduleKind, WorkspaceConfig};
         let mut config = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
