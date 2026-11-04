@@ -22,6 +22,7 @@ const entry = (
   runningTaskCount: 0n,
   scheduleEnabled: false,
   schedulePaused: false,
+  scheduleAllowedBlocks: null,
   scheduleBlockedReason: null,
   scheduleWaitingReason: null,
   scheduleKind: null,

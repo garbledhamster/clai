@@ -9,6 +9,8 @@ import React, { useCallback, useEffect, useImperativeHandle, useState } from 're
 import { invoke } from '@tauri-apps/api/core';
 import { setWorkspaceTitle } from '../../workspace/client';
 import IntervalSelect from './IntervalSelect';
+import WeeklyBlockGrid from './WeeklyBlockGrid';
+import { formatNextRun } from '../../fleet/workspaceStatus';
 import { Switch } from './ListEditors';
 import { useReportDirty, type SectionHandle } from './sectionHandle';
 import type { ScheduleKind, WorkspaceDetails } from '../../generated/bindings';
@@ -193,6 +195,8 @@ export const SchedulePage = ({
   const [enabled, setEnabled] = useState(!!details?.scheduleEnabled);
   const [draft, setDraft] = useState(() => draftFrom(details?.scheduleKind));
   // Pause/Resume and Run now are immediate commands with their own busy state.
+  const [slots, setSlots] = useState<number[]>(() => details?.scheduleAllowedBlocks?.slots ?? []);
+  const [blockTimezone, setBlockTimezone] = useState(() => details?.scheduleAllowedBlocks?.timezone ?? 'UTC');
   const [commandBusy, setCommandBusy] = useState(false);
   const busy = saving || commandBusy;
   const [error, setError] = useState<string | null>(null);
@@ -216,11 +220,15 @@ export const SchedulePage = ({
   // Keyed on the schedule's value, not its object: the workspace re-fetches
   // details every 5 s, and a same-value refetch must not discard the draft.
   const savedKind = JSON.stringify(details?.scheduleKind ?? null);
+  const savedBlocks = JSON.stringify(details?.scheduleAllowedBlocks ?? null);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- resyncs the two-field draft when the saved schedule changes underneath.
     setEnabled(!!details?.scheduleEnabled);
     setDraft(draftFrom(JSON.parse(savedKind) as ScheduleKind | null));
-  }, [details?.scheduleEnabled, savedKind]);
+    const blocks = JSON.parse(savedBlocks);
+    setSlots(blocks?.slots ?? []);
+    setBlockTimezone(blocks?.timezone ?? 'UTC');
+  }, [details?.scheduleEnabled, savedKind, savedBlocks]);
 
   // Next fire times for the cron being typed, so it can be checked before Save.
   useEffect(() => {
@@ -253,7 +261,9 @@ export const SchedulePage = ({
   const savedOn = !!details?.scheduleEnabled;
 
   useReportDirty(
-    enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)),
+    enabled !== savedOn || JSON.stringify(draft) !== JSON.stringify(draftFrom(details?.scheduleKind)) ||
+      JSON.stringify(slots) !== JSON.stringify(details?.scheduleAllowedBlocks?.slots ?? []) ||
+      (draft.type === 'enhancedInterval' && blockTimezone !== (details?.scheduleAllowedBlocks?.timezone ?? 'UTC')),
     onDirtyChange
   );
 
@@ -317,7 +327,11 @@ export const SchedulePage = ({
         return { ok: false, error: built.error };
       }
       try {
-        await invoke('workspace_set_schedule', { workspaceId, kind: built.kind });
+        await invoke('workspace_set_schedule', { workspaceId, kind: built.kind,
+          ...(built.kind?.type === 'enhancedInterval' || built.kind?.type === 'enhancedCron' ? {
+            allowedBlocks: { timezone: built.kind.type === 'enhancedCron' ? built.kind.timezone : blockTimezone.trim(), slots },
+          } : {}),
+        });
         setError(null);
         return { ok: true };
       } catch (err) {
@@ -455,6 +469,18 @@ export const SchedulePage = ({
                 </div>
               </>
             )}
+            {(draft.type === 'enhancedInterval' || draft.type === 'enhancedCron') && (
+              <section className={form.field} aria-label="Allowed execution periods">
+                <h4 className={form.label}>Allowed weekly blocks</h4>
+                {draft.type === 'enhancedInterval' && <>
+                  <label className={form.label} htmlFor="ws-block-tz">Timezone</label>
+                  <input id="ws-block-tz" className={form.input} value={blockTimezone}
+                    onChange={(event) => setBlockTimezone(event.target.value)} disabled={off} spellCheck={false} />
+                </>}
+                <p className={form.hint}>The saved named zone stays fixed when you travel. Cron and allowed blocks share this zone.</p>
+                <WeeklyBlockGrid slots={slots} onChange={setSlots} disabled={off} />
+              </section>
+            )}
           </div>
         </section>
 
@@ -503,13 +529,15 @@ export const SchedulePage = ({
                 </p>
               ) : null}
               {(blockedReason || (!paused && waitingReason)) && <p className={form.lede}>{blockedReason || waitingReason}</p>}
+              {details?.scheduleAllowedBlocks && <p className={form.hint}>Saved timezone: {details.scheduleAllowedBlocks.timezone}</p>}
+              {details?.nextRunInSeconds != null && savedOn && !paused && !blockedReason && <p className={form.hint}>Next eligible check: {formatNextRun(details.nextRunInSeconds)}</p>}
             </div>
           </section>
 
           {(draft.type === 'cron' || draft.type === 'enhancedCron') && enabled && (
             <section className={form.panel}>
               <header className={form.panelHeader}>
-                <h3 id="schedule-next" className={form.panelTitle}>Next runs</h3>
+                <h3 id="schedule-next" className={form.panelTitle}>{draft.type === 'enhancedCron' ? 'Cron occurrences' : 'Next runs'}</h3>
               </header>
               <div className={form.panelBody}>
                 {previewError ? (

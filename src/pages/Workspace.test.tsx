@@ -185,6 +185,7 @@ const detailsFor = (
   enabled: true,
   scheduleEnabled: false,
   schedulePaused: false,
+  scheduleAllowedBlocks: null,
   scheduleBlockedReason: null,
   scheduleWaitingReason: null,
   scheduleKind: null,

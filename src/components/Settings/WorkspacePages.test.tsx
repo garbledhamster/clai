@@ -86,6 +86,7 @@ describe('SchedulePage', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: { type: 'enhancedInterval', intervalSeconds: 15 },
+      allowedBlocks: { timezone: 'UTC', slots: [] },
     });
   });
 
@@ -131,6 +132,7 @@ describe('SchedulePage', () => {
     expect(await submit(ref)).toEqual({ ok: true });
     expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
       workspaceId: 'ws-1', kind: { type: 'enhancedCron', expression: '0 10 * * *', timezone: 'UTC' },
+      allowedBlocks: { timezone: 'UTC', slots: [] },
     });
   });
 
@@ -207,5 +209,29 @@ describe('SchedulePage', () => {
     await act(async () => { rerender(page(saved({ schedulePaused: true }))); });
     expect(screen.getByLabelText('Cron expression')).toHaveValue('0 10 * * *');
     expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  });
+});
+
+
+describe('weekly allowed blocks', () => {
+  it.each(['enhancedInterval', 'enhancedCron'])('saves %s and blocks atomically and preserves the draft on refresh', async (type) => {
+    const user = userEvent.setup();
+    const ref = createRef<SectionHandle>();
+    const kind = type === 'enhancedInterval' ? { type, intervalSeconds: 15 } : { type, expression: '* * * * *', timezone: 'UTC' };
+    const details = { ...DETAILS, scheduleEnabled: true, scheduleKind: kind } as WorkspaceDetails;
+    const page = (value: WorkspaceDetails) => <SchedulePage ref={ref} workspaceId="ws-1" details={value} saving={false} />;
+    const { rerender } = render(page(details));
+    const zone = screen.getByLabelText('Timezone');
+    await user.clear(zone);
+    await user.type(zone, 'America/Chicago');
+    await user.click(screen.getByRole('button', { name: 'Monday 09:00–09:15' }));
+    await act(async () => { rerender(page({ ...details, schedulePaused: true })); });
+    expect(screen.getByLabelText('Timezone')).toHaveValue('America/Chicago');
+    expect(screen.getByRole('button', { name: 'Monday 09:00–09:15' })).toHaveAttribute('aria-pressed', 'true');
+    expect(await submit(ref)).toEqual({ ok: true });
+    expect(mockInvoke).toHaveBeenCalledWith('workspace_set_schedule', {
+      workspaceId: 'ws-1', kind: type === 'enhancedCron' ? { ...kind, timezone: 'America/Chicago' } : kind,
+      allowedBlocks: { timezone: 'America/Chicago', slots: [36] },
+    });
   });
 });

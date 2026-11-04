@@ -65,11 +65,16 @@ pub struct DispatchLease {
     cron_clock_generation: Option<u64>,
     committed: Arc<AtomicBool>,
     claim_valid: Arc<AtomicBool>,
+    allowed_blocks: Option<super::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 impl DispatchLease {
     /// Commit the first provider operation while ordered with sleep and clock events.
     pub fn try_commit(&self) -> bool {
+        self.try_commit_with_clock(|| chrono::Utc::now().timestamp_millis())
+    }
+
+    fn try_commit_with_clock(&self, clock: impl FnOnce() -> i64) -> bool {
         let Ok(state) = self.signal.0.lock() else {
             return false;
         };
@@ -77,6 +82,10 @@ impl DispatchLease {
             return true;
         }
         if !self.claim_valid.load(Ordering::Relaxed)
+            || self
+                .allowed_blocks
+                .as_ref()
+                .is_some_and(|blocks| !blocks.is_allowed(clock()))
             || state.sleeping
             || state.generation != self.generation
             || self
@@ -106,6 +115,10 @@ impl DispatchLease {
     pub fn is_current(&self) -> bool {
         self.signal.0.lock().is_ok_and(|state| {
             self.claim_valid.load(Ordering::Relaxed)
+                && self
+                    .allowed_blocks
+                    .as_ref()
+                    .is_none_or(|blocks| blocks.is_allowed(chrono::Utc::now().timestamp_millis()))
                 && !state.sleeping
                 && state.generation == self.generation
                 && self
@@ -128,6 +141,7 @@ impl WakeSignal {
             cron_clock_generation: None,
             committed: Arc::new(AtomicBool::new(false)),
             claim_valid: Arc::new(AtomicBool::new(true)),
+            allowed_blocks: None,
         })
     }
 
@@ -162,6 +176,9 @@ pub struct PendingCancellation {
     pub instance_id: String,
     pub previous_cli_session: Option<crate::assistant::run_lifecycle::CliSessionBeforeStart>,
     rearm: bool,
+    /// Closing-only abandonment keeps one due check even if rollback finishes
+    /// after the next opening. A real wake invalidates this retained check.
+    preserve_due: bool,
 }
 
 /// The agent scheduler.
@@ -397,6 +414,10 @@ impl Scheduler {
                                 .map(|_| clock_generation),
                             committed: Arc::new(AtomicBool::new(false)),
                             claim_valid: Arc::new(AtomicBool::new(true)),
+                            allowed_blocks: self
+                                .enhanced
+                                .get(&instance.instance_id)
+                                .and_then(|timing| timing.allowed_blocks()),
                         },
                     );
                 }
@@ -444,10 +465,14 @@ impl Scheduler {
     }
 
     pub fn waiting_reason(&self, instance_id: &str) -> Option<&'static str> {
-        (self.state == SchedulerState::Running
-            && self.instances.get(instance_id).is_some_and(|i| i.enabled)
-            && self.waiting.contains(instance_id))
-        .then_some("Waiting for the workspace to become available.")
+        if self.state != SchedulerState::Running {
+            return None;
+        }
+        self.allowed_block_waiting_reason(instance_id).or_else(|| {
+            (self.instances.get(instance_id).is_some_and(|i| i.enabled)
+                && self.waiting.contains(instance_id))
+            .then_some("Waiting for the workspace to become available.")
+        })
     }
 
     /// Future script/approval phases use the same revocation boundary.
@@ -475,10 +500,14 @@ impl Scheduler {
         &mut self,
         instance_id: &str,
         clock: impl FnOnce() -> (i64, Instant),
-    ) {
+    ) -> bool {
         if !self.running.contains(instance_id) {
-            return;
+            return false;
         }
+        let timing_invalidated = self
+            .claimed_dispatch_leases
+            .get(instance_id)
+            .is_some_and(|lease| !lease.timing_is_current());
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.is_running = false;
             instance.manual_run_pending = false;
@@ -486,6 +515,7 @@ impl Scheduler {
         self.running.remove(instance_id);
         self.claimed_dispatch_leases.remove(instance_id);
         self.waiting.remove(instance_id);
+        let mut preserve_due = false;
         let signal = self.wake_signal.clone();
         match signal.0.lock() {
             Ok(state) if !state.sleeping => {
@@ -496,7 +526,8 @@ impl Scheduler {
                     self.observed_wake_generation = state.generation;
                     self.note_wake_at(wall_ms, now);
                 } else if let Some(timing) = self.enhanced.get_mut(instance_id) {
-                    if timing.wake(wall_ms, now).is_err() {
+                    preserve_due = !timing_invalidated && timing.waiting_for_block(wall_ms, now);
+                    if !preserve_due && timing.wake(wall_ms, now).is_err() {
                         self.wake_monitor_available = false;
                     }
                 }
@@ -504,6 +535,7 @@ impl Scheduler {
             Ok(_) => {}
             Err(_) => self.wake_monitor_available = false,
         };
+        preserve_due
     }
 
     pub fn retain_failed_cancellation(
@@ -513,12 +545,29 @@ impl Scheduler {
         run_id: &str,
         previous_cli_session: Option<crate::assistant::run_lifecycle::CliSessionBeforeStart>,
     ) {
+        self.retain_failed_cancellation_with_clock(
+            instance_id,
+            session_id,
+            run_id,
+            previous_cli_session,
+            || (chrono::Utc::now().timestamp_millis(), Instant::now()),
+        );
+    }
+
+    fn retain_failed_cancellation_with_clock(
+        &mut self,
+        instance_id: &str,
+        session_id: &str,
+        run_id: &str,
+        previous_cli_session: Option<crate::assistant::run_lifecycle::CliSessionBeforeStart>,
+        clock: impl FnOnce() -> (i64, Instant),
+    ) {
         let Some(instance) = self.instances.get(instance_id) else {
             return;
         };
         let workspace_id = instance.workspace_id.clone();
         let rearm = !self.completion_is_invalidated(instance_id);
-        self.abandon_enhanced_claim(instance_id);
+        let preserve_due = self.abandon_enhanced_claim_with_clock(instance_id, clock);
         self.pending_cancellations.insert(
             workspace_id.clone(),
             PendingCancellation {
@@ -528,6 +577,7 @@ impl Scheduler {
                 instance_id: instance_id.to_string(),
                 previous_cli_session,
                 rearm,
+                preserve_due,
             },
         );
     }
@@ -549,6 +599,17 @@ impl Scheduler {
     }
 
     pub fn finish_pending_cancellation(&mut self, workspace_id: &str, run_id: &str) {
+        self.finish_pending_cancellation_with_clock(workspace_id, run_id, || {
+            (chrono::Utc::now().timestamp_millis(), Instant::now())
+        });
+    }
+
+    fn finish_pending_cancellation_with_clock(
+        &mut self,
+        workspace_id: &str,
+        run_id: &str,
+        clock: impl FnOnce() -> (i64, Instant),
+    ) {
         let Some(pending) = self.pending_cancellations.get(workspace_id) else {
             return;
         };
@@ -565,12 +626,15 @@ impl Scheduler {
             let signal = self.wake_signal.clone();
             match signal.0.lock() {
                 Ok(state) if !state.sleeping => {
-                    if let Some(timing) = self.enhanced.get_mut(&pending.instance_id) {
-                        if timing
-                            .wake(chrono::Utc::now().timestamp_millis(), Instant::now())
-                            .is_err()
-                        {
-                            self.wake_monitor_available = false;
+                    let (wall_ms, now) = clock();
+                    if state.generation != self.observed_wake_generation {
+                        self.observed_wake_generation = state.generation;
+                        self.note_wake_at(wall_ms, now);
+                    } else if !pending.preserve_due {
+                        if let Some(timing) = self.enhanced.get_mut(&pending.instance_id) {
+                            if timing.wake(wall_ms, now).is_err() {
+                                self.wake_monitor_available = false;
+                            }
                         }
                     }
                 }
@@ -627,6 +691,29 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn configure_allowed_blocks(
+        &mut self,
+        instance_id: &str,
+        blocks: Option<super::weekly_blocks::WeeklyAllowedBlocks>,
+    ) -> Result<(), String> {
+        if let Some(timing) = self.enhanced.get_mut(instance_id) {
+            timing.set_allowed_blocks(blocks)?;
+        }
+        Ok(())
+    }
+
+    pub fn allowed_block_waiting_reason(&self, instance_id: &str) -> Option<&'static str> {
+        self.instances
+            .get(instance_id)
+            .filter(|instance| instance.enabled && !instance.is_running)?;
+        self.enhanced
+            .get(instance_id)
+            .is_some_and(|timing| {
+                timing.waiting_for_block(chrono::Utc::now().timestamp_millis(), Instant::now())
+            })
+            .then_some("Waiting for an allowed block.")
+    }
+
     /// Countdown for the deadline that actually controls this instance.
     pub fn seconds_until_next_run(&self, instance_id: &str) -> Option<u64> {
         self.seconds_until_next_run_at(
@@ -665,6 +752,9 @@ impl Scheduler {
     }
 
     pub fn note_wake_at(&mut self, wall_ms: i64, now: Instant) {
+        for pending in self.pending_cancellations.values_mut() {
+            pending.preserve_due = false;
+        }
         for (id, timing) in &mut self.enhanced {
             // A running attempt retains the occurrence it claimed. Completion
             // rearms it from the later of completion and that occurrence.
@@ -889,6 +979,157 @@ mod tests {
 
     fn definition_named(id: &str) -> AgentDefinition {
         AgentDefinition::new(id, "Test Agent").with_description("A test agent")
+    }
+
+    #[test]
+    fn weekly_blocks_cleanup_recovery_preserves_due_unless_real_wake_intervenes() {
+        use crate::config::workspace_config::ScheduleKind;
+        use std::time::Duration;
+        for (recovery_seconds, wake_before_recovery, poll_wake) in [
+            (4560, false, false),
+            (7260, false, false),
+            (4560, true, false),
+            (4560, true, true),
+        ] {
+            let start = Instant::now();
+            let wall = chrono::DateTime::parse_from_rfc3339("2026-11-02T08:00:00Z")
+                .unwrap()
+                .timestamp_millis();
+            let mut scheduler = Scheduler::new();
+            scheduler.register_definition(
+                AgentDefinition::new("agent", "Agent").with_workspace_id("ws"),
+            );
+            let id = scheduler.create_instance("agent").unwrap();
+            scheduler
+                .configure_enhanced(
+                    &id,
+                    ScheduleKind::EnhancedCron {
+                        expression: "0 9 * * *".into(),
+                        timezone: "UTC".into(),
+                    },
+                    wall,
+                    start,
+                )
+                .unwrap();
+            scheduler
+                .configure_allowed_blocks(
+                    &id,
+                    Some(super::super::weekly_blocks::WeeklyAllowedBlocks {
+                        timezone: "UTC".into(),
+                        slots: vec![36, 40],
+                    }),
+                )
+                .unwrap();
+            scheduler.set_wake_monitor_available(true, wall, start);
+            assert_eq!(
+                scheduler.next_ready_at(wall + 3_600_000, start + Duration::from_secs(3600)),
+                Some(id.clone())
+            );
+            scheduler.retain_failed_cancellation_with_clock(&id, "session", "run", None, || {
+                (wall + 4_500_000, start + Duration::from_secs(4500))
+            });
+            assert!(scheduler.pending_cancellation_reason("ws").is_some());
+            if wake_before_recovery {
+                scheduler.wake_signal().will_sleep();
+                scheduler.wake_signal().did_wake();
+                if poll_wake {
+                    assert_eq!(
+                        scheduler
+                            .next_ready_at(wall + 4_550_000, start + Duration::from_secs(4550)),
+                        None
+                    );
+                }
+            }
+            scheduler.finish_pending_cancellation_with_clock("ws", "run", || {
+                (
+                    wall + recovery_seconds as i64 * 1000,
+                    start + Duration::from_secs(recovery_seconds),
+                )
+            });
+            let dispatch_seconds = recovery_seconds.max(7200);
+            assert_eq!(
+                scheduler.next_ready_at(
+                    wall + dispatch_seconds as i64 * 1000,
+                    start + Duration::from_secs(dispatch_seconds)
+                ),
+                if wake_before_recovery { None } else { Some(id) }
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_blocks_keep_claim_that_expires_at_closing_pending_until_next_opening() {
+        use crate::config::workspace_config::ScheduleKind;
+        use std::time::Duration;
+        for wake_while_claimed in [false, true] {
+            let start = Instant::now();
+            let wall = chrono::DateTime::parse_from_rfc3339("2026-11-02T08:00:00Z")
+                .unwrap()
+                .timestamp_millis();
+            let mut scheduler = Scheduler::new();
+            scheduler.register_definition(create_test_definition());
+            let id = scheduler.create_instance("test-agent").unwrap();
+            scheduler
+                .configure_enhanced(
+                    &id,
+                    ScheduleKind::EnhancedCron {
+                        expression: "0 9 * * *".into(),
+                        timezone: "UTC".into(),
+                    },
+                    wall,
+                    start,
+                )
+                .unwrap();
+            scheduler
+                .configure_allowed_blocks(
+                    &id,
+                    Some(super::super::weekly_blocks::WeeklyAllowedBlocks {
+                        timezone: "UTC".into(),
+                        slots: vec![36, 40],
+                    }),
+                )
+                .unwrap();
+            scheduler.set_wake_monitor_available(true, wall, start);
+            assert_eq!(
+                scheduler.next_ready_at(wall + 3_600_000, start + Duration::from_secs(3600)),
+                Some(id.clone())
+            );
+            if wake_while_claimed {
+                scheduler.wake_signal().will_sleep();
+                scheduler.wake_signal().did_wake();
+                assert!(scheduler
+                    .next_ready_at(wall + 4_500_000, start + Duration::from_secs(4500))
+                    .is_none());
+            }
+            scheduler.abandon_enhanced_claim_with_clock(&id, || {
+                (wall + 4_500_000, start + Duration::from_secs(4500))
+            });
+            assert_eq!(
+                scheduler.next_ready_at(wall + 4_500_000, start + Duration::from_secs(4500)),
+                None
+            );
+            assert_eq!(
+                scheduler.next_ready_at(wall + 7_200_000, start + Duration::from_secs(7200)),
+                if wake_while_claimed { None } else { Some(id) }
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_blocks_rechecked_at_commit_but_committed_work_can_finish() {
+        let signal = WakeSignal::default();
+        let mut lease = signal.dispatch_lease().unwrap();
+        lease.allowed_blocks = Some(super::super::weekly_blocks::WeeklyAllowedBlocks {
+            timezone: "UTC".into(),
+            slots: vec![36],
+        });
+        let open = chrono::DateTime::parse_from_rfc3339("2026-11-02T09:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let closed = open + 15 * 60_000;
+        assert!(!lease.try_commit_with_clock(|| closed));
+        assert!(lease.try_commit_with_clock(|| open));
+        assert!(lease.try_commit_with_clock(|| closed));
     }
 
     #[test]

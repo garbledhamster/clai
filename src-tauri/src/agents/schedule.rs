@@ -134,6 +134,7 @@ pub struct EnhancedTiming {
     interval_deadline: Option<std::time::Instant>,
     cron_target: Option<i64>,
     last_cron_target: Option<i64>,
+    allowed_blocks: Option<super::weekly_blocks::WeeklyAllowedBlocks>,
 }
 
 impl EnhancedTiming {
@@ -149,6 +150,7 @@ impl EnhancedTiming {
             interval_deadline: None,
             cron_target: None,
             last_cron_target: None,
+            allowed_blocks: None,
         };
         timing.wake(now_ms, now)?;
         Ok(timing)
@@ -158,7 +160,36 @@ impl EnhancedTiming {
         matches!(self.kind, ScheduleKind::EnhancedCron { .. })
     }
 
+    pub fn set_allowed_blocks(
+        &mut self,
+        blocks: Option<super::weekly_blocks::WeeklyAllowedBlocks>,
+    ) -> Result<(), String> {
+        if let Some(blocks) = &blocks {
+            blocks.validate(&self.kind)?;
+        }
+        self.allowed_blocks = blocks;
+        Ok(())
+    }
+
+    pub fn allowed_blocks(&self) -> Option<super::weekly_blocks::WeeklyAllowedBlocks> {
+        self.allowed_blocks.clone()
+    }
+
+    pub fn waiting_for_block(&self, now_ms: i64, now: std::time::Instant) -> bool {
+        self.cadence_due(now_ms, now) && !self.block_is_open(now_ms)
+    }
+
+    fn block_is_open(&self, now_ms: i64) -> bool {
+        self.allowed_blocks
+            .as_ref()
+            .is_none_or(|blocks| blocks.is_allowed(now_ms))
+    }
+
     pub fn is_due(&self, now_ms: i64, now: std::time::Instant) -> bool {
+        self.cadence_due(now_ms, now) && self.block_is_open(now_ms)
+    }
+
+    fn cadence_due(&self, now_ms: i64, now: std::time::Instant) -> bool {
         self.interval_deadline
             .is_some_and(|deadline| now >= deadline)
             || self.cron_target.is_some_and(|target| now_ms >= target)
@@ -166,13 +197,22 @@ impl EnhancedTiming {
 
     /// Whole seconds until the same deadline used by `is_due`.
     pub fn seconds_until_next_run(&self, now_ms: i64, now: std::time::Instant) -> u64 {
-        if let Some(deadline) = self.interval_deadline {
-            deadline.saturating_duration_since(now).as_secs()
+        let target = if let Some(deadline) = self.interval_deadline {
+            now_ms.saturating_add(
+                i64::try_from(deadline.saturating_duration_since(now).as_millis())
+                    .unwrap_or(i64::MAX),
+            )
         } else {
-            self.cron_target
-                .map(|target| target.saturating_sub(now_ms).max(0) as u64 / 1000)
-                .unwrap_or(0)
-        }
+            self.cron_target.unwrap_or(now_ms).max(now_ms)
+        };
+        let eligible = match &self.allowed_blocks {
+            Some(blocks) => match blocks.next_allowed_at(target) {
+                Ok(eligible) => eligible,
+                Err(_) => return u64::MAX,
+            },
+            None => target,
+        };
+        eligible.saturating_sub(now_ms).max(0) as u64 / 1000
     }
 
     pub fn complete(&mut self, now_ms: i64, now: std::time::Instant) -> Result<(), String> {
@@ -223,6 +263,84 @@ pub fn host_timezone() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weekly_blocks_countdown_uses_exact_deadline_before_rounding_seconds() {
+        use super::super::weekly_blocks::WeeklyAllowedBlocks;
+        use std::time::{Duration, Instant};
+        let anchor = chrono::DateTime::parse_from_rfc3339("2026-11-02T09:14:00.500Z")
+            .unwrap()
+            .timestamp_millis();
+        let next_open = chrono::DateTime::parse_from_rfc3339("2026-11-02T10:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let start = Instant::now();
+        for kind in [
+            ScheduleKind::EnhancedInterval {
+                interval_seconds: 60,
+            },
+            ScheduleKind::EnhancedCron {
+                expression: "15 9 * * *".into(),
+                timezone: "UTC".into(),
+            },
+        ] {
+            let mut timing = EnhancedTiming::new(kind, anchor, start).unwrap();
+            timing
+                .set_allowed_blocks(Some(WeeklyAllowedBlocks {
+                    timezone: "UTC".into(),
+                    slots: vec![36, 40],
+                }))
+                .unwrap();
+            let now_ms = anchor + 250;
+            assert_eq!(
+                timing.seconds_until_next_run(now_ms, start + Duration::from_millis(250)),
+                (next_open - now_ms) as u64 / 1000
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_blocks_hold_one_due_check_and_reset_on_wake_for_both_cadences() {
+        use super::super::weekly_blocks::WeeklyAllowedBlocks;
+        use std::time::{Duration, Instant};
+        let wall = chrono::DateTime::parse_from_rfc3339("2026-11-02T08:58:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let start = Instant::now();
+        for kind in [
+            ScheduleKind::EnhancedInterval {
+                interval_seconds: 15,
+            },
+            ScheduleKind::EnhancedCron {
+                expression: "* * * * *".into(),
+                timezone: "UTC".into(),
+            },
+        ] {
+            let mut timing = EnhancedTiming::new(kind, wall, start).unwrap();
+            timing
+                .set_allowed_blocks(Some(WeeklyAllowedBlocks {
+                    timezone: "UTC".into(),
+                    slots: vec![36],
+                }))
+                .unwrap();
+            assert!(!timing.is_due(wall + 59_999, start + Duration::from_secs(59)));
+            assert!(timing.waiting_for_block(wall + 120_000 - 1, start + Duration::from_secs(60)));
+            assert_eq!(
+                timing.seconds_until_next_run(wall + 90_000, start + Duration::from_secs(90)),
+                30
+            );
+            assert!(timing.is_due(wall + 120_000, start + Duration::from_secs(120)));
+            assert!(!timing.is_due(wall + 1_020_000, start + Duration::from_secs(1020)));
+            timing
+                .wake(wall + 120_000, start + Duration::from_secs(120))
+                .unwrap();
+            assert!(!timing.is_due(wall + 120_000, start + Duration::from_secs(120)));
+            timing
+                .complete(wall + 135_000, start + Duration::from_secs(135))
+                .unwrap();
+            assert!(!timing.is_due(wall + 135_000, start + Duration::from_secs(135)));
+        }
+    }
 
     #[test]
     fn enhanced_interval_uses_elapsed_time_and_restarts_after_wake() {
