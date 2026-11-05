@@ -145,4 +145,50 @@ mod tests {
             "NUL must not turn one approved argument into several"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn anonymous_input_is_parent_private_sealed_and_closed_after_use_or_spawn_failure() {
+        use std::os::fd::AsRawFd;
+        let payload = "x".repeat(96 * 1024);
+        let input = ArgumentInput::new(&[OsString::from(&payload)]).unwrap();
+        let fd = input.fd();
+        let descriptor_path = format!("/proc/self/fd/{fd}");
+        let unrelated = tokio::process::Command::new("/bin/cat")
+            .arg(&descriptor_path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !unrelated.status.success(),
+            "unrelated children must not inherit argument input"
+        );
+        let mut reader = tokio::process::Command::new("/bin/cat");
+        reader.arg(&descriptor_path);
+        input.forward_to(&mut reader);
+        let output = reader.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.len(),
+            96 * 1024 + 1,
+            "input larger than pipe capacity must arrive without blocking"
+        );
+        assert_eq!(&output.stdout[..96 * 1024], payload.as_bytes());
+        assert_eq!(output.stdout[96 * 1024], 0);
+        assert_eq!(
+            unsafe { libc::write(input.0.as_raw_fd(), b"a".as_ptr().cast(), 1) },
+            -1,
+            "sealed input must not be writable by the receiver"
+        );
+        drop(input);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+
+        let input = ArgumentInput::new(&["unused".into()]).unwrap();
+        let fd = input.fd();
+        let mut missing = tokio::process::Command::new("/missing-clai-qa-launcher");
+        input.forward_to(&mut missing);
+        assert!(missing.spawn().is_err());
+        drop(input);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
 }

@@ -114,7 +114,7 @@ pub(crate) fn spawn_checked(
     }
 }
 
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 pub(crate) async fn run_spawned_child(
     child: Child,
     cwd: PathBuf,
