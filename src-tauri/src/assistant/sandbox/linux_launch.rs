@@ -7,9 +7,12 @@ pub(super) fn launch_argv(
     mut args: Vec<OsString>,
     in_flatpak: bool,
     argument_fd: Option<i32>,
+    command_argv: &[OsString],
 ) -> (&'static str, Vec<OsString>) {
     if let Some(fd) = argument_fd {
         args = vec!["--args".into(), fd.to_string().into()];
+        args.push("--".into());
+        args.extend_from_slice(command_argv);
     }
     if in_flatpak {
         let mut launch = vec!["--host".into()];
@@ -109,23 +112,37 @@ mod tests {
         ]
         .map(OsString::from)
         .to_vec();
-        let (program, argv) = launch_argv(args, false, Some(7));
+        let (program, argv) = launch_argv(args, false, Some(7), &["/bin/true".into()]);
         assert_eq!(program, "bwrap");
         assert!(
             !argv.iter().any(|arg| arg == "disposable-secret"),
             "payload must not be a launcher argument"
         );
-        assert_eq!(argv, ["--args", "7"].map(OsString::from));
+        assert_eq!(argv, ["--args", "7", "--", "/bin/true"].map(OsString::from));
     }
 
     #[test]
     fn flatpak_forwards_the_argument_descriptor_without_values_in_argv() {
-        let (program, argv) = launch_argv(vec!["disposable-secret".into()], true, Some(9));
+        let (program, argv) = launch_argv(
+            vec!["disposable-secret".into()],
+            true,
+            Some(9),
+            &["/bin/true".into()],
+        );
         assert_eq!(program, "flatpak-spawn");
         assert!(!argv.iter().any(|arg| arg == "disposable-secret"));
         assert_eq!(
             argv,
-            ["--host", "--forward-fd=9", "bwrap", "--args", "9"].map(OsString::from)
+            [
+                "--host",
+                "--forward-fd=9",
+                "bwrap",
+                "--args",
+                "9",
+                "--",
+                "/bin/true"
+            ]
+            .map(OsString::from)
         );
     }
 

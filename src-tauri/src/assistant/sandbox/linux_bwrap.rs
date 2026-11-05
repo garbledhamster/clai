@@ -26,18 +26,23 @@ pub(crate) async fn run_guarded(
 ) -> Result<Option<SandboxCommandOutput>, String> {
     prune_missing_grants(&mut command).await;
     let args = bwrap_args(&command)?;
+    // --args parses options recursively; its remaining command is not returned
+    // to bwrap's outer parser. Keep the existing command argv outside that input.
+    // Derive the boundary from the known argv length: a value can itself be "--".
+    let option_count = args.len() - command.argv.len() - 1;
     let in_flatpak = crate::providers::is_flatpak();
     let argument_input = command
         .profile
         .variables
         .as_ref()
         .filter(|variables| variables.in_use())
-        .map(|_| ArgumentInput::new(&args))
+        .map(|_| ArgumentInput::new(&args[..option_count]))
         .transpose()?;
     let (program, launch_args) = launch_argv(
         args,
         in_flatpak,
         argument_input.as_ref().map(ArgumentInput::fd),
+        &command.argv,
     );
     let mut child_command = Command::new(program);
     child_command.args(launch_args);
@@ -672,7 +677,7 @@ mod tests {
     #[test]
     fn launch_argv_runs_bwrap_directly_on_host() {
         let bwrap_args = vec![os("--die-with-parent"), os("--"), os("/bin/sh")];
-        let (program, args) = launch_argv(bwrap_args.clone(), false, None);
+        let (program, args) = launch_argv(bwrap_args.clone(), false, None, &[]);
         assert_eq!(program, "bwrap");
         assert_eq!(args, bwrap_args);
     }
@@ -680,7 +685,7 @@ mod tests {
     #[test]
     fn launch_argv_wraps_with_flatpak_spawn_in_flatpak() {
         let bwrap_args = vec![os("--die-with-parent"), os("--"), os("/bin/sh")];
-        let (program, args) = launch_argv(bwrap_args, true, None);
+        let (program, args) = launch_argv(bwrap_args, true, None, &[]);
         assert_eq!(program, "flatpak-spawn");
         // flatpak-spawn --host bwrap <original bwrap args...>
         let rendered: Vec<String> = args
