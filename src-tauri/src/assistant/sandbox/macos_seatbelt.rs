@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::process::Command;
 
-use super::runner::{prepare_stdio, run_spawned_child};
+use super::runner::{prepare_stdio, run_spawned_child_redacted, spawn_checked};
 use super::{
     SandboxCommand, SandboxCommandOutput, SandboxNetworkMode, SandboxPathAccess, SandboxPathGrant,
 };
@@ -64,6 +64,11 @@ pub(crate) async fn run_guarded(
     for (key, value) in command.profile.env.iter() {
         child_command.env(key, value);
     }
+    if let Some(variables) = &command.profile.variables {
+        for (key, value) in variables.iter() {
+            child_command.env(key, value);
+        }
+    }
     child_command
         .env("TMPDIR", &private_tmp)
         .env("TMP", &private_tmp)
@@ -72,31 +77,41 @@ pub(crate) async fn run_guarded(
 
     // No await separates this logical start from process spawn. The callback
     // orders admission with wake/manual revocation without holding a gate over I/O.
-    if start_check.is_some_and(|check| !check()) {
-        cleanup_ephemeral_tmp_dir(&private_tmp, ephemeral);
-        return Ok(None);
-    }
-
-    let child = match child_command.spawn() {
-        Ok(child) => child,
+    let admission = spawn_checked(
+        &mut child_command,
+        start_check,
+        command.profile.variables.as_ref(),
+        |error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "Sandboxed shell is unavailable: macOS sandbox-exec is not installed".to_string()
+            } else {
+                format!("Failed to start sandboxed shell: {error}")
+            }
+        },
+    );
+    let child = match admission {
+        Ok(Some(child)) => child,
+        Ok(None) => {
+            cleanup_ephemeral_tmp_dir(&private_tmp, ephemeral);
+            return Ok(None);
+        }
         Err(error) => {
             cleanup_ephemeral_tmp_dir(&private_tmp, ephemeral);
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Err(
-                    "Sandboxed shell is unavailable: macOS sandbox-exec is not installed"
-                        .to_string(),
-                );
-            }
-            return Err(format!("Failed to start sandboxed shell: {}", error));
+            return Err(error);
         }
     };
 
-    let result = run_spawned_child(
+    let protected = command.profile.variables.as_ref().map_or_else(
+        Vec::new,
+        crate::variables::ResolvedVariables::protected_values,
+    );
+    let result = run_spawned_child_redacted(
         child,
         command.cwd,
         command.timeout_ms,
         command.max_output_chars,
         "Sandboxed shell command",
+        protected,
     )
     .await;
     cleanup_ephemeral_tmp_dir(&private_tmp, ephemeral);
@@ -263,6 +278,20 @@ fn seatbelt_profile(command: &SandboxCommand, private_tmp: &Path) -> Result<Stri
     append_rule(&mut profile, "file-read*", &read_filters);
     append_rule(&mut profile, "file-write*", &write_filters);
     append_workspace_mask(&mut profile, command)?;
+    for denied in &command.profile.filesystem.denied_paths {
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (subpath \"{}\"))\n",
+            path_literal(denied)?
+        ));
+        // A broad writable grant must not move the protected subtree to an
+        // unprotected spelling by renaming one of its parent directories.
+        for ancestor in denied.ancestors().filter(|path| path.parent().is_some()) {
+            profile.push_str(&format!(
+                "(deny file-write-unlink (literal \"{}\"))\n",
+                path_literal(ancestor)?
+            ));
+        }
+    }
     Ok(profile)
 }
 

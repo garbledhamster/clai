@@ -497,6 +497,7 @@ fn capture_with_execution(
         .as_deref()
         .unwrap_or(&filesystem.workspace_root);
     let profile = SandboxProfile {
+        variables: None,
         env: SandboxEnv::filtered_from_current(env_home, session_bus),
         scratch_tmp: None,
         filesystem,

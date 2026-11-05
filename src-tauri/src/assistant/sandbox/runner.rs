@@ -53,7 +53,7 @@ pub async fn run_command(command: SandboxCommand) -> Result<SandboxCommandOutput
 
 /// Admission is evaluated by the backend after setup, directly before spawn.
 pub(crate) async fn run_command_guarded(
-    command: SandboxCommand,
+    mut command: SandboxCommand,
     start_check: Option<StartCheck<'_>>,
 ) -> Result<Option<SandboxCommandOutput>, String> {
     if command.argv.is_empty() {
@@ -64,6 +64,17 @@ pub(crate) async fn run_command_guarded(
             "Shell cwd does not exist or is not a directory: {}",
             command.cwd.display()
         ));
+    }
+    if let Some(variables) = &command.profile.variables {
+        if variables.in_use() && !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Err("Variables execution is unavailable: registry isolation cannot be enforced on this platform".into());
+        }
+        if variables.in_use() && cfg!(any(target_os = "macos", target_os = "linux")) {
+            command
+                .profile
+                .filesystem
+                .exclude_registry(variables.registry_directory())?;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -85,12 +96,42 @@ pub(crate) async fn run_command_guarded(
     }
 }
 
+pub(crate) fn spawn_checked(
+    command: &mut Command,
+    start_check: Option<StartCheck<'_>>,
+    variables: Option<&crate::variables::ResolvedVariables>,
+    error_message: impl FnOnce(std::io::Error) -> String,
+) -> Result<Option<Child>, String> {
+    let spawn = || {
+        if start_check.is_some_and(|check| !check()) {
+            return Ok(None);
+        }
+        command.spawn().map(Some).map_err(error_message)
+    };
+    match variables {
+        Some(variables) => variables.admit(spawn),
+        None => spawn(),
+    }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) async fn run_spawned_child(
+    child: Child,
+    cwd: PathBuf,
+    timeout_ms: u64,
+    output_limit: usize,
+    timeout_label: &str,
+) -> Result<SandboxCommandOutput, String> {
+    run_spawned_child_redacted(child, cwd, timeout_ms, output_limit, timeout_label, vec![]).await
+}
+
+pub(crate) async fn run_spawned_child_redacted(
     mut child: Child,
     cwd: PathBuf,
     timeout_ms: u64,
     output_limit: usize,
     timeout_label: &str,
+    protected: Vec<String>,
 ) -> Result<SandboxCommandOutput, String> {
     let stdout = child
         .stdout
@@ -106,8 +147,18 @@ pub(crate) async fn run_spawned_child(
     let byte_limit = output_limit.saturating_mul(4);
     let stdout_capture = Arc::new(Mutex::new(Vec::new()));
     let stderr_capture = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout_task = tokio::spawn(read_bounded(stdout, byte_limit, stdout_capture.clone()));
-    let mut stderr_task = tokio::spawn(read_bounded(stderr, byte_limit, stderr_capture.clone()));
+    let mut stdout_task = tokio::spawn(read_bounded(
+        stdout,
+        byte_limit,
+        stdout_capture.clone(),
+        protected.clone(),
+    ));
+    let mut stderr_task = tokio::spawn(read_bounded(
+        stderr,
+        byte_limit,
+        stderr_capture.clone(),
+        protected,
+    ));
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
     // Capture the pid up front: on timeout we signal the child's whole process
@@ -174,14 +225,8 @@ pub(crate) async fn run_spawned_child(
             ));
         }
     };
-    let stdout_bytes = stdout_capture
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let stderr_bytes = stderr_capture
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let stdout_bytes = retained_bytes(&stdout_capture);
+    let stderr_bytes = retained_bytes(&stderr_capture);
 
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut stderr = truncate_string(
@@ -211,6 +256,13 @@ pub(crate) async fn run_spawned_child(
     })
 }
 
+fn retained_bytes(capture: &Mutex<Vec<u8>>) -> Vec<u8> {
+    capture
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 fn timeout_output(
     cwd: PathBuf,
     stdout: &Mutex<Vec<u8>>,
@@ -237,16 +289,19 @@ async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
     retained: Arc<Mutex<Vec<u8>>>,
+    protected: Vec<String>,
 ) -> std::io::Result<()> {
     let mut chunk = [0u8; 8192];
+    let mut redactor = crate::variables::ProtectedOutput::new(protected);
     loop {
         let count = reader.read(&mut chunk).await?;
+        let safe = redactor.push(&chunk[..count], count == 0);
+        let mut retained = retained.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = safe.len().min(limit.saturating_sub(retained.len()));
+        retained.extend_from_slice(&safe[..keep]);
         if count == 0 {
             return Ok(());
         }
-        let mut retained = retained.lock().unwrap_or_else(|e| e.into_inner());
-        let keep = count.min(limit.saturating_sub(retained.len()));
-        retained.extend_from_slice(&chunk[..keep]);
     }
 }
 
@@ -501,10 +556,56 @@ mod scheduled_process_tests {
         assert!(output.stderr.starts_with("abcdefghij"));
         assert!(output.stdout.len() < 150 && output.stderr.len() < 150);
         let capture = Arc::new(Mutex::new(Vec::new()));
-        read_bounded(&vec![b'x'; 1_000_000][..], 400, capture.clone())
+        read_bounded(&vec![b'x'; 1_000_000][..], 400, capture.clone(), vec![])
             .await
             .unwrap();
         assert_eq!(capture.lock().unwrap().len(), 400);
+    }
+
+    #[tokio::test]
+    async fn protected_output_crossing_read_chunks_is_suppressed_before_retention() {
+        let mut data = vec![b'x'; 8190];
+        data.extend_from_slice(b"disposable-secret:end");
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        read_bounded(
+            &data[..],
+            10_000,
+            capture.clone(),
+            vec!["disposable-secret".into()],
+        )
+        .await
+        .unwrap();
+        let output = capture.lock().unwrap();
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            !output.contains("disposable-secret"),
+            "chunk boundary must not bypass suppression"
+        );
+        assert!(output.starts_with(&"x".repeat(8190)) && output.ends_with(":end"));
+    }
+
+    #[tokio::test]
+    async fn suppression_markers_cannot_reintroduce_a_protected_value() {
+        for (data, secrets) in [
+            ("protected", vec!["protected"]),
+            ("aabc", vec!["abc", "a["]),
+        ] {
+            let capture = Arc::new(Mutex::new(Vec::new()));
+            read_bounded(
+                data.as_bytes(),
+                1000,
+                capture.clone(),
+                secrets.iter().map(|s| (*s).into()).collect(),
+            )
+            .await
+            .unwrap();
+            let output = capture.lock().unwrap();
+            let output = String::from_utf8_lossy(&output);
+            assert!(
+                secrets.iter().all(|secret| !output.contains(secret)),
+                "suppression itself must not introduce a protected payload"
+            );
+        }
     }
 
     #[tokio::test]

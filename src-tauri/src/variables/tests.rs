@@ -540,3 +540,342 @@ fn uncertain_directory_durability_preserves_both_credentials_and_reports_committ
     let reopened = VariablesRegistry::open_with_credentials(path, credentials).unwrap();
     assert_eq!(reopened.list(None).unwrap(), vec![result.definition]);
 }
+
+#[cfg(target_os = "macos")]
+fn native_command(
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+    script: &str,
+) -> crate::assistant::sandbox::SandboxCommand {
+    use crate::assistant::sandbox::*;
+    SandboxCommand {
+        argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        cwd: workspace.into(),
+        timeout_ms: 5000,
+        max_output_chars: 2000,
+        profile: SandboxProfile::for_test(
+            workspace.into(),
+            vec![SandboxPathGrant {
+                host_path: home.into(),
+                access: SandboxPathAccess::ReadWrite,
+            }],
+            SandboxNetworkMode::Disabled,
+            SandboxSessionBusMode::Deny,
+            SandboxEnv::filtered_from_iter(
+                [
+                    ("PATH", "/usr/bin:/bin"),
+                    ("CLAI_VAR_TOKEN", "inherited-bypass"),
+                ],
+                home,
+                SandboxSessionBusMode::Deny,
+            ),
+            None,
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn protected_shell_results_suppress_payload_and_keep_surrounding_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = VariablesRegistry::open_with_credentials(
+        temp.path().join("profile/variables"),
+        Arc::new(TestCredentials::default()),
+    )
+    .unwrap();
+    registry
+        .save(
+            protected("TOKEN", Some("disposable-shell-secret")),
+            &known(),
+        )
+        .unwrap();
+    let command = native_command(&workspace, temp.path(), "printf 'before:%s:after' \"$CLAI_VAR_TOKEN\"; printf 'before:%s:after' \"$CLAI_VAR_TOKEN\" >&2");
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_A, command)
+            .await
+            .unwrap();
+    assert!(output.success);
+    assert!(
+        !output.stdout.contains("disposable-shell-secret"),
+        "stdout must suppress protected values"
+    );
+    assert!(
+        !output.stderr.contains("disposable-shell-secret"),
+        "stderr must suppress protected values"
+    );
+    assert!(output.stdout.starts_with("before:") && output.stdout.ends_with(":after"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn unassigned_shell_cannot_read_registry_through_broad_grants_or_aliases() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let directory = temp.path().join("profile/variables");
+    let registry = VariablesRegistry::open(directory.clone()).unwrap();
+    registry
+        .save(create("MESSAGE", "private-registry-text"), &known())
+        .unwrap();
+    let alias = temp.path().join("registry-alias");
+    std::os::unix::fs::symlink(&directory, &alias).unwrap();
+    for file in [directory.join("registry.json"), alias.join("registry.json")] {
+        let command = native_command(
+            &workspace,
+            temp.path(),
+            &format!("cat '{}'", file.display()),
+        );
+        let output =
+            crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+                .await
+                .unwrap();
+        assert!(
+            !output.success,
+            "broad grants must not expose the Variables registry"
+        );
+        assert!(!output.stdout.contains("private-registry-text"));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn revoked_snapshot_cannot_start_a_later_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = VariablesRegistry::open(temp.path().join("profile/variables")).unwrap();
+    let saved = registry
+        .save(create("MESSAGE", "one"), &known())
+        .unwrap()
+        .definition;
+    let snapshot = registry.resolve(WORKSPACE_A).unwrap();
+    let mut edit = create("MESSAGE", "one");
+    edit.id = Some(saved.id);
+    edit.expected_revision = Some(saved.revision);
+    edit.workspace_ids.clear();
+    registry.save(edit, &known()).unwrap();
+    let mut command = native_command(&workspace, temp.path(), "touch SHOULD_NOT_START");
+    command.profile.variables = Some(snapshot);
+    let result = crate::assistant::sandbox::run_command(command).await;
+    assert!(
+        result.is_err(),
+        "revoked access must fail at actual process admission"
+    );
+    assert!(!workspace.join("SHOULD_NOT_START").exists());
+}
+
+#[test]
+fn unassigned_resolution_does_not_read_credentials_or_leak_payloads_in_debug() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(TestCredentials::default());
+    let registry = VariablesRegistry::open_with_credentials(
+        temp.path().join("variables"),
+        credentials.clone(),
+    )
+    .unwrap();
+    registry
+        .save(
+            protected("TOKEN", Some("disposable-shell-secret")),
+            &known(),
+        )
+        .unwrap();
+    let assigned = registry.resolve(WORKSPACE_A).unwrap();
+    assert!(!format!("{assigned:?}").contains("disposable-shell-secret"));
+    credentials
+        .reads
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    credentials
+        .fail_read
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let unassigned = registry.resolve(WORKSPACE_B).unwrap();
+    assert_eq!(unassigned.iter().count(), 0);
+    assert_eq!(
+        credentials.reads.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        registry.resolve(WORKSPACE_A).is_err(),
+        "assigned missing/unavailable credential must fail visibly"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn protected_output_is_suppressed_before_character_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = VariablesRegistry::open_with_credentials(
+        temp.path().join("profile/variables"),
+        Arc::new(TestCredentials::default()),
+    )
+    .unwrap();
+    registry
+        .save(
+            protected("TOKEN", Some("disposable-shell-secret")),
+            &known(),
+        )
+        .unwrap();
+    let mut command = native_command(&workspace, temp.path(), "printf '%s' \"$CLAI_VAR_TOKEN\"");
+    command.max_output_chars = 7;
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_A, command)
+            .await
+            .unwrap();
+    assert!(
+        !output.stdout.contains("disposa"),
+        "retention must not preserve a truncated secret prefix"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn registry_cannot_be_relocated_or_hardlinked_out_of_its_denial() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let profile = temp.path().join("profile");
+    let directory = profile.join("variables");
+    let registry = VariablesRegistry::open(directory.clone()).unwrap();
+    registry
+        .save(create("MESSAGE", "private-registry-text"), &known())
+        .unwrap();
+    let moved = temp.path().join("moved-profile");
+    let command = native_command(
+        &workspace,
+        temp.path(),
+        &format!(
+            "mv '{}' '{}'; cat '{}/variables/registry.json'",
+            profile.display(),
+            moved.display(),
+            moved.display()
+        ),
+    );
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+            .await
+            .unwrap();
+    assert!(
+        !output.stdout.contains("private-registry-text"),
+        "moving a parent must not bypass registry isolation"
+    );
+    assert!(
+        directory.join("registry.json").exists(),
+        "registry ancestors must remain in place"
+    );
+    let link = workspace.join("registry-copy");
+    let command = native_command(
+        &workspace,
+        temp.path(),
+        &format!(
+            "ln '{}' '{}'; cat '{}'",
+            directory.join("registry.json").display(),
+            link.display(),
+            link.display()
+        ),
+    );
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+            .await
+            .unwrap();
+    assert!(
+        !output.stdout.contains("private-registry-text"),
+        "hardlink aliases must not expose definitions"
+    );
+    assert!(
+        !link.exists(),
+        "registry files must not be linked into an accessible workspace"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn child_serializes_boolean_number_and_preserves_base_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = VariablesRegistry::open(temp.path().join("variables")).unwrap();
+    for (name, value) in [
+        ("ENABLED", VariableInput::Boolean { value: false }),
+        (
+            "COUNT",
+            VariableInput::Number {
+                value: "-12.5".into(),
+            },
+        ),
+    ] {
+        registry
+            .save(
+                SaveVariable {
+                    id: None,
+                    expected_revision: None,
+                    name: name.into(),
+                    value,
+                    workspace_ids: vec![WORKSPACE_A.into()],
+                },
+                &known(),
+            )
+            .unwrap();
+    }
+    let command = native_command(
+        &workspace,
+        temp.path(),
+        "printf '%s|%s|%s' \"${CLAI_VAR_ENABLED?}\" \"${CLAI_VAR_COUNT?}\" \"$PATH\"",
+    );
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_A, command)
+            .await
+            .unwrap();
+    assert!(output.success);
+    assert_eq!(output.stdout, "false|-12.5|/usr/bin:/bin");
+    let command = native_command(
+        &workspace,
+        temp.path(),
+        "printf '%s' \"${CLAI_VAR_TOKEN-unset}\"",
+    );
+    let output =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+            .await
+            .unwrap();
+    assert_eq!(output.stdout, "unset");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn unused_variables_do_not_require_an_available_registry_path_for_legacy_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let unavailable = temp.path().join("profile-alias");
+    std::os::unix::fs::symlink(temp.path().join("missing-profile"), &unavailable).unwrap();
+    let registry = VariablesRegistry::open(unavailable.join("variables")).unwrap();
+    assert!(registry.list(None).unwrap().is_empty());
+    let command = native_command(&workspace, temp.path(), "printf legacy");
+    let result =
+        crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_A, command)
+            .await;
+    assert!(
+        result.is_ok(),
+        "unused Variables must not block existing shell execution"
+    );
+    assert_eq!(result.unwrap().stdout, "legacy");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn first_definition_invalidates_an_empty_snapshot_before_process_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = VariablesRegistry::open(temp.path().join("profile/variables")).unwrap();
+    let snapshot = registry.resolve(WORKSPACE_A).unwrap();
+    registry.save(create("MESSAGE", "new"), &known()).unwrap();
+    let mut command = native_command(&workspace, temp.path(), "touch SHOULD_NOT_START");
+    command.profile.variables = Some(snapshot);
+    assert!(crate::assistant::sandbox::run_command(command)
+        .await
+        .is_err());
+    assert!(!workspace.join("SHOULD_NOT_START").exists());
+}

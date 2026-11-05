@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use tauri::Manager;
 use tokio::time::Duration;
 
 use crate::assistant::sandbox::{
@@ -176,13 +177,18 @@ async fn execute_bash_exec(
         }
     };
 
-    let output = run_command(SandboxCommand {
-        argv,
-        cwd,
-        timeout_ms,
-        max_output_chars: output_limit,
-        profile: sandbox_profile(context, workspace_root, filesystem),
-    })
+    let app_state = deps.app.state::<crate::AppState>();
+    let output = run_workspace_command(
+        &app_state.variables,
+        &deps.workspace_id,
+        SandboxCommand {
+            argv,
+            cwd,
+            timeout_ms,
+            max_output_chars: output_limit,
+            profile: sandbox_profile(context, workspace_root, filesystem),
+        },
+    )
     .await
     .inspect_err(|error| {
         // Surface sandbox-availability failures (bwrap missing, kernel
@@ -210,6 +216,18 @@ async fn execute_bash_exec(
         "stdout": output.stdout,
         "stderr": output.stderr
     }))
+}
+
+pub(crate) async fn run_workspace_command(
+    registry: &crate::variables::VariablesRegistry,
+    workspace_id: &str,
+    mut command: SandboxCommand,
+) -> Result<crate::assistant::sandbox::SandboxCommandOutput, String> {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) && !registry.list(None)?.is_empty() {
+        return Err("Variables execution is unavailable: registry isolation cannot be enforced on this platform".into());
+    }
+    command.profile.variables = Some(registry.resolve(workspace_id)?);
+    run_command(command).await
 }
 
 /// Turn a bare sandbox timeout into an actionable error the model can recover
@@ -294,6 +312,7 @@ fn sandbox_profile(
         .as_deref()
         .unwrap_or(&filesystem.workspace_root);
     SandboxProfile {
+        variables: None,
         env: SandboxEnv::filtered_from_current(env_home, session_bus),
         filesystem,
         network,
@@ -1721,6 +1740,62 @@ mod tests {
                 std::sync::Mutex::new(Vec::new()),
             ),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bound_workspace_shell_receives_assigned_literal_data() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace_id = "b147151d-ddb3-45ac-9e7f-e1aa48c0f3de";
+        let registry =
+            crate::variables::VariablesRegistry::open(temp.path().join("profile/variables"))
+                .unwrap();
+        let known = std::collections::HashSet::from([workspace_id.to_string()]);
+        registry
+            .save(
+                crate::variables::SaveVariable {
+                    id: None,
+                    expected_revision: None,
+                    name: "MESSAGE".into(),
+                    value: crate::variables::VariableInput::Text {
+                        value: "literal '$HOME'\n$(touch INJECTED)".into(),
+                    },
+                    workspace_ids: vec![workspace_id.into()],
+                },
+                &known,
+            )
+            .unwrap();
+        let context = context_with_grants(&workspace, vec![]);
+        let profile = sandbox_profile(
+            &context,
+            workspace.clone(),
+            filesystem_policy(&context).unwrap(),
+        );
+        let output = run_workspace_command(
+            &registry,
+            workspace_id,
+            SandboxCommand {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s' \"$CLAI_VAR_MESSAGE\"".into(),
+                ],
+                cwd: workspace.clone(),
+                timeout_ms: 5000,
+                max_output_chars: 2000,
+                profile,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(output.success, "native workspace child must succeed");
+        assert_eq!(output.stdout, "literal '$HOME'\n$(touch INJECTED)");
+        assert!(
+            !workspace.join("INJECTED").exists(),
+            "literal data must not execute"
+        );
     }
 
     #[test]

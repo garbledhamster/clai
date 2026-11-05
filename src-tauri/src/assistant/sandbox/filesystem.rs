@@ -9,6 +9,7 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct EffectiveFilesystemPolicy {
+    pub denied_paths: Vec<PathBuf>,
     pub workspace_root: PathBuf,
     pub path_grants: Vec<SandboxPathGrant>,
     pub mask: Option<PathBuf>,
@@ -64,6 +65,7 @@ impl EffectiveFilesystemPolicy {
                     .any(|w| authorizes(w, &g.host_path, mask.as_deref()))
         });
         Ok(Self {
+            denied_paths: Vec::new(),
             workspace_root,
             path_grants,
             mask,
@@ -93,12 +95,30 @@ impl EffectiveFilesystemPolicy {
 
     /// Query an absolute, resolved path (the form returned by grant requests).
     pub fn covers(&self, path: &Path, access: FilesystemPathAccess) -> bool {
+        if self
+            .denied_paths
+            .iter()
+            .any(|denied| path.starts_with(denied))
+        {
+            return false;
+        }
         authorizes(&self.workspace_root, path, self.mask.as_deref())
             || self.path_grants.iter().any(|g| {
                 authorizes(&g.host_path, path, self.mask.as_deref())
                     && (g.access == SandboxPathAccess::ReadWrite
                         || access == FilesystemPathAccess::ReadOnly)
             })
+    }
+
+    pub(crate) fn exclude_registry(&mut self, directory: &Path) -> Result<(), String> {
+        let directory = resolve(directory)?;
+        if self.workspace_root.starts_with(&directory) {
+            return Err("Workspace overlaps the protected Variables registry".into());
+        }
+        if !self.denied_paths.contains(&directory) {
+            self.denied_paths.push(directory);
+        }
+        Ok(())
     }
 
     pub fn authorize_cwd(&self, requested: &str) -> Result<PathBuf, String> {
@@ -153,6 +173,12 @@ impl EffectiveFilesystemPolicy {
                 },
             ),
         });
+        // Registry exclusion is final: a more specific additive grant cannot undo it.
+        ops.extend(
+            self.denied_paths
+                .iter()
+                .map(|path| FilesystemOperation::Mask(path)),
+        );
         ops
     }
 }

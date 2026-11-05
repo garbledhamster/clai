@@ -30,6 +30,7 @@ const ENV_DENY_EXACT: &[&str] = &[
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SandboxProfile {
+    pub(crate) variables: Option<crate::variables::ResolvedVariables>,
     pub filesystem: super::filesystem::EffectiveFilesystemPolicy,
     pub network: SandboxNetworkMode,
     pub session_bus: SandboxSessionBusMode,
@@ -183,6 +184,7 @@ impl SandboxProfile {
         )
         .unwrap();
         Self {
+            variables: None,
             filesystem,
             network,
             session_bus,

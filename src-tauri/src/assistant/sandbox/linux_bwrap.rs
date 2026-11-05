@@ -47,6 +47,14 @@ pub(crate) async fn run_guarded(
     mut command: SandboxCommand,
     start_check: Option<super::runner::StartCheck<'_>>,
 ) -> Result<Option<SandboxCommandOutput>, String> {
+    if command
+        .profile
+        .variables
+        .as_ref()
+        .is_some_and(|variables| variables.in_use())
+    {
+        return Err("Variables execution is unavailable: safe Linux variable transport is not yet established".into());
+    }
     prune_missing_grants(&mut command).await;
     let args = bwrap_args(&command)?;
     let in_flatpak = crate::providers::is_flatpak();
@@ -2043,6 +2051,7 @@ mod tests {
             timeout_ms: 5_000,
             max_output_chars: 2_000,
             profile: SandboxProfile {
+                variables: None,
                 filesystem,
                 env,
                 network: SandboxNetworkMode::Disabled,

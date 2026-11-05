@@ -4,6 +4,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 mod credentials;
+mod redaction;
+mod runtime;
+pub(crate) use redaction::ProtectedOutput;
+pub(crate) use runtime::ResolvedVariables;
 
 mod types;
 use credentials::CredentialStore;
@@ -13,7 +17,7 @@ pub use types::{
 
 pub struct VariablesRegistry {
     directory: PathBuf,
-    definitions: Mutex<Vec<StoredDefinition>>,
+    definitions: Arc<Mutex<Vec<StoredDefinition>>>,
     credentials: Arc<dyn CredentialStore>,
     directory_sync: fn(&std::path::Path) -> std::io::Result<()>,
 }
@@ -27,6 +31,49 @@ struct StoredDefinition {
 }
 
 impl VariablesRegistry {
+    pub(crate) fn resolve(&self, workspace_id: &str) -> Result<ResolvedVariables, String> {
+        let definitions = self
+            .definitions
+            .lock()
+            .map_err(|_| "Variables registry lock is unavailable")?;
+        let mut values = std::collections::BTreeMap::new();
+        let mut protected = Vec::new();
+        for definition in definitions
+            .iter()
+            .filter(|d| d.metadata.workspace_ids.iter().any(|id| id == workspace_id))
+        {
+            let value = if definition.metadata.kind == VariableKind::Protected {
+                let reference = definition
+                    .credential_reference
+                    .as_deref()
+                    .ok_or("Protected value is unavailable")?;
+                let value = self.credentials.get(reference)?;
+                protected.push(value.clone());
+                value
+            } else {
+                match definition
+                    .metadata
+                    .value
+                    .as_ref()
+                    .ok_or("Variable value is unavailable")?
+                {
+                    PlainValue::Text(value) => value.clone(),
+                    PlainValue::Boolean(value) => value.to_string(),
+                    PlainValue::Number(value) => value.to_string(),
+                }
+            };
+            values.insert(format!("CLAI_VAR_{}", definition.metadata.name), value);
+        }
+        Ok(ResolvedVariables {
+            values,
+            protected,
+            directory: self.directory.clone(),
+            workspace_id: workspace_id.into(),
+            revisions: runtime::identity_for(&definitions, workspace_id),
+            in_use: !definitions.is_empty(),
+            definitions: self.definitions.clone(),
+        })
+    }
     pub fn open(directory: PathBuf) -> Result<Self, String> {
         Self::open_with_credentials(directory, Arc::new(credentials::NativeCredentials))
     }
@@ -92,7 +139,7 @@ impl VariablesRegistry {
         }
         Ok(Self {
             directory,
-            definitions: Mutex::new(definitions),
+            definitions: Arc::new(Mutex::new(definitions)),
             credentials,
             directory_sync: |path| std::fs::File::open(path)?.sync_all(),
         })
