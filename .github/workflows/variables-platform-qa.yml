@@ -1,0 +1,46 @@
+name: Variables platform QA
+on:
+  push:
+    branches: [codex/static-variables-linux-qa]
+permissions:
+  contents: read
+concurrency:
+  group: variables-platform-qa
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+      - name: Install native and sandbox dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsecret-1-dev bubblewrap flatpak dbus-x11 gnome-keyring
+      - name: Build frontend
+        run: npm ci && npm run build
+      - name: Enable shared native Variables probes on Linux
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/src/variables/tests.rs")
+          p.write_text(p.read_text().replace('#[cfg(target_os = "macos")]', '#[cfg(any(target_os = "macos", target_os = "linux"))]'))
+          PY
+      - name: Build native test executable
+        working-directory: src-tauri
+        run: cargo test --lib --no-run --message-format=json > "$RUNNER_TEMP/variables-test-build.json"
+      - name: Run real Linux Variables children
+        working-directory: src-tauri
+        run: |
+          QA_TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/variables-test-build.json" | tail -1)
+          test -x "$QA_TEST_BIN"
+          mkdir -p "$HOME/clai-variables-qa/tmp"
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" variables::tests --nocapture
