@@ -36,6 +36,7 @@ mod paths;
 mod preview;
 mod providers;
 mod system_apps;
+mod variables;
 mod windows_console;
 mod workspace_index;
 
@@ -132,6 +133,7 @@ pub mod scheduler_verification {
 /// It's registered with Tauri via `.manage()` and injected into commands
 /// via `State<'_, AppState>`.
 pub struct AppState {
+    pub(crate) variables: variables::VariablesRegistry,
     /// Configuration manager for providers, automations, and MCP servers.
     pub config_manager: Mutex<ConfigManager>,
     /// External MCP client registry.
@@ -165,6 +167,9 @@ impl AppState {
         mcp_client_manager.sync_from_config(&initial_config);
 
         Ok(Self {
+            variables: variables::VariablesRegistry::open(
+                config_manager.profile_root().join("variables"),
+            )?,
             config_manager: Mutex::new(config_manager),
             mcp_client_manager: AsyncMutex::new(mcp_client_manager),
             pending_mcp_oauth: AsyncMutex::new(mcp::oauth::McpOAuthSessionRegistry::new()),
@@ -433,6 +438,10 @@ pub fn run() {
 
     // Create the shared application state
     let state = AppState {
+        variables: variables::VariablesRegistry::open(
+            config_manager.profile_root().join("variables"),
+        )
+        .expect("Variables registry could not be opened"),
         config_manager: Mutex::new(config_manager),
         mcp_client_manager: AsyncMutex::new({
             let mut manager = mcp::client::McpClientManager::new();
@@ -516,6 +525,9 @@ pub fn run() {
         // Register our custom commands
         // These become available to JS via invoke()
         .invoke_handler(tauri::generate_handler![
+            commands::variables::variables_list,
+            commands::variables::variables_save,
+            commands::variables::workspace_variables,
             // App metadata
             commands::app_info::app_version_detail,
             // App update commands

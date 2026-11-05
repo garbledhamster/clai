@@ -26,6 +26,12 @@ vi.mock('./AgentLibrarySettings', () => ({
 
 import SettingsModal, { TABS } from './SettingsModal';
 
+vi.mock('../../variables', () => ({
+  listVariables: async () => [],
+  variableWorkspaces: async () => [],
+  saveVariable: async () => { throw new Error('Storage unavailable'); },
+}));
+
 type Tab = (typeof TABS)[keyof typeof TABS];
 
 const modal = (props: { isOpen: boolean; initialAgentDefinitionId?: string | null; initialTab?: Tab }) => (
@@ -76,6 +82,32 @@ describe('SettingsModal agent deep link', () => {
 });
 
 describe('SettingsModal window', () => {
+  it('offers Variables as an app settings page', async () => {
+    render(modal({ isOpen: true, initialTab: TABS.APPEARANCE }));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Variables' }));
+    expect(screen.getByRole('heading', { level: 2, name: 'Variables' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Add field' })).toBeVisible();
+  });
+
+  it('guards Variables drafts when leaving the page or closing Settings', async () => {
+    const user = userEvent.setup();
+    const close = vi.fn();
+    render(<SettingsModal isOpen onClose={close} initialTab={TABS.VARIABLES} />);
+    await user.click(await screen.findByRole('button', { name: 'Add field' }));
+    await user.type(screen.getByLabelText('Name', { exact: true }), 'UNSAVED');
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.click(screen.getByRole('button', { name: 'Keep editing' }));
+    expect(screen.getByLabelText('Name', { exact: true })).toHaveValue('UNSAVED');
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(close).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Storage unavailable');
+    expect(close).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Discard' }));
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it('reopens on the tab asked for, not the one it was closed on', () => {
     const { rerender } = render(modal({ isOpen: true, initialTab: TABS.AGENTS }));
     expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Agents');

@@ -145,6 +145,10 @@ impl ConfigManager {
         crate::paths::clai_home().join(CONFIG_FILE_NAME)
     }
 
+    pub(crate) fn profile_root(&self) -> &Path {
+        self.config_path.parent().unwrap_or(Path::new("."))
+    }
+
     /// Loads config from a file.
     fn load_from_file(path: &PathBuf) -> Result<ClaiConfig, ConfigError> {
         let contents = fs::read_to_string(path).map_err(|e| ConfigError::Io {

@@ -465,6 +465,8 @@ export type SandboxNetworkConfig = "enabled" | "disabled";
  */
 export type SandboxSessionBusConfig = "deny" | "allow";
 
+export type SaveVariable = { id: string | null, expectedRevision: number | null, name: string, value: string, workspaceIds: Array<string>, };
+
 /**
  * Discriminated union describing *how* the manager's next run is
  * computed. Stored inline on [`WorkspaceSchedule`] and consumed by
@@ -615,6 +617,8 @@ export type UpdateProviderConnectionRequest = { id: string, name: string, protoc
  * Brand/catalog id. Defaults to `protocol_id` when omitted.
  */
 providerId: string | null, apiKey: string | null, authMode: AuthMode | null, baseUrl: string | null, modelId: string, accountLabel: string | null, enabled: boolean, };
+
+export type VariableMetadata = { id: string, revision: number, name: string, value: string, workspaceIds: Array<string>, };
 
 export type WebCapabilityConfig = { enabled: boolean, };
 

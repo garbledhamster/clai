@@ -16,5 +16,6 @@ pub mod schedule_scripts;
 pub mod skills;
 pub mod system_apps;
 pub mod terminal;
+pub mod variables;
 pub mod workspace;
 pub mod workspace_agents;

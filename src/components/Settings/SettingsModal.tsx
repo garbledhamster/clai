@@ -4,7 +4,7 @@
  * Main settings modal with sidebar navigation for different settings sections.
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import AgentLibrarySettings from './AgentLibrarySettings';
 import AssistantProviderSettings from './AssistantProviderSettings';
@@ -13,6 +13,7 @@ import SkillsSettings from './SkillsSettings';
 import AppearanceSettings from './AppearanceSettings';
 import ApplicationsSettings from './ApplicationsSettings';
 import AboutSettings from './AboutSettings';
+import VariablesSettings, { type VariablesHandle } from './VariablesSettings';
 import { useOverlayLayer } from '../../hooks/useOverlayLayer';
 import shell from './SettingsShell.module.css';
 import styles from './SettingsModal.module.css';
@@ -89,6 +90,7 @@ const TABS = {
   APPLICATIONS: 'applications',
   APPEARANCE: 'appearance',
   ABOUT: 'about',
+  VARIABLES: 'variables',
 } as const;
 
 type TabValue = (typeof TABS)[keyof typeof TABS];
@@ -96,6 +98,7 @@ type TabValue = (typeof TABS)[keyof typeof TABS];
 const NAV: { tab: TabValue; label: string; Icon: () => React.JSX.Element }[] = [
   { tab: TABS.PROVIDER, label: 'AI Provider', Icon: ProviderIcon },
   { tab: TABS.AGENTS, label: 'Agents', Icon: AgentsIcon },
+  { tab: TABS.VARIABLES, label: 'Variables', Icon: SkillsIcon },
   { tab: TABS.SKILLS, label: 'Skills', Icon: SkillsIcon },
   { tab: TABS.MCP_SERVERS, label: 'MCP Servers', Icon: PlugIcon },
   { tab: TABS.APPLICATIONS, label: 'Applications', Icon: AppsIcon },
@@ -132,25 +135,33 @@ const SettingsWindow = ({
   // the deep link is cleared on any tab change so that remount shows the
   // gallery, not the editor the user navigated away from.
   const [deepLinkAgentId, setDeepLinkAgentId] = useState(initialAgentDefinitionId);
+  const variablesRef = useRef<VariablesHandle>(null);
+  const leave = useCallback((next: () => void) => {
+    if (activeTab === TABS.VARIABLES && variablesRef.current) variablesRef.current.requestLeave(next);
+    else next();
+  }, [activeTab]);
+  const requestClose = useCallback(() => leave(onClose), [leave, onClose]);
 
   const selectTab = useCallback((tab: TabValue) => {
-    setActiveTab(tab);
-    setDeepLinkAgentId(null);
-  }, []);
+    if (tab === activeTab) return;
+    leave(() => { setActiveTab(tab); setDeepLinkAgentId(null); });
+  }, [activeTab, leave]);
 
   // Escape and the body-scroll lock, shared with every other open overlay:
   // this modal can sit over the workspace Settings modal, and a form modal can
   // sit over it.
-  useOverlayLayer(true, onClose);
+  useOverlayLayer(true, requestClose);
 
   const handleOverlayClick = useCallback((e: React.MouseEvent) => {
     if (e.target === e.currentTarget) {
-      onClose();
+      requestClose();
     }
-  }, [onClose]);
+  }, [requestClose]);
 
   const renderContent = () => {
     switch (activeTab) {
+      case TABS.VARIABLES:
+        return <VariablesSettings ref={variablesRef} />;
       case TABS.PROVIDER:
         return <AssistantProviderSettings initialAction={initialProviderAction} />;
       case TABS.AGENTS:
@@ -173,7 +184,7 @@ const SettingsWindow = ({
   return ReactDOM.createPortal(
     <div className={`${shell.overlay} ${shell.overlayNested}`} onClick={handleOverlayClick}>
       <div
-        className={shell.window}
+        className={`${shell.window} ${activeTab === TABS.VARIABLES ? styles.variablesWindow : ''}`}
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
@@ -207,10 +218,11 @@ const SettingsWindow = ({
 
         <div className={shell.main}>
           <header className={shell.header}>
+            {activeTab === TABS.VARIABLES && <select className={styles.compactNavigation} aria-label="Settings page" value={activeTab} onChange={e => selectTab(e.target.value as TabValue)}>{NAV.map(item => <option key={item.tab} value={item.tab}>{item.label}</option>)}</select>}
             <div className={shell.headerText}>
               <h2 className={shell.title}>{NAV.find((item) => item.tab === activeTab)?.label}</h2>
             </div>
-            <button type="button" className={shell.closeButton} onClick={onClose} aria-label="Close settings">
+            <button type="button" className={shell.closeButton} onClick={requestClose} aria-label="Close settings">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <line x1="18" y1="6" x2="6" y2="18" />
                 <line x1="6" y1="6" x2="18" y2="18" />
@@ -218,8 +230,8 @@ const SettingsWindow = ({
             </button>
           </header>
 
-          <div className={shell.body}>
-            <div className={styles.pane}>{renderContent()}</div>
+          <div className={`${shell.body} ${activeTab === TABS.VARIABLES ? styles.variablesBody : ''}`}>
+            <div className={`${styles.pane} ${activeTab === TABS.VARIABLES ? styles.variablesPane : ''}`}>{renderContent()}</div>
           </div>
         </div>
       </div>
