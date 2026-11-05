@@ -527,6 +527,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::variables::variables_list,
             commands::variables::variables_save,
+            commands::variables::variables_reveal,
             commands::variables::workspace_variables,
             // App metadata
             commands::app_info::app_version_detail,

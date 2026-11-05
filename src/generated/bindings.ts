@@ -351,6 +351,8 @@ alsoAffectsWorkspaces: Array<string>, };
 
 export type PermissionScope = "agent";
 
+export type PlainValue = string | boolean | number;
+
 export type ProbeModelsRequest = { protocolId: string, 
 /**
  * Existing connection to probe with. When present and no replacement
@@ -465,7 +467,7 @@ export type SandboxNetworkConfig = "enabled" | "disabled";
  */
 export type SandboxSessionBusConfig = "deny" | "allow";
 
-export type SaveVariable = { id: string | null, expectedRevision: number | null, name: string, value: string, workspaceIds: Array<string>, };
+export type SaveVariable = { id: string | null, expectedRevision: number | null, name: string, value: VariableInput, workspaceIds: Array<string>, };
 
 /**
  * Discriminated union describing *how* the manager's next run is
@@ -618,7 +620,13 @@ export type UpdateProviderConnectionRequest = { id: string, name: string, protoc
  */
 providerId: string | null, apiKey: string | null, authMode: AuthMode | null, baseUrl: string | null, modelId: string, accountLabel: string | null, enabled: boolean, };
 
-export type VariableMetadata = { id: string, revision: number, name: string, value: string, workspaceIds: Array<string>, };
+export type VariableInput = { "type": "text", value: string, } | { "type": "boolean", value: boolean, } | { "type": "number", value: string, } | { "type": "protected", replacement: string | null, };
+
+export type VariableKind = "text" | "boolean" | "number" | "protected";
+
+export type VariableMetadata = { id: string, revision: number, name: string, kind: VariableKind, value: PlainValue | null, workspaceIds: Array<string>, };
+
+export type VariableSaveResult = { definition: VariableMetadata, warning: string | null, };
 
 export type WebCapabilityConfig = { enabled: boolean, };
 

@@ -23,7 +23,7 @@ fn entry_for(service_name: &str, secret_ref: &str) -> Result<Entry, keyring::Err
 /// collection with the `default` alias — the daemon shows its own password
 /// dialog, so the user stays in control of the keyring password — and then
 /// retry the write once.
-fn set_password_creating_default_collection(
+pub(crate) fn set_password_creating_default_collection(
     entry: &Entry,
     secret: &str,
 ) -> Result<(), keyring::Error> {

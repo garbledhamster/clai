@@ -89,6 +89,25 @@
   color: var(--color-text-secondary);
 }
 
+.radios {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+}
+
+.radios legend {
+  margin-bottom: 8px;
+}
+
+.protected {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .details label:last-child {
   flex: 1;
   min-height: 0;

@@ -1,5 +1,5 @@
 //! Settings-only management. These commands are never registered as agent tools.
-use crate::variables::{SaveVariable, VariableMetadata};
+use crate::variables::{SaveVariable, VariableMetadata, VariableSaveResult};
 use crate::AppState;
 use std::collections::HashSet;
 use tauri::State;
@@ -10,10 +10,19 @@ pub fn variables_list(state: State<'_, AppState>) -> Result<Vec<VariableMetadata
 }
 
 #[tauri::command]
+pub fn variables_reveal(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u32,
+) -> Result<String, String> {
+    state.variables.reveal(&id, expected_revision)
+}
+
+#[tauri::command]
 pub fn variables_save(
     state: State<'_, AppState>,
     input: SaveVariable,
-) -> Result<VariableMetadata, String> {
+) -> Result<VariableSaveResult, String> {
     let workspaces: HashSet<String> = state
         .workspace_index
         .read()
