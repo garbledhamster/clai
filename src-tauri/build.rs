@@ -2,6 +2,11 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CLAI_PREVIEW_HOME");
+    if let Ok(home) = std::env::var("CLAI_PREVIEW_HOME") {
+        println!("cargo:rustc-env=CLAI_PREVIEW_HOME={home}");
+    }
+
     // Bake a `git describe` string (e.g. "v26.6.7-38-g6148106") into the
     // binary so the About page can show how far a dev build is past the last
     // release tag. Best-effort: in tarball / vendored builds there's no `.git`

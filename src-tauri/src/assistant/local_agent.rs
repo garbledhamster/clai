@@ -4899,11 +4899,17 @@ fn content_part_text(part: &ContentPart) -> Option<String> {
 }
 
 fn write_mcp_config(url: &str, token: &str) -> Result<PathBuf, LocalAgentRunError> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| LocalAgentRunError::failed("Could not determine config directory"))?
-        .join("clai")
-        .join("tmp");
-    std::fs::create_dir_all(&dir).map_err(|e| LocalAgentRunError::failed(e.to_string()))?;
+    let dir = crate::paths::runtime_tmp_dir()
+        .ok_or_else(|| LocalAgentRunError::failed("Could not determine config directory"))?;
+    write_mcp_config_in(&dir, url, token)
+}
+
+fn write_mcp_config_in(
+    dir: &std::path::Path,
+    url: &str,
+    token: &str,
+) -> Result<PathBuf, LocalAgentRunError> {
+    std::fs::create_dir_all(dir).map_err(|e| LocalAgentRunError::failed(e.to_string()))?;
     let path = dir.join(format!("claude-mcp-{}.json", Uuid::new_v4()));
     let config = serde_json::json!({
         "mcpServers": {
@@ -6537,5 +6543,23 @@ mod tests {
             .expect("fires by its deadline");
         let never = tokio::time::timeout(window() * 50, sleep_until_due(None)).await;
         assert!(never.is_err(), "no deadline never fires");
+    }
+}
+
+#[cfg(test)]
+mod preview_temp_tests {
+    #[test]
+    fn mcp_config_is_written_only_in_resolved_temp_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("preview/tmp");
+        let path =
+            super::write_mcp_config_in(&dir, "http://localhost:1/mcp", "test-token").unwrap();
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["clai"]["headers"]["Authorization"],
+            "Bearer test-token"
+        );
     }
 }

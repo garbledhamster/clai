@@ -244,6 +244,7 @@ struct UpdateManifest {
 
 #[derive(Debug, Clone, Copy)]
 struct SupportProbe<'a> {
+    preview: bool,
     debug_assertions: bool,
     flatpak: bool,
     target_os: &'a str,
@@ -376,6 +377,9 @@ pub async fn install_app_update(
 }
 
 pub fn spawn_startup_check(app: AppHandle) {
+    if crate::preview::is_preview() {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_CHECK_DELAY).await;
         let Some(state) = app.try_state::<AppState>() else {
@@ -416,6 +420,9 @@ pub fn spawn_startup_check(app: AppHandle) {
     reason = "lint debt: cognitive complexity 40 against a budget of 25"
 )]
 async fn download_update_in_background(app: &AppHandle) {
+    if crate::preview::is_preview() {
+        return;
+    }
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
@@ -632,6 +639,7 @@ fn detect_support_status() -> AppUpdateSupportStatus {
     let bundle = tauri::utils::platform::bundle_type().map(|bundle| bundle.to_string());
     let os_release = read_os_release();
     support_from_probe(SupportProbe {
+        preview: crate::preview::is_preview(),
         debug_assertions: cfg!(debug_assertions),
         flatpak: crate::providers::is_flatpak(),
         target_os: std::env::consts::OS,
@@ -644,6 +652,13 @@ fn detect_support_status() -> AppUpdateSupportStatus {
 }
 
 fn support_from_probe(probe: SupportProbe<'_>) -> AppUpdateSupportStatus {
+    if probe.preview {
+        return unsupported(
+            probe,
+            "preview",
+            "Updates are disabled for this isolated CLAI preview.",
+        );
+    }
     if probe.debug_assertions {
         return unsupported(
             probe,
@@ -831,6 +846,7 @@ mod tests {
 
     fn probe<'a>(target_os: &'a str, bundle_type: Option<&'a str>) -> SupportProbe<'a> {
         SupportProbe {
+            preview: false,
             debug_assertions: false,
             flatpak: false,
             target_os,
@@ -839,6 +855,23 @@ mod tests {
             os_release: None,
             has_dpkg: false,
             has_rpm: false,
+        }
+    }
+
+    #[test]
+    fn preview_disables_checks_installation_and_background_downloads() {
+        for (os, bundle) in [("macos", "app"), ("linux", "deb"), ("windows", "msi")] {
+            let mut candidate = probe(os, Some(bundle));
+            candidate.preview = true;
+            candidate.flatpak = true;
+            let status = support_from_probe(candidate);
+            assert!(!status.supported);
+            assert!(!status.can_check);
+            assert_eq!(status.channel, "preview");
+            assert!(!should_download_in_background(
+                &status,
+                &sample_info("26.8.1")
+            ));
         }
     }
 

@@ -33,6 +33,7 @@ mod config;
 mod db;
 mod mcp;
 mod paths;
+mod preview;
 mod providers;
 mod system_apps;
 mod windows_console;
@@ -341,6 +342,10 @@ impl AppState {
     reason = "lint debt: 220 lines against a 100-line budget; split it, do not raise the budget"
 )]
 pub fn run() {
+    // A preview must select and validate its fixed profile before any startup
+    // cleanup, configuration writes, discovery, or background work.
+    preview::prepare_startup_or_exit();
+
     // Initialize tracing (structured logging)
     // In development, this outputs to stderr with colors
     // RUST_LOG env var can control log levels (e.g., RUST_LOG=debug)
@@ -444,13 +449,13 @@ pub fn run() {
     };
 
     // Build and run the Tauri application
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Register Tauri plugins
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init());
+    preview::configure_updater(builder)
         // Make our state available to all commands
         // Commands can access it via State<'_, AppState>
         .manage(state)
