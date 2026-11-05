@@ -69,7 +69,9 @@ pub(crate) async fn run_command_guarded(
         if variables.in_use() && !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err("Variables execution is unavailable: registry isolation cannot be enforced on this platform".into());
         }
-        if variables.in_use() && cfg!(any(target_os = "macos", target_os = "linux")) {
+        if variables.requires_registry_isolation()
+            && cfg!(any(target_os = "macos", target_os = "linux"))
+        {
             command
                 .profile
                 .filesystem

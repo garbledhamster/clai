@@ -33,6 +33,7 @@ pub(crate) struct ResolvedVariables {
     pub(super) workspace_id: String,
     pub(super) revisions: Vec<VariableRevision>,
     pub(super) in_use: bool,
+    pub(super) isolate_registry: bool,
     pub(super) definitions: Arc<Mutex<Vec<super::StoredDefinition>>>,
 }
 
@@ -51,6 +52,9 @@ impl ResolvedVariables {
     }
     pub(crate) fn registry_directory(&self) -> &std::path::Path {
         &self.directory
+    }
+    pub(crate) fn requires_registry_isolation(&self) -> bool {
+        self.isolate_registry
     }
     pub(crate) fn admit<T>(&self, spawn: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let definitions = self

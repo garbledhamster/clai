@@ -159,6 +159,24 @@ impl EffectiveFilesystemPolicy {
                     required: false,
                 }),
         );
+        // A masked child mount follows an ancestor rename on Linux. Pin every
+        // already-authorized ancestor with a self bind so it cannot be moved.
+        // Sort these with the original grants: later workspace masks must still
+        // hide sibling workspaces. Never expose an otherwise unavailable path.
+        for denied in &self.denied_paths {
+            for ancestor in denied.ancestors().skip(1) {
+                let access = if self.covers(ancestor, FilesystemPathAccess::ReadWrite) {
+                    SandboxPathAccess::ReadWrite
+                } else if self.covers(ancestor, FilesystemPathAccess::ReadOnly) {
+                    SandboxPathAccess::ReadOnly
+                } else {
+                    continue;
+                };
+                if !ops.iter().any(|op| matches!(op, FilesystemOperation::Expose { path, .. } if *path == ancestor)) {
+                    ops.push(FilesystemOperation::Expose { path: ancestor, access, required: true });
+                }
+            }
+        }
         if let Some(mask) = &self.mask {
             ops.push(FilesystemOperation::Mask(mask));
         }

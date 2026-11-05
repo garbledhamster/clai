@@ -18,6 +18,7 @@ pub use types::{
 
 pub struct VariablesRegistry {
     directory: PathBuf,
+    directory_anchored: bool,
     definitions: Arc<Mutex<Vec<StoredDefinition>>>,
     credentials: Arc<dyn CredentialStore>,
     directory_sync: fn(&std::path::Path) -> std::io::Result<()>,
@@ -55,6 +56,14 @@ impl VariablesRegistry {
         if approved.is_some_and(|approved| approved != revisions) {
             return Err("Assigned Variables changed. Review a fresh approval.".into());
         }
+        // Establish a stable, empty isolation target before the first field is
+        // saved, so an already-running child cannot read later definitions.
+        // An unavailable unused profile must retain legacy execution behavior.
+        let isolate_registry =
+            self.directory_anchored && prepare_directory(&self.directory).is_ok();
+        if !isolate_registry && !definitions.is_empty() {
+            return Err("Variables registry is unavailable".into());
+        }
         let mut values = std::collections::BTreeMap::new();
         let mut protected = Vec::new();
         for definition in definitions
@@ -90,6 +99,7 @@ impl VariablesRegistry {
             workspace_id: workspace_id.into(),
             revisions,
             in_use: !definitions.is_empty(),
+            isolate_registry,
             definitions: self.definitions.clone(),
         })
     }
@@ -156,8 +166,15 @@ impl VariablesRegistry {
                 return Err("Variables registry contains invalid definitions; restore a valid registry before continuing".into());
             }
         }
+        // Persistence and sandbox denial must share one stable identity. Never
+        // follow a mutable configured alias again after a child has started.
+        let anchored = prepare_directory(&directory)
+            .ok()
+            .and_then(|_| crate::assistant::sandbox::filesystem::resolve(&directory).ok());
+        let directory_anchored = anchored.is_some();
         Ok(Self {
-            directory,
+            directory: anchored.unwrap_or(directory),
+            directory_anchored,
             definitions: Arc::new(Mutex::new(definitions)),
             credentials,
             directory_sync: |path| std::fs::File::open(path)?.sync_all(),
@@ -181,6 +198,9 @@ impl VariablesRegistry {
         input: SaveVariable,
         known_workspaces: &HashSet<String>,
     ) -> Result<VariableSaveResult, String> {
+        if !self.directory_anchored {
+            return Err("Variables registry path is unavailable; restore the profile and restart before saving".into());
+        }
         let mut definitions = self
             .definitions
             .lock()
@@ -282,7 +302,7 @@ impl VariablesRegistry {
 
     fn persist(&self, candidate: &[StoredDefinition]) -> Result<RegistryCommit, String> {
         use std::io::Write;
-        std::fs::create_dir_all(&self.directory).map_err(|_| "Variables could not be saved")?;
+        prepare_directory(&self.directory).map_err(|_| "Variables could not be saved")?;
         let staging = self.directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let bytes =
             serde_json::to_vec_pretty(&candidate).map_err(|_| "Variables could not be encoded")?;
@@ -311,6 +331,17 @@ impl VariablesRegistry {
             RegistryCommit::Uncertain
         })
     }
+}
+
+fn prepare_directory(directory: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)
 }
 
 #[derive(Clone, Copy)]

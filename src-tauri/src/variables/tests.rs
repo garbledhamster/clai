@@ -43,6 +43,26 @@ fn text_save_reload_and_workspace_filter_preserve_literal_value() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unanchored_profile_cannot_begin_writes_after_external_repair_without_reopening() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("unavailable");
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let directory = alias.join("variables");
+    let registry = VariablesRegistry::open(directory.clone()).unwrap();
+    std::fs::create_dir(target).unwrap();
+    assert!(registry
+        .save(create("MESSAGE", "must-not-write"), &known())
+        .is_err());
+    assert!(!directory.join("registry.json").exists());
+    assert!(VariablesRegistry::open(directory)
+        .unwrap()
+        .save(create("MESSAGE", "available-after-reopen"), &known())
+        .is_ok());
+}
+
 fn create(name: &str, value: &str) -> SaveVariable {
     SaveVariable {
         id: None,
@@ -669,7 +689,7 @@ fn uncertain_directory_durability_preserves_both_credentials_and_reports_committ
     assert_eq!(reopened.list(None).unwrap(), vec![result.definition]);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn native_command(
     workspace: &std::path::Path,
     home: &std::path::Path,
@@ -702,7 +722,7 @@ fn native_command(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn protected_shell_results_suppress_payload_and_keep_surrounding_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -736,7 +756,7 @@ async fn protected_shell_results_suppress_payload_and_keep_surrounding_output() 
     assert!(output.stdout.starts_with("before:") && output.stdout.ends_with(":after"));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn unassigned_shell_cannot_read_registry_through_broad_grants_or_aliases() {
     let temp = tempfile::tempdir().unwrap();
@@ -767,7 +787,7 @@ async fn unassigned_shell_cannot_read_registry_through_broad_grants_or_aliases()
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn revoked_snapshot_cannot_start_a_later_process() {
     let temp = tempfile::tempdir().unwrap();
@@ -829,7 +849,7 @@ fn unassigned_resolution_does_not_read_credentials_or_leak_payloads_in_debug() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn protected_output_is_suppressed_before_character_truncation() {
     let temp = tempfile::tempdir().unwrap();
@@ -858,7 +878,7 @@ async fn protected_output_is_suppressed_before_character_truncation() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn registry_cannot_be_relocated_or_hardlinked_out_of_its_denial() {
     let temp = tempfile::tempdir().unwrap();
@@ -918,7 +938,7 @@ async fn registry_cannot_be_relocated_or_hardlinked_out_of_its_denial() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn child_serializes_boolean_number_and_preserves_base_environment() {
     let temp = tempfile::tempdir().unwrap();
@@ -970,7 +990,7 @@ async fn child_serializes_boolean_number_and_preserves_base_environment() {
     assert_eq!(output.stdout, "unset");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn unused_variables_do_not_require_an_available_registry_path_for_legacy_shell() {
     let temp = tempfile::tempdir().unwrap();
@@ -991,7 +1011,7 @@ async fn unused_variables_do_not_require_an_available_registry_path_for_legacy_s
     assert_eq!(result.unwrap().stdout, "legacy");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn first_definition_invalidates_an_empty_snapshot_before_process_admission() {
     let temp = tempfile::tempdir().unwrap();
@@ -1006,4 +1026,86 @@ async fn first_definition_invalidates_an_empty_snapshot_before_process_admission
         .await
         .is_err());
     assert!(!workspace.join("SHOULD_NOT_START").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn an_already_running_unassigned_child_cannot_read_a_later_first_definition() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let directory = temp.path().join("profile/variables");
+    let registry = Arc::new(VariablesRegistry::open(directory.clone()).unwrap());
+    let command = native_command(
+        &workspace,
+        temp.path(),
+        &format!(
+            "touch ready; while ! test -f continue; do sleep 0.01; done; cat '{}'",
+            directory.join("registry.json").display()
+        ),
+    );
+    let child = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !workspace.join("ready").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry
+        .save(create("MESSAGE", "future-private-registry-value"), &known())
+        .unwrap();
+    std::fs::write(workspace.join("continue"), "").unwrap();
+    let output = child.await.unwrap().unwrap();
+    assert!(
+        !output.stdout.contains("future-private-registry-value"),
+        "registry isolation must survive first-definition creation after launch"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn registry_profile_alias_cannot_redirect_app_writes_outside_running_child_isolation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let original = temp.path().join("original-profile");
+    let redirected = temp.path().join("redirected-profile");
+    for directory in [&workspace, &original, &redirected] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    let alias = temp.path().join("profile-alias");
+    std::os::unix::fs::symlink(&original, &alias).unwrap();
+    let registry = Arc::new(VariablesRegistry::open(alias.join("variables")).unwrap());
+    let command = native_command(&workspace, temp.path(), &format!(
+        "rm '{}'; ln -s '{}' '{}'; touch ready; while ! test -f continue; do sleep 0.01; done; cat '{}'",
+        alias.display(), redirected.display(), alias.display(), redirected.join("variables/registry.json").display()));
+    let child = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            crate::assistant::tools::local::run_workspace_command(&registry, WORKSPACE_B, command)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !workspace.join("ready").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry
+        .save(create("MESSAGE", "alias-private-registry-value"), &known())
+        .unwrap();
+    std::fs::write(workspace.join("continue"), "").unwrap();
+    let output = child.await.unwrap().unwrap();
+    assert!(
+        !output.stdout.contains("alias-private-registry-value"),
+        "a configured symlink must not redirect future app writes outside isolation"
+    );
 }
