@@ -108,9 +108,23 @@
   gap: 8px;
 }
 
-.details label:last-child {
-  flex: 1;
-  min-height: 0;
+.details > label:last-child {
+  flex: 1 0 64px;
+  min-height: 64px;
+}
+
+.details,
+.workspaces {
+  overflow-y: auto;
+}
+
+.details > *,
+.workspaces > * {
+  flex-shrink: 0;
+}
+
+.workspaces > .list {
+  flex: 1 0 80px;
 }
 
 .details textarea {
@@ -198,5 +212,26 @@
   .details input,
   .details select {
     padding: 6px 8px;
+  }
+}
+
+@media (max-width: 760px) and (max-height: 500px) {
+  .page {
+    grid-template-rows: 32px minmax(0, 1fr);
+  }
+
+  .fields {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .fields .heading {
+    flex-shrink: 0;
+  }
+
+  .fields .list {
+    align-self: stretch;
+    align-items: center;
   }
 }
