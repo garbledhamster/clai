@@ -229,6 +229,23 @@ it('rejects blank numeric input and saves a finite decimal Number', async () => 
   expect(screen.getByRole('spinbutton', { name: 'Value' })).toHaveValue(-12.5);
 });
 
+it('clears the earlier Saved status when an invalid Number cannot be saved', async () => {
+  const user = userEvent.setup();
+  render(<VariablesSettings />);
+  await user.click(await screen.findByRole('button', { name: 'Add field' }));
+  await user.type(screen.getByLabelText('Name', { exact: true }), 'AMOUNT');
+  await user.selectOptions(screen.getByLabelText('Type'), 'number');
+  await user.type(screen.getByRole('spinbutton', { name: 'Value' }), '12.5');
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByRole('status')).toHaveTextContent('Saved');
+  await user.clear(screen.getByRole('spinbutton', { name: 'Value' }));
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('Enter a finite number');
+  expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  expect(backend.records[0]?.value).toBe(12.5);
+  expect(screen.getByRole('spinbutton', { name: 'Value' })).toHaveValue(null);
+});
+
 it('masks saved protected strings until deliberate reveal and remasks on selection', async () => {
   backend.records = [
     { id: 'secret', revision: 1, kind: 'protected', name: 'SECRET', value: null, workspaceIds: [] },

@@ -56,6 +56,14 @@ const SkillsIcon = () => (
   </svg>
 );
 
+const VariablesIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M8 3H6a2 2 0 0 0-2 2v4a3 3 0 0 1-2 3 3 3 0 0 1 2 3v4a2 2 0 0 0 2 2h2" />
+    <path d="M16 3h2a2 2 0 0 1 2 2v4a3 3 0 0 0 2 3 3 3 0 0 0-2 3v4a2 2 0 0 1-2 2h-2" />
+    <path d="M10 9h4m-4 6h4" />
+  </svg>
+);
+
 const AppsIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <rect x="3" y="3" width="7" height="7" rx="1" />
@@ -98,7 +106,7 @@ type TabValue = (typeof TABS)[keyof typeof TABS];
 const NAV: { tab: TabValue; label: string; Icon: () => React.JSX.Element }[] = [
   { tab: TABS.PROVIDER, label: 'AI Provider', Icon: ProviderIcon },
   { tab: TABS.AGENTS, label: 'Agents', Icon: AgentsIcon },
-  { tab: TABS.VARIABLES, label: 'Variables', Icon: SkillsIcon },
+  { tab: TABS.VARIABLES, label: 'Variables', Icon: VariablesIcon },
   { tab: TABS.SKILLS, label: 'Skills', Icon: SkillsIcon },
   { tab: TABS.MCP_SERVERS, label: 'MCP Servers', Icon: PlugIcon },
   { tab: TABS.APPLICATIONS, label: 'Applications', Icon: AppsIcon },

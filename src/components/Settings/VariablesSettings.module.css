@@ -109,13 +109,13 @@
 }
 
 .details > label:last-child {
-  flex: 1 0 64px;
-  min-height: 64px;
+  flex: 1;
+  min-height: 0;
 }
 
 .details,
 .workspaces {
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .details > *,
@@ -124,12 +124,13 @@
 }
 
 .workspaces > .list {
-  flex: 1 0 80px;
+  flex: 1;
 }
 
 .details textarea {
   flex: 1;
   min-height: 32px;
+  overflow: auto;
   resize: none;
 }
 
@@ -215,7 +216,55 @@
   }
 }
 
-@media (max-width: 760px) and (max-height: 500px) {
+/* Narrow windows keep Name and Type together so the value stays in view.
+   Only the field and workspace lists scroll; the form fills the pane. */
+@media (max-width: 760px) {
+  .details {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(144px, 1.2fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+    align-content: start;
+  }
+
+  .details > * {
+    grid-column: 1 / -1;
+    min-height: 0;
+  }
+
+  .details > label:first-of-type {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .details > label:nth-of-type(2) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .details > .warning {
+    grid-row: 2;
+  }
+
+  .details > :last-child {
+    grid-row: 3;
+  }
+
+  .protected {
+    align-self: start;
+  }
+
+  .radios {
+    align-self: start;
+  }
+
+  .workspaces > h3 {
+    display: none;
+  }
+}
+
+/* Short narrow windows need one compact field selector row to leave
+   room for the stored Protected actions and both explanatory messages. */
+@media (max-width: 760px) and (max-height: 650px) {
   .page {
     grid-template-rows: 32px minmax(0, 1fr);
   }
@@ -233,5 +282,61 @@
   .fields .list {
     align-self: stretch;
     align-items: center;
+  }
+}
+
+/* At desktop 200% zoom, put both selectors on one toolbar row. This
+   gives the form the same usable height as the tall narrow windows. */
+@media (max-width: 760px) and (max-height: 500px) {
+  .page {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: 32px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+
+  .editor {
+    display: contents;
+  }
+
+  .sectionTabs {
+    align-items: center;
+    gap: 4px;
+  }
+
+  .columns,
+  .footer,
+  .editor > p {
+    grid-column: 1 / -1;
+  }
+
+  .details,
+  .workspaces {
+    gap: 6px;
+    font-size: 12px;
+    line-height: 1.3;
+  }
+
+  .details input,
+  .details select,
+  .workspaces input {
+    padding: 4px 8px;
+  }
+
+  .protected {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 8px;
+  }
+
+  .protected .heading {
+    align-self: end;
+  }
+
+  .protected > .warning {
+    grid-column: 1 / -1;
+  }
+
+  .footer {
+    padding-top: 8px;
   }
 }

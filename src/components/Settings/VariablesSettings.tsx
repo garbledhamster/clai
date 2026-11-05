@@ -115,6 +115,7 @@ const VariablesSettings = ({ ref }: { ref?: Ref<VariablesHandle> }) => {
   }, []);
   const save = async () => {
     if (!draft) return false;
+    setStatus('');
     if (
       draft.kind === 'number' &&
       (String(draft.value).trim() === '' || !Number.isFinite(Number(draft.value)))
@@ -124,7 +125,6 @@ const VariablesSettings = ({ ref }: { ref?: Ref<VariablesHandle> }) => {
     }
     setSaving(true);
     setError('');
-    setStatus('');
     try {
       const outcome = await saveVariable({
         id: draft.id,
