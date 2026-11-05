@@ -73,7 +73,9 @@ impl CleanupIntent {
         workspace_id: &str,
     ) -> Result<CapturedScript, String> {
         let captured = scripts::capture(state, workspace_id, &self.script)?;
-        if !self.identity.allows(&captured)
+        // The original script and non-Variable access stay bound. Changed
+        // Variables require fresh consent below, rather than losing cleanup.
+        if !self.identity.same_input_and_access(&captured)
             || self.content != captured.content
             || self.interpreter != captured.interpreter.display().to_string()
         {
@@ -184,6 +186,10 @@ pub(crate) async fn approve_phase(
         let unchanged = current
             .as_ref()
             .is_ok_and(|current| current.same_approval(&snapshot));
+        let variable_change_only = !unchanged
+            && current
+                .as_ref()
+                .is_ok_and(|current| snapshot.same_input_and_access(current));
         let consent = if phase == ScriptPhase::After {
             bound_consent.clone()
         } else {
@@ -199,7 +205,11 @@ pub(crate) async fn approve_phase(
         {
             return Ok(Some(snapshot));
         }
-        if phase != ScriptPhase::After {
+        if phase != ScriptPhase::After
+            || current
+                .as_ref()
+                .is_ok_and(|current| snapshot.same_input_and_access(current))
+        {
             snapshot = current.map_err(RunnerError::AssistantPersistence)?;
         }
         let (send, mut receive) = oneshot::channel();
@@ -208,7 +218,12 @@ pub(crate) async fn approve_phase(
             let runtime = scheduler.scripts.entry(workspace_id.into()).or_default();
             runtime.request_for(snapshot.clone(), "scheduled", phase, Some(send));
             if !unchanged && phase == ScriptPhase::After {
-                runtime.error = Some("The bound cleanup input or access changed. Restore it or explicitly Skip cleanup.".into());
+                runtime.error = Some(if variable_change_only {
+                    "Assigned Variables changed. Review the new cleanup approval before it can run."
+                        .into()
+                } else {
+                    "The bound cleanup input or access changed. Restore it or explicitly Skip cleanup.".into()
+                });
             }
         }
         let approved = loop {

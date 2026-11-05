@@ -108,7 +108,9 @@ pub(crate) async fn resolve_approval(
         let current = match current {
             Ok(current) if pending.snapshot.same_approval(&current) => current,
             Ok(current) => {
-                if pending.approval.phase == Some(ScriptPhase::After) && pending.decision.is_some()
+                if pending.approval.phase == Some(ScriptPhase::After)
+                    && pending.decision.is_some()
+                    && !pending.snapshot.same_input_and_access(&current)
                 {
                     let runtime = scheduler
                         .scripts
@@ -207,7 +209,10 @@ pub(crate) async fn authorize_condition(
     let current = match scripts::capture(state, workspace_id, &pending.snapshot.config) {
         Ok(current) if current.same_approval(&pending.snapshot) => current,
         Ok(current) => {
-            if phase == ScriptPhase::After && pending.decision.is_some() {
+            if phase == ScriptPhase::After
+                && pending.decision.is_some()
+                && !pending.snapshot.same_input_and_access(&current)
+            {
                 runtime.error = Some("The bound cleanup input or access changed. Restore it or explicitly Skip cleanup.".into());
                 runtime.pending = Some(pending);
                 return Err(

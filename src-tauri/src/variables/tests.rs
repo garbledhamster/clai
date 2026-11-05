@@ -334,6 +334,134 @@ fn protected_grant_only_save_keeps_unrevealed_value_and_rejects_stale_reveal() {
     assert!(registry.list(Some(WORKSPACE_A)).unwrap().is_empty());
 }
 
+// Stale script approval must be rejected before unlocking even a replacement credential.
+#[test]
+fn approved_resolution_checks_revisions_before_any_protected_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(TestCredentials::default());
+    let registry = VariablesRegistry::open_with_credentials(
+        temp.path().join("variables"),
+        credentials.clone(),
+    )
+    .unwrap();
+    let first = registry
+        .save(protected("TOKEN", Some("old-disposable")), &known())
+        .unwrap()
+        .definition;
+    let approved = vec![VariableRevision {
+        id: first.id.clone(),
+        revision: first.revision,
+    }];
+    let mut replacement = protected("TOKEN", Some("new-disposable"));
+    replacement.id = Some(first.id);
+    replacement.expected_revision = Some(first.revision);
+    registry.save(replacement, &known()).unwrap();
+    credentials
+        .fail_read
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(registry.resolve_approved(WORKSPACE_A, &approved).is_err());
+    assert_eq!(
+        credentials.reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the unapproved replacement must not be read from native storage"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn script_approval_and_cleanup_records_never_resolve_or_serialize_protected_payloads() {
+    use crate::agents::scripts::{self, ScriptConfig, ScriptPhase, ScriptSource};
+    use crate::config::{
+        workspace_config, AppConfig, ConfigManager, ShellAccessMode, WorkspaceConfig,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let mut workspace =
+        WorkspaceConfig::new(WORKSPACE_A.into(), "Variables QA".into(), 0, "main".into());
+    workspace.main_agent.as_mut().unwrap().execution.shell.mode = ShellAccessMode::Full;
+    workspace
+        .main_agent
+        .as_mut()
+        .unwrap()
+        .execution
+        .shell
+        .blocked_command_prefixes
+        .clear();
+    workspace_config::save(temp.path(), &workspace).unwrap();
+    let mut index = crate::WorkspaceIndex::default();
+    index.insert_config(temp.path().into(), &workspace);
+    let mut state = crate::AppState::new_for_tests(
+        ConfigManager::new_for_tests(AppConfig::default(), temp.path().join("app.json")),
+        index,
+    )
+    .unwrap();
+    let credentials = Arc::new(TestCredentials::default());
+    state.variables = VariablesRegistry::open_with_credentials(
+        temp.path().join("variables"),
+        credentials.clone(),
+    )
+    .unwrap();
+    let saved = state
+        .variables
+        .save(
+            protected("TOKEN", Some("disposable-record-secret")),
+            &known(),
+        )
+        .unwrap()
+        .definition;
+    credentials
+        .fail_read
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let script = ScriptConfig {
+        source: ScriptSource::Inline {
+            content: "printf '%s' \"${CLAI_VAR_TOKEN?}\"".into(),
+        },
+        interpreter: "/bin/sh".into(),
+        timeout_seconds: 5,
+    };
+    let snapshot = scripts::capture(&state, WORKSPACE_A, &script).unwrap();
+    let consent = snapshot.consent();
+    let approval = state
+        .scheduler
+        .lock()
+        .await
+        .scripts
+        .entry(WORKSPACE_A.into())
+        .or_default()
+        .request_for(snapshot.clone(), "test", ScriptPhase::After, None);
+    let intent = crate::agents::hooks::persist_intent(
+        &state,
+        WORKSPACE_A,
+        "session",
+        "run",
+        &snapshot,
+        Some(consent.clone()),
+    )
+    .unwrap();
+    let persisted = std::fs::read_to_string(workspace_config::config_path(temp.path())).unwrap();
+    let records = serde_json::to_string(&(
+        consent,
+        approval,
+        intent,
+        workspace_config::load(temp.path()).unwrap(),
+        persisted,
+    ))
+    .unwrap();
+    assert!(!records.contains("disposable-record-secret"));
+    assert!(!records.contains("credentialReference"));
+    assert!(records.contains(&saved.id));
+    assert_eq!(
+        credentials.reads.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let result = snapshot.execute(&state, WORKSPACE_A).await;
+    assert_eq!(result.started, Some(false));
+    assert!(result.error.is_some());
+    assert!(
+        !result.condition_allows(),
+        "credential failure must not become a successful condition"
+    );
+}
+
 #[test]
 fn failed_protected_registry_commit_removes_staged_replacement_and_preserves_previous() {
     let temp = tempfile::tempdir().unwrap();

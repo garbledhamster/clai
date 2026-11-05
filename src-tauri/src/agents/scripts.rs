@@ -170,6 +170,7 @@ pub(crate) struct CapturedScript {
     pub interpreter: PathBuf,
     pub access: String,
     identity: String,
+    variable_revisions: Vec<crate::variables::VariableRevision>,
     invocation: String,
     profile: SandboxProfile,
     start_lease: Option<super::scheduler::DispatchLease>,
@@ -181,11 +182,16 @@ pub(crate) struct CapturedScript {
 pub struct ScriptConsent {
     version: u8,
     identity: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    variables: Vec<crate::variables::VariableRevision>,
 }
 
 impl ScriptConsent {
-    pub(crate) fn allows(&self, snapshot: &CapturedScript) -> bool {
+    pub(crate) fn same_input_and_access(&self, snapshot: &CapturedScript) -> bool {
         self.version == 1 && self.identity == snapshot.identity
+    }
+    pub(crate) fn allows(&self, snapshot: &CapturedScript) -> bool {
+        self.same_input_and_access(snapshot) && self.variables == snapshot.variable_revisions
     }
 }
 
@@ -376,7 +382,39 @@ pub(crate) fn capture(
         .workspace_root(workspace_id)
         .ok_or("Workspace not found.")?;
     let (workspace, roster) = state.resolve_workspace_roster(workspace_id)?;
-    capture_with_roster(&root, &workspace, &roster, script)
+    bind_variables(
+        capture_with_roster(&root, &workspace, &roster, script)?,
+        state,
+        workspace_id,
+    )
+}
+
+fn bind_variables(
+    mut captured: CapturedScript,
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<CapturedScript, String> {
+    // Metadata only: approval/capture must never unlock or read a credential.
+    let mut fields = state.variables.list(Some(workspace_id))?;
+    fields.sort_by(|a, b| a.id.cmp(&b.id));
+    captured.variable_revisions = fields
+        .iter()
+        .map(|field| crate::variables::VariableRevision {
+            id: field.id.clone(),
+            revision: field.revision,
+        })
+        .collect();
+    if !fields.is_empty() {
+        captured
+            .access
+            .push_str("\nAssigned Variables (values hidden):");
+        for field in fields {
+            captured
+                .access
+                .push_str(&format!("\nCLAI_VAR_{} ({:?})", field.name, field.kind));
+        }
+    }
+    Ok(captured)
 }
 
 fn capture_with_roster(
@@ -410,7 +448,11 @@ pub(crate) fn capture_for_config(
         .workspace_root(&workspace.id)
         .ok_or("Workspace not found.")?;
     let (_, roster) = state.resolve_roster_for(workspace.clone())?;
-    capture_with_roster(&root, workspace, &roster, script)
+    bind_variables(
+        capture_with_roster(&root, workspace, &roster, script)?,
+        state,
+        &workspace.id,
+    )
 }
 
 pub(crate) fn saved_consent(
@@ -540,6 +582,7 @@ fn capture_with_execution(
         interpreter,
         access,
         identity,
+        variable_revisions: vec![],
         invocation,
         profile,
         start_lease: None,
@@ -597,9 +640,13 @@ impl CapturedScript {
         ScriptConsent {
             version: 1,
             identity: self.identity.clone(),
+            variables: self.variable_revisions.clone(),
         }
     }
     pub fn same_approval(&self, other: &Self) -> bool {
+        self.same_input_and_access(other) && self.variable_revisions == other.variable_revisions
+    }
+    pub(crate) fn same_input_and_access(&self, other: &Self) -> bool {
         self.identity == other.identity
     }
     pub(crate) fn guard_start(mut self, lease: &super::scheduler::DispatchLease) -> Self {
@@ -631,10 +678,14 @@ impl CapturedScript {
                 &self.invocation,
                 true,
             )?;
-            interpreter_flag(&self.config.interpreter)
+            let flag = interpreter_flag(&self.config.interpreter)?;
+            let variables = state
+                .variables
+                .resolve_approved(workspace_id, &self.variable_revisions)?;
+            Ok((flag, variables))
         })();
-        let flag = match preparation {
-            Ok(flag) => flag,
+        let (flag, variables) = match preparation {
+            Ok(prepared) => prepared,
             Err(error) => {
                 return ScriptResult {
                     started: Some(false),
@@ -648,6 +699,8 @@ impl CapturedScript {
                 .as_ref()
                 .is_none_or(|lease| lease.try_start_script(&clock))
         };
+        let mut profile = self.profile.clone();
+        profile.variables = Some(variables);
         let result = crate::assistant::sandbox::runner::run_command_guarded(
             SandboxCommand {
                 argv: vec![
@@ -658,7 +711,7 @@ impl CapturedScript {
                 cwd: self.profile.filesystem.workspace_root.clone(),
                 timeout_ms: u64::from(self.config.timeout_seconds) * 1000,
                 max_output_chars: OUTPUT_LIMIT,
-                profile: self.profile.clone(),
+                profile,
             },
             Some(&check),
         )
@@ -932,9 +985,18 @@ mod tests {
         blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
         wall_ms: i64,
     ) -> Fixture {
+        fixture_for(script, blocks, wall_ms, "ws").await
+    }
+    async fn fixture_for(
+        script: Option<ScriptConfig>,
+        blocks: Option<crate::agents::weekly_blocks::WeeklyAllowedBlocks>,
+        wall_ms: i64,
+        workspace_id: &str,
+    ) -> Fixture {
         let (tmp, pool) = crate::db::test_support::workspace_pool().await;
         let root = tmp.path().to_path_buf();
-        let mut workspace = WorkspaceConfig::new("ws".into(), "Workspace".into(), 0, "main".into());
+        let mut workspace =
+            WorkspaceConfig::new(workspace_id.into(), "Workspace".into(), 0, "main".into());
         workspace.main_agent.as_mut().unwrap().execution = execution();
         workspace.schedule.enabled = true;
         workspace.schedule.kind = crate::config::workspace_config::ScheduleKind::EnhancedInterval {
@@ -951,7 +1013,7 @@ mod tests {
             let start = Instant::now() - Duration::from_secs(30);
             scheduler.set_wake_monitor_available(true, 0, start);
             scheduler.register_definition(
-                crate::agents::AgentDefinition::new("main", "Main").with_workspace_id("ws"),
+                crate::agents::AgentDefinition::new("main", "Main").with_workspace_id(workspace_id),
             );
             scheduler.create_instance("main").unwrap();
             scheduler
@@ -3015,6 +3077,299 @@ mod tests {
         assert_eq!(result.started, Some(true));
         assert_eq!(result.exit_code, Some(0));
         assert!(f.root.join("after-started").exists());
+    }
+
+    mod variables {
+        use super::*;
+        use crate::variables::{SaveVariable, VariableInput, VariableMetadata};
+        const ID: &str = "9b43ef75-7edb-45e2-995f-f5459f2e8dde";
+
+        fn save(f: &Fixture, value: &str, previous: Option<&VariableMetadata>) -> VariableMetadata {
+            f.state
+                .variables
+                .save(
+                    SaveVariable {
+                        id: previous.map(|p| p.id.clone()),
+                        expected_revision: previous.map(|p| p.revision),
+                        name: "MESSAGE".into(),
+                        value: VariableInput::Text {
+                            value: value.into(),
+                        },
+                        workspace_ids: vec![ID.into()],
+                    },
+                    &[ID.into()].into(),
+                )
+                .unwrap()
+                .definition
+        }
+
+        // Removing resolver delivery must fail actual interpreter execution in every manual phase.
+        #[tokio::test]
+        async fn manual_phase_tests_receive_literal_assigned_data_without_rewriting_source() {
+            let f = fixture_for(None, None, 0, ID).await;
+            let literal = "a 'quote'\n$(touch SHOULD_NOT_EXIST)";
+            save(&f, literal, None);
+            repository::complete_run(&f.pool, &f.run.id, RunStatus::Cancelled, None)
+                .await
+                .unwrap();
+            *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+            let script = inline("printf '%s' \"${CLAI_VAR_MESSAGE?Missing or unavailable}\"");
+            for phase in [
+                ScriptPhase::Condition,
+                ScriptPhase::Before,
+                ScriptPhase::After,
+            ] {
+                let snapshot = capture(&f.state, ID, &script).unwrap();
+                assert_eq!(
+                    snapshot.content,
+                    "printf '%s' \"${CLAI_VAR_MESSAGE?Missing or unavailable}\""
+                );
+                let approval = f
+                    .state
+                    .scheduler
+                    .lock()
+                    .await
+                    .scripts
+                    .entry(ID.into())
+                    .or_default()
+                    .request_for(snapshot, "test", phase, None);
+                let approved = crate::commands::schedule_scripts::resolve_approval(
+                    &f.state,
+                    &f.pool,
+                    ID,
+                    &approval.id,
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let result = approved.execute(&f.state, ID).await;
+                assert_eq!(result.stdout, literal, "{phase:?}: {:?}", result.error);
+                assert_eq!(result.exit_code, Some(0));
+                f.state
+                    .scheduler
+                    .lock()
+                    .await
+                    .scripts
+                    .get_mut(ID)
+                    .unwrap()
+                    .running = false;
+            }
+            assert!(!f.root.join("SHOULD_NOT_EXIST").exists());
+            assert_eq!(
+                f.state.variables.list(Some(ID)).unwrap()[0].value,
+                Some(crate::variables::PlainValue::Text(literal.into()))
+            );
+        }
+
+        #[tokio::test]
+        async fn scheduled_condition_before_and_after_share_the_checked_snapshot() {
+            use crate::agents::hooks::run_prepared_with_executor;
+            let condition = inline("printf 'condition:%s\\n' \"${CLAI_VAR_MESSAGE?}\" >> phases");
+            let before = inline("printf 'before:%s\\n' \"${CLAI_VAR_MESSAGE?}\" >> phases; CLAI_VAR_MESSAGE=child-only");
+            let after = inline("printf 'after:%s\\n' \"${CLAI_VAR_MESSAGE?}\" >> phases");
+            let f = fixture_for(Some(condition.clone()), None, 0, ID).await;
+            save(&f, "assigned", None);
+            let consents = [condition.clone(), before.clone(), after.clone()]
+                .map(|script| capture(&f.state, ID, &script).unwrap().consent());
+            f.state
+                .update_workspace_config(ID, |workspace| {
+                    workspace.schedule.condition_consent = Some(consents[0].clone());
+                    workspace.schedule.before = Some(before.clone());
+                    workspace.schedule.before_consent = Some(consents[1].clone());
+                    workspace.schedule.after = Some(after.clone());
+                    workspace.schedule.after_consent = Some(consents[2].clone());
+                    Ok(())
+                })
+                .unwrap();
+            let outcome = condition_with_executor(
+                &f.state,
+                ID,
+                &f.pool,
+                &f.session.id,
+                &f.lease,
+                |snapshot| snapshot.execute(&f.state, ID),
+            )
+            .await;
+            assert!(matches!(outcome, ConditionOutcome::Allow));
+            let models = AtomicUsize::new(0);
+            run_prepared_with_executor(
+                &f.state,
+                ID,
+                &f.pool,
+                &f.session.id,
+                &f.run.id,
+                &f.lease,
+                tokio_util::sync::CancellationToken::new(),
+                |_| {},
+                |snapshot, _| snapshot.execute(&f.state, ID),
+                || async {
+                    models.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(models.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                std::fs::read_to_string(f.root.join("phases")).unwrap(),
+                "condition:assigned\nbefore:assigned\nafter:assigned\n"
+            );
+            assert_eq!(
+                f.state.variables.list(Some(ID)).unwrap()[0].value,
+                Some(crate::variables::PlainValue::Text("assigned".into()))
+            );
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_none());
+        }
+
+        // An approved script must not start with a later value or silently use its earlier value.
+        #[tokio::test]
+        async fn value_change_invalidates_captured_and_saved_script_consent_before_execution() {
+            let f = fixture_for(None, None, 0, ID).await;
+            let first = save(&f, "one", None);
+            let script = inline("touch SHOULD_NOT_START");
+            let approved = capture(&f.state, ID, &script).unwrap();
+            let consent = approved.consent();
+            save(&f, "two", Some(&first));
+            assert!(
+                !consent.allows(&capture(&f.state, ID, &script).unwrap()),
+                "saved consent must bind the assigned revision"
+            );
+            let result = approved.execute(&f.state, ID).await;
+            assert_eq!(result.started, Some(false));
+            assert!(result.error.is_some());
+            assert!(!f.root.join("SHOULD_NOT_START").exists());
+        }
+
+        async fn approve_current(f: &Fixture) {
+            let approval = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(approval) = f
+                        .state
+                        .scheduler
+                        .lock()
+                        .await
+                        .script_status_for(ID, ScriptPhase::After)
+                        .pending
+                    {
+                        break approval;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !f.root.join("after-data").exists(),
+                "cleanup must wait for renewed approval"
+            );
+            assert!(workspace_config::load(&f.root)
+                .unwrap()
+                .schedule
+                .cleanup_intent
+                .is_some());
+            crate::commands::schedule_scripts::resolve_approval(
+                &f.state,
+                &f.pool,
+                ID,
+                &approval.id,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Both live and recovered cleanup must keep ownership and obtain consent for new Variables.
+        #[tokio::test]
+        async fn changed_variables_require_renewed_cleanup_approval_live_and_after_restart() {
+            for restart in [false, true] {
+                let f = fixture_for(None, None, 0, ID).await;
+                let first = save(&f, "one", None);
+                let script = inline(
+                    "printf '%s' \"${CLAI_VAR_MESSAGE?Missing or unavailable}\" > after-data",
+                );
+                let bound = capture(&f.state, ID, &script).unwrap();
+                let consent = bound.consent();
+                f.state
+                    .update_workspace_config(ID, |workspace| {
+                        workspace.schedule.after = Some(script.clone());
+                        workspace.schedule.after_consent = Some(consent.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let intent = crate::agents::hooks::persist_intent(
+                    &f.state,
+                    ID,
+                    &f.session.id,
+                    &f.run.id,
+                    &bound,
+                    Some(consent.clone()),
+                )
+                .unwrap();
+                f.state
+                    .scheduler
+                    .lock()
+                    .await
+                    .scripts
+                    .entry(ID.into())
+                    .or_default()
+                    .cleanup_owned = true;
+                save(&f, "two", Some(&first));
+                if restart {
+                    repository::complete_run(&f.pool, &f.run.id, RunStatus::Cancelled, None)
+                        .await
+                        .unwrap();
+                    *f.state.scheduler.lock().await = crate::agents::scheduler::Scheduler::new();
+                    let (outcome, ()) = tokio::join!(
+                        crate::agents::cleanup_recovery::recover(&f.state, ID),
+                        approve_current(&f)
+                    );
+                    outcome.unwrap();
+                } else {
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let (outcome, ()) = tokio::join!(
+                        crate::agents::hooks::approve_phase(
+                            &f.state,
+                            ID,
+                            &f.pool,
+                            &f.session.id,
+                            &f.lease,
+                            &cancel,
+                            ScriptPhase::After,
+                            bound,
+                            Some(consent)
+                        ),
+                        approve_current(&f)
+                    );
+                    let result = outcome.unwrap().unwrap().execute(&f.state, ID).await;
+                    assert_eq!(result.started, Some(true));
+                    assert!(result.error.is_none());
+                    crate::agents::cleanup_recovery::record_completion(
+                        &f.state,
+                        ID,
+                        &intent.id,
+                        Some(result),
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert_eq!(
+                    std::fs::read_to_string(f.root.join("after-data")).unwrap(),
+                    "two"
+                );
+                let saved = workspace_config::load(&f.root).unwrap();
+                assert!(saved.schedule.cleanup_intent.is_none());
+                assert_eq!(
+                    saved.schedule.cleanup_completion.unwrap().intent_id,
+                    intent.id
+                );
+                assert!(!f.state.scheduler.lock().await.script_is_running(ID));
+            }
+        }
     }
     #[tokio::test]
     async fn recovery_records_completed_timeout_once_and_does_not_retry_it() {

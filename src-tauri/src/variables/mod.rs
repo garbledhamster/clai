@@ -8,6 +8,7 @@ mod redaction;
 mod runtime;
 pub(crate) use redaction::ProtectedOutput;
 pub(crate) use runtime::ResolvedVariables;
+pub(crate) use runtime::VariableRevision;
 
 mod types;
 use credentials::CredentialStore;
@@ -31,11 +32,29 @@ struct StoredDefinition {
 }
 
 impl VariablesRegistry {
+    pub(crate) fn resolve_approved(
+        &self,
+        workspace_id: &str,
+        approved: &[VariableRevision],
+    ) -> Result<ResolvedVariables, String> {
+        self.resolve_checked(workspace_id, Some(approved))
+    }
     pub(crate) fn resolve(&self, workspace_id: &str) -> Result<ResolvedVariables, String> {
+        self.resolve_checked(workspace_id, None)
+    }
+    fn resolve_checked(
+        &self,
+        workspace_id: &str,
+        approved: Option<&[VariableRevision]>,
+    ) -> Result<ResolvedVariables, String> {
         let definitions = self
             .definitions
             .lock()
             .map_err(|_| "Variables registry lock is unavailable")?;
+        let revisions = runtime::identity_for(&definitions, workspace_id);
+        if approved.is_some_and(|approved| approved != revisions) {
+            return Err("Assigned Variables changed. Review a fresh approval.".into());
+        }
         let mut values = std::collections::BTreeMap::new();
         let mut protected = Vec::new();
         for definition in definitions
@@ -69,7 +88,7 @@ impl VariablesRegistry {
             protected,
             directory: self.directory.clone(),
             workspace_id: workspace_id.into(),
-            revisions: runtime::identity_for(&definitions, workspace_id),
+            revisions,
             in_use: !definitions.is_empty(),
             definitions: self.definitions.clone(),
         })
