@@ -4,37 +4,14 @@ use std::path::{Component, Path, PathBuf};
 use tokio::process::Command;
 
 use super::filesystem::normalize_path;
-use super::runner::{prepare_stdio, run_spawned_child};
+use super::linux_launch::{launch_argv, ArgumentInput};
+use super::runner::{prepare_stdio, run_spawned_child_redacted, spawn_checked};
 use super::{
     SandboxCommand, SandboxCommandOutput, SandboxNetworkMode, SandboxPathAccess,
     SandboxSessionBusMode,
 };
 
-const BWRAP_BIN: &str = "bwrap";
 const FLATPAK_SPAWN_BIN: &str = "flatpak-spawn";
-
-/// Builds the program + argv to launch the sandbox.
-///
-/// On a normal host we exec `bwrap` directly. Inside Flatpak, however,
-/// the app itself already runs in a bubblewrap sandbox whose seccomp
-/// filter blocks creating *nested* user namespaces — a bwrap launched
-/// from here would fail with "creating new namespace failed" (and the
-/// runtime doesn't even ship `bwrap`). So inside Flatpak we run the same
-/// bwrap invocation ON THE HOST via `flatpak-spawn --host bwrap …`: the
-/// host's bwrap can create namespaces, so the sandbox profile and its
-/// security boundary are preserved unchanged. This path requires the
-/// Flatpak to hold the `org.freedesktop.Flatpak` talk permission.
-fn launch_argv(bwrap_args: Vec<OsString>, in_flatpak: bool) -> (&'static str, Vec<OsString>) {
-    if in_flatpak {
-        let mut args = Vec::with_capacity(bwrap_args.len() + 2);
-        args.push(os("--host"));
-        args.push(os(BWRAP_BIN));
-        args.extend(bwrap_args);
-        (FLATPAK_SPAWN_BIN, args)
-    } else {
-        (BWRAP_BIN, bwrap_args)
-    }
-}
 
 #[cfg(test)]
 pub async fn run(command: SandboxCommand) -> Result<SandboxCommandOutput, String> {
@@ -47,46 +24,63 @@ pub(crate) async fn run_guarded(
     mut command: SandboxCommand,
     start_check: Option<super::runner::StartCheck<'_>>,
 ) -> Result<Option<SandboxCommandOutput>, String> {
-    if command
-        .profile
-        .variables
-        .as_ref()
-        .is_some_and(|variables| variables.in_use())
-    {
-        return Err("Variables execution is unavailable: safe Linux variable transport is not yet established".into());
-    }
     prune_missing_grants(&mut command).await;
     let args = bwrap_args(&command)?;
     let in_flatpak = crate::providers::is_flatpak();
-    let (program, launch_args) = launch_argv(args, in_flatpak);
+    let argument_input = command
+        .profile
+        .variables
+        .as_ref()
+        .filter(|variables| variables.in_use())
+        .map(|_| ArgumentInput::new(&args))
+        .transpose()?;
+    let (program, launch_args) = launch_argv(
+        args,
+        in_flatpak,
+        argument_input.as_ref().map(ArgumentInput::fd),
+    );
     let mut child_command = Command::new(program);
     child_command.args(launch_args);
     prepare_stdio(&mut child_command);
+    if let Some(input) = &argument_input {
+        input.forward_to(&mut child_command);
+    }
 
     // No await separates this logical start from process spawn. The callback
     // orders admission with wake/manual revocation without holding a gate over I/O.
-    if start_check.is_some_and(|check| !check()) {
-        return Ok(None);
-    }
-
-    let child = child_command.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            if in_flatpak {
-                "Sandboxed shell is unavailable: `flatpak-spawn` not found — the Flatpak needs the `org.freedesktop.Flatpak` talk permission to run the sandbox on the host.".to_string()
+    let admission = spawn_checked(
+        &mut child_command,
+        start_check,
+        command.profile.variables.as_ref(),
+        |e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if in_flatpak {
+                    "Sandboxed shell is unavailable: `flatpak-spawn` not found — the Flatpak needs the `org.freedesktop.Flatpak` talk permission to run the sandbox on the host.".to_string()
+                } else {
+                    "Sandboxed shell is unavailable: bubblewrap (`bwrap`) is not installed or not on PATH".to_string()
+                }
             } else {
-                "Sandboxed shell is unavailable: bubblewrap (`bwrap`) is not installed or not on PATH".to_string()
+                format!("Failed to start sandboxed shell: {}", e)
             }
-        } else {
-            format!("Failed to start sandboxed shell: {}", e)
-        }
-    })?;
+        },
+    );
+    // No parent descriptor is held across output collection, timeout or cancellation.
+    drop(argument_input);
+    let Some(child) = admission? else {
+        return Ok(None);
+    };
 
-    let output = run_spawned_child(
+    let protected = command.profile.variables.as_ref().map_or_else(
+        Vec::new,
+        crate::variables::ResolvedVariables::protected_values,
+    );
+    let output = run_spawned_child_redacted(
         child,
         command.cwd,
         command.timeout_ms,
         command.max_output_chars,
         "Sandboxed shell command",
+        protected,
     )
     .await?;
 
@@ -199,6 +193,11 @@ pub(crate) fn bwrap_args(command: &SandboxCommand) -> Result<Vec<OsString>, Stri
         args.push(os("--setenv"));
         args.push(os(key));
         args.push(os(value));
+    }
+    if let Some(variables) = &command.profile.variables {
+        for (key, value) in variables.iter() {
+            args.extend([os("--setenv"), os(key), os(value)]);
+        }
     }
 
     append_tmp_env(&mut args, command);
@@ -673,7 +672,7 @@ mod tests {
     #[test]
     fn launch_argv_runs_bwrap_directly_on_host() {
         let bwrap_args = vec![os("--die-with-parent"), os("--"), os("/bin/sh")];
-        let (program, args) = launch_argv(bwrap_args.clone(), false);
+        let (program, args) = launch_argv(bwrap_args.clone(), false, None);
         assert_eq!(program, "bwrap");
         assert_eq!(args, bwrap_args);
     }
@@ -681,7 +680,7 @@ mod tests {
     #[test]
     fn launch_argv_wraps_with_flatpak_spawn_in_flatpak() {
         let bwrap_args = vec![os("--die-with-parent"), os("--"), os("/bin/sh")];
-        let (program, args) = launch_argv(bwrap_args, true);
+        let (program, args) = launch_argv(bwrap_args, true, None);
         assert_eq!(program, "flatpak-spawn");
         // flatpak-spawn --host bwrap <original bwrap args...>
         let rendered: Vec<String> = args

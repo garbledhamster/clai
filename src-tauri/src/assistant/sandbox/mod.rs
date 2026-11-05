@@ -11,6 +11,8 @@ pub mod scratch;
 
 #[cfg(target_os = "linux")]
 mod linux_bwrap;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod linux_launch;
 #[cfg(any(target_os = "macos", all(test, target_family = "unix")))]
 mod macos_seatbelt;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
