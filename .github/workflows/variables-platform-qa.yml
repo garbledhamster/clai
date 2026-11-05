@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ae5f5313d139fdb48e6056dd3dab8675e0f003b7
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -25,6 +27,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsecret-1-dev bubblewrap flatpak dbus-x11 gnome-keyring
+      - name: Record tested source revision
+        run: git rev-parse HEAD
       - name: Build frontend
         run: npm ci && npm run build
       - name: Enable shared native Variables probes on Linux
