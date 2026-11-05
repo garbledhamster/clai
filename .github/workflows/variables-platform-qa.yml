@@ -23,6 +23,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          cache-on-failure: true
       - name: Install native and sandbox dependencies
         run: |
           sudo apt-get update
@@ -36,7 +37,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path("src-tauri/src/variables/tests.rs")
-          p.write_text(p.read_text().replace('#[cfg(target_os = "macos")]', '#[cfg(any(target_os = "macos", target_os = "linux"))]'))
+          content = p.read_text().replace('#[cfg(target_os = "macos")]', '#[cfg(any(target_os = "macos", target_os = "linux"))]')
+          p.write_text(content.replace('assert!(output.success);', 'assert!(output.success, "{output:?}");'))
           PY
       - name: Build native test executable
         working-directory: src-tauri
