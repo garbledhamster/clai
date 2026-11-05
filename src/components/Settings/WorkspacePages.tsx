@@ -11,6 +11,7 @@ import { setWorkspaceTitle } from '../../workspace/client';
 import IntervalSelect from './IntervalSelect';
 import WeeklyBlockGrid from './WeeklyBlockGrid';
 import ScheduleCondition, { scriptError } from './ScheduleCondition';
+import WorkspaceVariables from './WorkspaceVariables';
 import { formatNextRun } from '../../fleet/workspaceStatus';
 import { Switch } from './ListEditors';
 import { useReportDirty, type SectionHandle } from './sectionHandle';
@@ -125,6 +126,7 @@ export const GeneralPage = ({ ref, workspaceId, details, saving, onDirtyChange }
           )}
         </dl>
 
+        <WorkspaceVariables workspaceId={workspaceId} />
         {error && <p className={form.errorBanner} role="alert">{error}</p>}
       </div>
     </div>

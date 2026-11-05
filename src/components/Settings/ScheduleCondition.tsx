@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { ScriptApproval, ScriptConfig, ScriptResult, ScriptStatus } from '../../generated/bindings';
 import { Switch } from './ListEditors';
 import form from './SettingsForm.module.css';
 import styles from './ScheduleCondition.module.css';
+import VariableReferencePicker from './VariableReferencePicker';
 
 export type ScheduleScriptPhase = 'condition' | 'before' | 'after';
 
@@ -48,6 +49,7 @@ interface Props {
 }
 
 export default function ScheduleCondition({ workspaceId, phase = 'condition', value, onChange, status, disabled, approvalDisabled = disabled, previewBlocked = false, cleanupIntentId, cleanupInterrupted = false, unattended, onUnattendedChange, onScheduledAuthorize, onDetailsRefresh }: Props) {
+  const editor = useRef<HTMLTextAreaElement>(null);
   const label = phaseLabel(phase);
   const cleanup = phase === 'after';
   // Keep a preview visible immediately, before the next workspace poll returns it.
@@ -154,9 +156,17 @@ export default function ScheduleCondition({ workspaceId, phase = 'condition', va
           </div>
           {value.source.type === 'inline' ? <div className={form.field}>
             <label className={form.label} htmlFor={`${phase}-content`}>{label} script contents</label>
-            <textarea id={`${phase}-content`} className={`${form.textarea} ${form.mono}`} value={value.source.content}
+            <textarea ref={editor} id={`${phase}-content`} className={`${form.textarea} ${form.mono}`} value={value.source.content}
               onChange={(event) => onChange({ ...value, source: { type: 'inline', content: event.target.value } })}
               disabled={locked} spellCheck={false} autoCapitalize="off" autoCorrect="off" />
+            <VariableReferencePicker workspaceId={workspaceId} interpreter={value.interpreter} phase={phase} disabled={locked} onInsert={(reference) => {
+              if (value.source.type !== 'inline' || !editor.current) return;
+              const start = editor.current.selectionStart;
+              const end = editor.current.selectionEnd;
+              const content = value.source.content.slice(0, start) + reference + value.source.content.slice(end);
+              onChange({ ...value, source: { type: 'inline', content } });
+              requestAnimationFrame(() => { editor.current?.focus(); editor.current?.setSelectionRange(start + reference.length, start + reference.length); });
+            }} />
           </div> : <div className={form.field}>
             <label className={form.label} htmlFor={`${phase}-path`}>{label} script file</label>
             <div className={form.addRow}>
