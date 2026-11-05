@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ae5f5313d139fdb48e6056dd3dab8675e0f003b7
+          ref: eb1f8aa2c8a81abb347a7a2b4c1839f577e443fd
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -41,6 +41,7 @@ jobs:
           p.write_text(content.replace('assert!(output.success);', 'assert!(output.success, "{output:?}");'))
           PY
       - name: Build native test executable
+        id: build
         working-directory: src-tauri
         run: cargo test --lib --no-run --message-format=json > "$RUNNER_TEMP/variables-test-build.json"
       - name: Run real Linux Variables children
@@ -49,4 +50,31 @@ jobs:
           QA_TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/variables-test-build.json" | tail -1)
           test -x "$QA_TEST_BIN"
           mkdir -p "$HOME/clai-variables-qa/tmp"
-          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" variables::tests --nocapture
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" variables::tests --nocapture --test-threads=1
+          "$QA_TEST_BIN" assistant::sandbox::linux_launch::tests --nocapture --test-threads=1
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" assistant::sandbox::linux_bwrap::tests --nocapture --test-threads=1
+      - name: Install the production Flatpak runtime
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.gnome.Platform//49 org.gnome.Sdk//49
+      - name: Verify native storage and real Flatpak host execution
+        if: always() && steps.build.outcome == 'success'
+        working-directory: src-tauri
+        run: |
+          QA_TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/variables-test-build.json" | tail -1)
+          export QA_TEST_BIN
+          dbus-run-session -- bash -euc '
+            printf "disposable-qa-keyring" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            "$QA_TEST_BIN" variables::native_tests::native_protected_storage_round_trip_and_cleanup --ignored --exact
+            QA_FLATPAK_ROOT="$HOME/clai-variables-qa/flatpak"
+            flatpak build-init "$QA_FLATPAK_ROOT" run.clai.VariablesQA org.gnome.Sdk//49 org.gnome.Platform//49
+            mkdir -p "$QA_FLATPAK_ROOT/files/libexec" "$QA_FLATPAK_ROOT/files/bin"
+            cp "$QA_TEST_BIN" "$QA_FLATPAK_ROOT/files/libexec/variables-tests"
+            printf "%s\n" "#!/bin/sh" "set -eu" "test -f /.flatpak-info" "mkdir -p \"\$HOME/clai-variables-qa/tmp\"" "export TMPDIR=\"\$HOME/clai-variables-qa/tmp\"" "/app/libexec/variables-tests variables::tests --nocapture --test-threads=1" "/app/libexec/variables-tests assistant::sandbox::linux_launch::tests --nocapture --test-threads=1" > "$QA_FLATPAK_ROOT/files/bin/variables-qa"
+            chmod +x "$QA_FLATPAK_ROOT/files/bin/variables-qa"
+            flatpak build-finish "$QA_FLATPAK_ROOT" --command=variables-qa --share=network --share=ipc --filesystem=home --talk-name=org.freedesktop.Flatpak --talk-name=org.freedesktop.secrets
+            flatpak build-export "$HOME/clai-variables-qa/repo" "$QA_FLATPAK_ROOT"
+            flatpak install --user -y --noninteractive --no-gpg-verify "$HOME/clai-variables-qa/repo" run.clai.VariablesQA
+            flatpak run --user run.clai.VariablesQA
+          '
