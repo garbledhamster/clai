@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: eb1f8aa2c8a81abb347a7a2b4c1839f577e443fd
+          ref: 126a8c1921302ac6fc98e7a183c8a96ce4198f9e
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -32,27 +32,25 @@ jobs:
         run: git rev-parse HEAD
       - name: Build frontend
         run: npm ci && npm run build
-      - name: Enable shared native Variables probes on Linux
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("src-tauri/src/variables/tests.rs")
-          content = p.read_text().replace('#[cfg(target_os = "macos")]', '#[cfg(any(target_os = "macos", target_os = "linux"))]')
-          p.write_text(content.replace('assert!(output.success);', 'assert!(output.success, "{output:?}");'))
-          PY
       - name: Build native test executable
         id: build
         working-directory: src-tauri
         run: cargo test --lib --no-run --message-format=json > "$RUNNER_TEMP/variables-test-build.json"
+      - name: Linux Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
       - name: Run real Linux Variables children
         working-directory: src-tauri
         run: |
           QA_TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/variables-test-build.json" | tail -1)
           test -x "$QA_TEST_BIN"
           mkdir -p "$HOME/clai-variables-qa/tmp"
-          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" variables::tests --nocapture --test-threads=1
-          "$QA_TEST_BIN" assistant::sandbox::linux_launch::tests --nocapture --test-threads=1
-          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" assistant::sandbox::linux_bwrap::tests --nocapture --test-threads=1
+          QA_STATUS=0
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" variables::tests --nocapture --test-threads=1 || QA_STATUS=$?
+          "$QA_TEST_BIN" assistant::sandbox::linux_launch::tests --nocapture --test-threads=1 || QA_STATUS=$?
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" assistant::sandbox::linux_bwrap::tests --nocapture --test-threads=1 || QA_STATUS=$?
+          TMPDIR="$HOME/clai-variables-qa/tmp" "$QA_TEST_BIN" agents::scripts::tests::variables --nocapture --test-threads=1 || QA_STATUS=$?
+          exit "$QA_STATUS"
       - name: Install the production Flatpak runtime
         if: always() && steps.build.outcome == 'success'
         run: |
@@ -75,6 +73,7 @@ jobs:
             chmod +x "$QA_FLATPAK_ROOT/files/bin/variables-qa"
             flatpak build-finish "$QA_FLATPAK_ROOT" --command=variables-qa --share=network --share=ipc --filesystem=home --talk-name=org.freedesktop.Flatpak --talk-name=org.freedesktop.secrets
             flatpak build-export "$HOME/clai-variables-qa/repo" "$QA_FLATPAK_ROOT"
-            flatpak install --user -y --noninteractive --no-gpg-verify "$HOME/clai-variables-qa/repo" run.clai.VariablesQA
+            flatpak remote-add --user --no-gpg-verify variables-qa-local "$HOME/clai-variables-qa/repo"
+            flatpak install --user -y --noninteractive variables-qa-local run.clai.VariablesQA
             flatpak run --user run.clai.VariablesQA
           '
