@@ -690,7 +690,7 @@ fn uncertain_directory_durability_preserves_both_credentials_and_reports_committ
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn native_command(
+pub(super) fn native_command(
     workspace: &std::path::Path,
     home: &std::path::Path,
     script: &str,
