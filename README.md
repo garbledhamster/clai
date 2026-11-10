@@ -2,7 +2,7 @@
   <img src="public/icon.svg" alt="CLAI" width="128" height="128">
 </p>
 
-<h1 align="center">CLAI</h1>
+<h1 align="center">CLAI+</h1>
 
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
@@ -25,6 +25,20 @@
   <br>
   <a href="https://clai.run/"><strong>Explore CLAI</strong></a>
 </p>
+
+## The CLAI+ fork
+
+CLAI+ is an independent fork of [CLAI](https://github.com/clairun/clai).
+It adds enhanced workspace scheduling with intervals as short as 15 seconds,
+optional condition, before, and after scripts, and weekly time blocks.
+The [public scheduler design](https://github.com/garbledhamster/clai/issues/1)
+describes the controls and execution rules. Automatic enhanced schedules
+currently require the macOS wake monitor. Legacy schedules are available
+on other platforms.
+
+The `clai-plus` branch contains the fork's changes. The `main` branch follows
+upstream CLAI. The [fork maintenance guide](AGENTS.md) shows how to bring
+upstream changes into the fork and verify them before publishing.
 
 ## What it is
 
