@@ -688,7 +688,12 @@ mod tests {
         let command = sample_command(workspace.path());
 
         let profile = seatbelt_profile(&command, private_tmp.path()).unwrap();
-        let workspace_path = escape_sbpl_string(&workspace.path().display().to_string());
+        let workspace_path = escape_sbpl_string(
+            &fs::canonicalize(workspace.path())
+                .unwrap()
+                .display()
+                .to_string(),
+        );
 
         assert!(profile.contains("(deny default)"));
         // macOS 26 /bin/sh reads `/` at startup and aborts without this.

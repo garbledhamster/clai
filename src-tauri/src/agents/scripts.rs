@@ -1710,7 +1710,7 @@ mod tests {
         .is_err());
         let next = pending(&f.state).await;
         assert_ne!(next.id, first.id);
-        assert!(next.access.contains("Disabled"));
+        assert!(next.access.contains("Network: Off"));
         let saved = workspace_config::load(&f.root).unwrap();
         assert_eq!(saved.schedule.condition, Some(inline("saved")));
         assert_eq!(saved.schedule.next_run_at_unix_ms, before);
