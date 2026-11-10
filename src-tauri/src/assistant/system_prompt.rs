@@ -32,15 +32,12 @@ pub(crate) fn build_system_prompt(
     trigger: &RunTrigger,
 ) -> ProviderInputMessage {
     let tool_names: Vec<&str> = tool_defs.iter().map(|t| t.name.as_str()).collect();
-    // `bash_exec` is the only tool that reads or writes arbitrary files, and in
-    // restricted mode the *write* capability is the allowlist rather than the
-    // mode. Guidance that assumes either is gated on these two flags: telling an
-    // agent to produce a file it cannot write stalls it on an approval prompt.
+    // `bash_exec` is the only tool that reads or writes arbitrary files, so
+    // guidance about files is gated on having a shell.
     let shell_enabled = !matches!(
         context.execution.shell.mode,
         crate::config::ShellAccessMode::Off
     );
-    let can_write_files = context.execution.shell.can_write_files();
     let current_datetime = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %:z")
         .to_string();
@@ -165,11 +162,9 @@ pub(crate) fn build_system_prompt(
          - First inspect what is available in this session and choose the smallest set of tools needed.\n\
          - Use the configured MCP tools available in this session for domain-specific work.\n",
     );
-    if can_write_files {
+    if shell_enabled {
         prompt
             .push_str("         - Use `bash_exec` for local filesystem inspection and changes.\n");
-    } else if shell_enabled {
-        prompt.push_str("         - Use `bash_exec` for local filesystem inspection.\n");
     }
     prompt.push_str(
         "         - Prior tool outputs in the conversation may be stale. Treat them as historical context, not guaranteed current state.\n\
@@ -182,7 +177,7 @@ pub(crate) fn build_system_prompt(
             "         - When looking for code, files, or prior work, ALWAYS search your workspace first with `bash_exec` before searching other granted paths. The workspace holds your own artifacts and earlier outputs; prefer a match found there over an equivalent one found elsewhere.\n",
         );
     }
-    if can_write_files {
+    if shell_enabled {
         prompt.push_str(
             "         - Durable outputs belong in the workspace: write them there with `bash_exec` so they persist after the run as user-visible artifacts.\n\
              - Before creating a new durable artifact, search the workspace for an existing relevant one and update it rather than creating a duplicate.\n",
@@ -211,9 +206,12 @@ pub(crate) fn build_system_prompt(
     // needed here. Scoped to sessions that actually expose such a tool;
     // ordinary read/write tools, which can be retried without side effects,
     // need no special handling.
-    let has_interactive_tool = tool_names
-        .iter()
-        .any(|n| matches!(*n, "ask_user" | "bash_exec" | "fs_request_grant"));
+    let has_interactive_tool = tool_names.iter().any(|n| {
+        matches!(
+            *n,
+            "ask_user" | "bash_exec" | "fs_request_grant" | "net_request_access"
+        )
+    });
     if has_interactive_tool {
         prompt.push_str(
             "\n## Interactive Tool Reliability\n\
@@ -304,7 +302,7 @@ pub(crate) fn build_system_prompt(
         prompt.push_str(
             "Your assistant text is visible to the user in chat. Treat chat as the primary way to communicate progress and outcomes.\n",
         );
-        if can_write_files {
+        if shell_enabled {
             prompt.push_str(
                 "Save durable outputs as files in the workspace (via `bash_exec`) so they surface as artifacts.\n",
             );
@@ -326,13 +324,9 @@ pub(crate) fn build_system_prompt(
     }
 
     prompt.push_str("\n## Local Execution Capabilities\n");
-    if shell_enabled && !can_write_files {
+    if shell_enabled {
         prompt.push_str(&format!(
-            "- Your workspace (id `{workspace_id}`) is your default shell working directory (run `pwd` for its path) and holds this workspace's artifacts, which you can read. Your command allowlist contains no command that writes a file, so any write you attempt through `bash_exec` stops and waits for the user to approve that command — which an unattended run has nobody to answer. Put your results in chat, save charts with `create_vega_chart` (it writes its own file and needs no shell), and say plainly when a request needs a file you cannot write.\n",
-        ));
-    } else if shell_enabled {
-        prompt.push_str(&format!(
-            "- Your workspace (id `{workspace_id}`) is your read_write home and your default shell working directory (run `pwd` for its path). Do your work here: write documents, scratch files, code, and durable outputs to the workspace unless the user points you elsewhere. Files in the workspace are shown to the user as **artifacts** in the CLAI app, so treat them as user-facing. The workspace is shared with other agents in the *same* workspace.\n",
+            "- Your workspace (id `{workspace_id}`) is your read_write home and your default shell working directory (run `pwd` for its path). Do your work here: write documents, scratch files, code, and durable outputs to the workspace unless the user points you elsewhere. Files in the workspace are shown to the user as **artifacts** in the CLAI app, so treat them as user-facing. The workspace is shared with other agents in the *same* workspace. Its `.clai/` directory is CLAI's own state (settings, conversation history): write there only under `.clai/memory/`; on Linux and macOS the shell can only read the rest. The same holds for the provider CLI configuration at the workspace root (`.claude/`, `.codex/`, `.opencode/`, `.mcp.json`, `opencode.json`, `opencode.jsonc`).\n",
         ));
     } else {
         prompt.push_str(&format!(
@@ -345,7 +339,7 @@ pub(crate) fn build_system_prompt(
     prompt.push_str(
         "- Charts: create every chart with the `create_vega_chart` tool, one chart per call — never hand-write a Vega-Lite spec into a file or paste one into chat. The tool validates the spec (fix and retry on a schema error). Give it the complete workspace-relative `.vl.json` path and choose a visible artifact location that keeps the chart with its related task or document instead of defaulting to a shared charts directory (for example, `reports/q3/revenue.vl.json`); avoid cache, dependency, and build-output directories. Reuse an existing chart's exact path when updating it instead of creating a near-duplicate. The tool does not show the chart in chat: it returns a `markdown` snippet such as `![title](/reports/q3/revenue.vl.json)`, and embedding that snippet in your reply or in a markdown report is the only way the chart is displayed — put it exactly where the chart belongs, once. Leading `/` = workspace root, so the link works from a report in any folder. Saved charts also appear as artifacts.\n",
     );
-    if can_write_files {
+    if shell_enabled {
         prompt.push_str(
             "- Keep data out of the spec above ~50 rows: write it to a CSV/JSON file in the workspace with `bash_exec` and point the spec's `data.url` at it (a leading `/` is workspace-root-relative, e.g. `/data/sales.csv`).\n",
         );
@@ -371,10 +365,10 @@ pub(crate) fn build_system_prompt(
     }
 
     if shell_enabled {
-        push_filesystem_boundary(&mut prompt, can_write_files, trigger);
+        push_filesystem_boundary(&mut prompt, trigger, sandbox_prompt_for(context).ssh);
     }
     // The memory protocol is all reads and writes of `.clai/memory/` files.
-    if can_write_files {
+    if shell_enabled {
         push_agent_memory(&mut prompt, trigger);
     }
 
@@ -444,83 +438,50 @@ fn push_shell_capability_lines(prompt: &mut String, context: &RunContext) {
         )),
     }
 
+    // The label the user sees in agent settings, then the stored value.
     let shell_mode = match context.execution.shell.mode {
-        crate::config::ShellAccessMode::Off => "off",
-        crate::config::ShellAccessMode::Restricted => "restricted",
-        crate::config::ShellAccessMode::Full => "full",
+        crate::config::ShellAccessMode::Off => "Off (off)",
+        crate::config::ShellAccessMode::Restricted => "Ask first (restricted)",
+        crate::config::ShellAccessMode::Full => "Don't ask (full)",
     };
     prompt.push_str(&format!("- Shell mode: {}\n", shell_mode));
-    let network_status = match context.execution.sandbox.network {
-        crate::config::SandboxNetworkConfig::Enabled => "network allowed",
-        crate::config::SandboxNetworkConfig::Disabled => "network disabled",
-    };
-    let sandbox_status = if cfg!(target_os = "linux") {
-        let session_bus_status = match context.execution.sandbox.session_bus {
-            crate::config::SandboxSessionBusConfig::Allow => "session bus available",
-            crate::config::SandboxSessionBusConfig::Deny => "session bus blocked",
-        };
-        format!(
-            "sandboxed shell on Linux through bubblewrap when `bash_exec` is available ({}, {})",
-            network_status, session_bus_status
-        )
-    } else if cfg!(target_os = "macos") {
-        format!(
-            "sandboxed shell on macOS through Seatbelt/sandbox-exec when `bash_exec` is available ({})",
-            network_status
-        )
-    } else {
-        // No sandbox implementation on this platform (see
-        // `assistant::sandbox::unsupported`), so the path grants are advisory
-        // there. The allow/blocklists are a different mechanism — CLAI parses
-        // every command against them in `shell_policy` before spawning
-        // anything, on every platform — so do not let the warning imply that
-        // nothing is enforced.
-        "host shell — no OS sandbox on this platform, so the path grants are NOT enforced by the kernel and the boundary below is a rule you keep yourself. Your allowed and blocked command prefixes are still enforced by CLAI before any command runs".to_string()
-    };
-    prompt.push_str(&format!("- Shell sandbox: {}\n", sandbox_status));
-    if cfg!(target_os = "linux")
-        && matches!(
-            context.execution.sandbox.session_bus,
-            crate::config::SandboxSessionBusConfig::Allow
-        )
-    {
-        prompt.push_str(
-            "- Session bus is available: tools that authenticate through libsecret (e.g. `gh`, `git-credential-libsecret`, `secret-tool`) can reach the host keyring directly. Use the host's existing auth instead of asking the user for tokens.\n",
-        );
+    let sandbox = sandbox_prompt_for(context);
+    prompt.push_str(&format!("- Shell sandbox: {}\n", sandbox.sandbox));
+    if let Some(allowlist) = &sandbox.allowlist {
+        prompt.push_str(allowlist);
     }
-
-    if !context.execution.shell.blocked_command_prefixes.is_empty() {
-        prompt.push_str(&format!(
-            "- Blocked command prefixes: {}\n",
-            context.execution.shell.blocked_command_prefixes.join(", ")
+    if cfg!(target_os = "linux") {
+        let unfiltered = crate::assistant::sandbox::status().session_bus_filter_unavailable_reason;
+        prompt.push_str(&session_bus_line(
+            context.execution.sandbox.session_bus,
+            unfiltered.as_deref(),
         ));
     }
 
-    match context.execution.shell.mode {
-        crate::config::ShellAccessMode::Restricted => {
-            let allowed = context.execution.shell.effective_allowed_command_prefixes();
-            let allowed_text = if allowed.is_empty() {
-                "none".to_string()
-            } else {
-                allowed.join(", ")
-            };
-            prompt.push_str(&format!("- Allowed command prefixes: {}\n", allowed_text));
-        }
-        crate::config::ShellAccessMode::Full => {
-            prompt.push_str("- Allowed command prefixes: any command not blocked\n");
-        }
-        // Unreachable: the caller only reaches this helper with a shell.
-        crate::config::ShellAccessMode::Off => {}
+    if matches!(
+        context.execution.shell.mode,
+        crate::config::ShellAccessMode::Restricted
+    ) {
+        let rules = &context.execution.shell.ask_first_command_prefixes;
+        let rules_text = if rules.is_empty() {
+            "none".to_string()
+        } else {
+            rules.join(", ")
+        };
+        prompt.push_str(&format!(
+            "- Ask first (the user approves each one; a denial comes back as an error with the user's reason): {}\n",
+            rules_text
+        ));
     }
 }
 
 /// The authorization boundary and the git/SSH etiquette that goes with it.
 /// Both describe how to behave *while running commands*, so they are
 /// omitted for agents without a shell.
-fn push_filesystem_boundary(prompt: &mut String, can_write_files: bool, trigger: &RunTrigger) {
+fn push_filesystem_boundary(prompt: &mut String, trigger: &RunTrigger, ssh: Option<&str>) {
     prompt.push_str(
         "\n## Filesystem boundary\n\
-         The path grants listed above are the ONLY locations you are authorized to read, write, or operate against. On Linux and macOS, `bash_exec` runs inside an OS sandbox that allows only the workspace, configured path grants, and required platform system files; if the sandbox is unavailable, `bash_exec` fails closed. On platforms with no sandbox implementation, `bash_exec` is labeled as a host shell: the command policy still applies, but nothing outside this paragraph stops you from reaching an ungranted path, so treat these rules as the boundary itself.\n\
+         The path grants listed above are the ONLY locations you are authorized to read, write, or operate against. On Linux and macOS, `bash_exec` runs inside an OS sandbox that allows only the workspace, configured path grants, and required platform system files; if the sandbox is unavailable, `bash_exec` fails closed. On platforms with no sandbox implementation, `bash_exec` is labeled as a host shell: nothing outside this paragraph stops you from reaching an ungranted path, so treat these rules as the boundary itself.\n\
          - Do not `cd`, redirect to, or pass paths outside the listed grants — not even via subshells, heredocs, scripts, or absolute paths.\n\
          - Do not invoke commands that touch paths outside the grants (no editing the user's other repos, no installing to global locations, no reading personal files like `~/.ssh`, etc.).\n\
          - If a task genuinely needs a path outside your current grants (e.g. `~/.ssh` for `git push`, `~/.config/gh` for the `gh` CLI), call `fs_request_grant({path, access, reason})` BEFORE attempting the work. The requested path must already exist because the shell sandbox cannot bind a nonexistent target; to create a new path, request its existing parent directory. The user can approve once (lasts this run), approve always (persists to agent settings), narrow the path, or deny. Request the narrowest path that satisfies the task — prefer `~/.config/gh` over `~/.config`, prefer a specific file over its parent directory. Prefer `read_only` unless writes are genuinely needed.\n\
@@ -530,11 +491,9 @@ fn push_filesystem_boundary(prompt: &mut String, can_write_files: bool, trigger:
     if !matches!(trigger, RunTrigger::WorkspaceTask) {
         prompt.push_str("         - If a denied grant requires a human answer, use `ask_user`.\n");
     }
-    if can_write_files {
-        prompt.push_str(
-            "         - Default your writes to the workspace. Other grants (often `$HOME`) are commonly read_only, so writing there fails — check the access listed above first, and if you genuinely need to write to a read_only or ungranted path, `fs_request_grant` it rather than attempting the write and failing.\n",
-        );
-    }
+    prompt.push_str(
+        "         - Default your writes to the workspace. Other grants (often `$HOME`) are commonly read_only, so writing there fails — check the access listed above first, and if you genuinely need to write to a read_only or ungranted path, `fs_request_grant` it rather than attempting the write and failing.\n",
+    );
     prompt.push_str(
         "         - Other CLAI workspaces exist on this machine but are intentionally isolated: you cannot see, list, or read them, and they will never appear in your grants. If the user asks you to work with a different workspace, ask them for its workspace id (the value they can read most easily in the CLAI app; you cannot enumerate workspaces). That workspace lives next to yours — same parent directory as your workspace, named with that id — so `fs_request_grant` that path (e.g. read_only first) to gain access.\n",
     );
@@ -553,10 +512,121 @@ fn push_filesystem_boundary(prompt: &mut String, can_write_files: bool, trigger:
             "         - If GH007 blocks a push, use `ask_user` with the rejection detail.\n",
         );
     }
-    if cfg!(target_os = "linux") {
-        prompt.push_str(
-            "             - The Linux sandbox overlays an empty tmpfs at `/etc/ssh`, so OpenSSH only consults `~/.ssh/config` and its built-in defaults. You do not need `-F /dev/null` workarounds; if you see `Bad owner or permissions` from ssh, the cause is something else (likely an explicit `-F` pointing at an unreadable path).\n",
-        );
+    if let Some(ssh) = ssh {
+        prompt.push_str(ssh);
+    }
+}
+
+/// What the shell sandbox and the network mode mean for the agent on one
+/// platform: `backend` is the sandbox, `None` a PC whose shell runs on the
+/// host. Modes go by the names agent settings show.
+struct SandboxPrompt {
+    /// The text of the `- Shell sandbox:` line.
+    sandbox: String,
+    /// How to work in Allowlist, where the shell is in it.
+    allowlist: Option<String>,
+    /// How ssh is configured inside the sandbox, for the git section.
+    ssh: Option<&'static str>,
+}
+
+const SSH_HOME_CONFIG_ONLY: &str = "             - The Linux sandbox overlays an empty tmpfs at `/etc/ssh`, so OpenSSH only consults `~/.ssh/config` and its built-in defaults. You do not need `-F /dev/null` workarounds; if you see `Bad owner or permissions` from ssh, the cause is something else (likely an explicit `-F` pointing at an unreadable path).\n";
+
+const SSH_THROUGH_PROXY: &str = "             - The Linux sandbox overlays an empty tmpfs at `/etc/ssh` and binds a CLAI-written `/etc/ssh/ssh_config` there that sends ssh (and git, scp and rsync over ssh) through the network proxy, so ssh to an allowed host works. `~/.ssh/config` is read first: a `ProxyCommand` or `ProxyJump` there overrides CLAI's and then fails inside the sandbox. You do not need `-F /dev/null` workarounds.\n";
+
+/// What the shell's session bus offers on Linux. Keyring only where the bus
+/// cannot be filtered is no bus: `unfiltered` says why and how to get one.
+/// Without a bus, keyring tools fail as if logged out, so the line says so.
+fn session_bus_line(
+    bus: crate::config::SandboxSessionBusConfig,
+    unfiltered: Option<&str>,
+) -> String {
+    use crate::config::SandboxSessionBusConfig::{Deny, KeyringOnly};
+    const NO_BUS: &str = "- No session bus in shell commands: tools that read the host keyring (`gh`, `git-credential-libsecret`, `secret-tool`) cannot reach it and report not logged in or an invalid token. Do not ask the user to log in again.";
+    match (bus, unfiltered) {
+        (KeyringOnly | Deny, Some(note)) => format!("{NO_BUS} {note}\n"),
+        (Deny, None) => format!(
+            "{NO_BUS} Ask the user to set this agent's Session bus to Keyring only in its Local access settings.\n"
+        ),
+        _ => "- Session bus is available: tools that authenticate through libsecret (e.g. `gh`, `git-credential-libsecret`, `secret-tool`) can reach the host keyring directly. Use the host's existing auth instead of asking the user for tokens.\n"
+            .to_string(),
+    }
+}
+
+fn sandbox_prompt_for(context: &RunContext) -> SandboxPrompt {
+    sandbox_prompt(
+        crate::assistant::sandbox::status().backend,
+        &context.execution.sandbox.network_access,
+        context.execution.sandbox.session_bus,
+    )
+}
+
+fn sandbox_prompt(
+    backend: Option<crate::assistant::sandbox::SandboxBackend>,
+    network: &crate::config::NetworkPolicy,
+    session_bus: crate::config::SandboxSessionBusConfig,
+) -> SandboxPrompt {
+    use crate::assistant::sandbox::SandboxBackend;
+    use crate::config::NetworkMode;
+    let mode = match network.mode {
+        NetworkMode::Off => "Off",
+        NetworkMode::Allowlist => "Allowlist",
+        NetworkMode::HostNetwork => "Host network (unfiltered)",
+    };
+    let unenforced = "Allowlist, which cannot be enforced for shell commands here yet, so `bash_exec` refuses to run until the user chooses Off or Host network";
+    match backend {
+        Some(SandboxBackend::Bubblewrap) => {
+            let bus = match session_bus {
+                crate::config::SandboxSessionBusConfig::Full => "session bus available",
+                crate::config::SandboxSessionBusConfig::KeyringOnly => "session bus: keyring only",
+                crate::config::SandboxSessionBusConfig::Deny => "session bus blocked",
+            };
+            let in_allowlist = network.mode == NetworkMode::Allowlist;
+            SandboxPrompt {
+                sandbox: format!(
+                    "sandboxed shell on Linux through bubblewrap when `bash_exec` is available (network: {mode}, {bus})"
+                ),
+                allowlist: in_allowlist.then(|| format!(
+                    "- Network allowlist: shell commands and `web_fetch` reach only the hosts matching the {} entries on this agent's allowlist and any the user allows during this run. Shell traffic goes through CLAI's network proxy: `HTTP_PROXY` and `HTTPS_PROXY` are set, so tools that honour them work; DNS lookups fail inside the sandbox and tools that ignore the proxy variables cannot connect. An unlisted host fails with a 403 or a refused connection, and the `bash_exec` result names it under `network.refused`. When the task needs such a host, call `net_request_access` with the host and the reason; do not look for a way around the proxy. `localhost` inside the sandbox is the sandbox's own, separate from this computer's: `ss`, `ps` and `netstat` there see only the sandbox, and a refused connection to localhost does not mean nothing listens on the computer. To reach a service on this computer's localhost, call `net_request_access` with host `localhost:<port>`; once granted, the port answers on 127.0.0.1 and ::1 from your next command, and it is taken inside the sandbox, so do not start your own server on it. Any other listed name that resolves to a loopback or link-local address is never reached, while one that resolves to a private local-network address is reachable from shell commands (`web_fetch` refuses every non-public address).\n",
+                    network.allow_domains.len()
+                )),
+                ssh: Some(if in_allowlist {
+                    SSH_THROUGH_PROXY
+                } else {
+                    SSH_HOME_CONFIG_ONLY
+                }),
+            }
+        }
+        Some(SandboxBackend::Seatbelt) => {
+            let network = match network.mode {
+                NetworkMode::Allowlist => unenforced,
+                _ => mode,
+            };
+            SandboxPrompt {
+                sandbox: format!(
+                    "sandboxed shell on macOS through Seatbelt/sandbox-exec when `bash_exec` is available (network: {network})"
+                ),
+                allowlist: None,
+                ssh: None,
+            }
+        }
+        // No sandbox implementation on this platform (see
+        // `assistant::sandbox::unsupported`), so the path grants are advisory
+        // there and the network mode reaches the web tools only.
+        None => {
+            let network = match network.mode {
+                NetworkMode::Allowlist => unenforced.to_string(),
+                _ => format!(
+                    "{mode}, which applies to `web_search` and `web_fetch` only; shell commands are not network-restricted"
+                ),
+            };
+            SandboxPrompt {
+                sandbox: format!(
+                    "host shell — no OS sandbox on this platform, so the path grants are NOT enforced by the kernel and the boundary below is a rule you keep yourself (network: {network})"
+                ),
+                allowlist: None,
+                ssh: None,
+            }
+        }
     }
 }
 
@@ -654,8 +724,6 @@ mod tests {
         ExecutionCapabilityConfig {
             shell: crate::config::types::ShellCapabilityConfig {
                 mode: ShellAccessMode::Restricted,
-                allowed_command_prefixes: crate::config::types::standard_restricted_shell_allowlist(
-                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -950,56 +1018,10 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_withholds_write_guidance_from_a_read_only_allowlist() {
-        // The shipped `code-reviewer` template's shape: a shell, but nothing in
-        // the allowlist that writes. Every write it attempted would stop on an
-        // approval prompt, which an unattended scheduled run cannot answer — so
-        // it must not be told to keep memory or save durable outputs.
-        let mut execution = ExecutionCapabilityConfig::default();
-        execution.shell.mode = ShellAccessMode::Restricted;
-        execution.shell.allowed_command_prefixes = ["rg", "cat", "git diff"]
-            .iter()
-            .map(|command| (*command).to_string())
-            .collect();
-
-        let context = RunContext {
-            // An automation, so the "save durable outputs as files" line is
-            // reachable — otherwise reverting its gate survives this test.
-            automation_name: Some("Nightly review".to_string()),
-            execution,
-            ..Default::default()
-        };
-
-        let message =
-            build_workspace_prompt("agent-123", &context, None, &[], &RunTrigger::Scheduled);
-        let text = match &message.content[0] {
-            ContentPart::Text { text } => text,
-            other => panic!("expected text content, got {:?}", other),
-        };
-
-        assert!(text.contains("This session belongs to the automation"));
-        assert!(!text.contains("## Agent Memory"));
-        assert!(!text.contains("Durable outputs belong in the workspace"));
-        assert!(!text.contains("Save durable outputs as files"));
-        assert!(!text.contains("Default your writes to the workspace"));
-        assert!(!text.contains("inspection and changes"));
-        assert!(text.contains("no command that writes a file"));
-        // Approval-blocked, not denied, and charts are still writable.
-        assert!(text.contains("waits for the user to approve"));
-        assert!(text.contains("save charts with `create_vega_chart`"));
-        // It still has a shell, so the boundary and the search guidance apply.
-        assert!(text.contains("## Filesystem boundary"));
-        assert!(text.contains("ALWAYS search your workspace first"));
-    }
-
-    #[test]
     fn build_system_prompt_describes_shell_mode_alongside_memory_guidance() {
         let mut execution = ExecutionCapabilityConfig::default();
         execution.shell.mode = ShellAccessMode::Restricted;
-        // `tee` is what makes this agent write-capable; without it the memory
-        // protocol below would be guidance it cannot act on.
-        execution.shell.allowed_command_prefixes =
-            vec!["cargo check".to_string(), "tee".to_string()];
+        execution.shell.ask_first_command_prefixes = vec!["git push".to_string(), "rm".to_string()];
 
         let context = RunContext {
             execution,
@@ -1013,10 +1035,35 @@ mod tests {
             other => panic!("expected text content, got {:?}", other),
         };
 
-        assert!(text.contains("- Shell mode: restricted"));
-        assert!(text.contains("- Allowed command prefixes: cargo check"));
-        assert!(text.contains("cargo check"));
+        assert!(text.contains("- Shell mode: Ask first (restricted)\n"));
+        assert!(text.contains(
+            "- Ask first (the user approves each one; a denial comes back as an error \
+             with the user's reason): git push, rm\n"
+        ));
+        assert!(!text.contains("Blocked command prefixes"));
+        assert!(!text.contains("Allowed command prefixes"));
         assert!(text.contains("## Agent Memory"));
+    }
+
+    #[test]
+    fn build_system_prompt_gives_a_full_agent_no_ask_first_line() {
+        let mut execution = ExecutionCapabilityConfig::default();
+        execution.shell.mode = ShellAccessMode::Full;
+        let context = RunContext {
+            execution,
+            ..Default::default()
+        };
+
+        let message =
+            build_workspace_prompt("agent-123", &context, None, &[], &RunTrigger::Scheduled);
+        let text = match &message.content[0] {
+            ContentPart::Text { text } => text,
+            other => panic!("expected text content, got {:?}", other),
+        };
+
+        assert!(text.contains("- Shell mode: Don't ask (full)\n"));
+        assert!(!text.contains("Ask first"));
+        assert!(!text.contains("command prefixes"));
     }
 
     #[test]
@@ -1427,6 +1474,139 @@ mod tests {
             assert!(text.contains("Treat memory as fallible working notes"));
             assert!(text.contains("Do not store secrets in memory"));
             assert!(text.contains("Knowledge is not a dashboard"));
+        }
+    }
+    #[test]
+    fn an_agent_without_a_bus_is_told_why_keyring_tools_fail() {
+        use crate::config::SandboxSessionBusConfig::{Deny, Full, KeyringOnly};
+        let note = "Keyring-only agents get no session bus here: x. Set Full.";
+        let available = |line: String| line.contains("Session bus is available");
+        assert!(available(session_bus_line(KeyringOnly, None)));
+        assert!(available(session_bus_line(Full, None)));
+        assert!(available(session_bus_line(Full, Some(note))));
+        let keyring_only =
+            "set this agent's Session bus to Keyring only in its Local access settings";
+        for (bus, unfiltered, fix) in [
+            (Deny, None, keyring_only),
+            (Deny, Some(note), note),
+            (KeyringOnly, Some(note), note),
+        ] {
+            let line = session_bus_line(bus, unfiltered);
+            assert!(
+                line.starts_with("- No session bus in shell commands:"),
+                "{line}"
+            );
+            assert!(line.contains("(`gh`,"), "{line}");
+            assert!(line.contains("invalid token"), "{line}");
+            assert!(
+                line.contains("Do not ask the user to log in again."),
+                "{line}"
+            );
+            assert!(line.contains(fix), "{line}");
+            // Where keyring only gives no bus, it is not the fix.
+            assert_eq!(line.contains(keyring_only), unfiltered.is_none(), "{line}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_system_prompt_tells_a_busless_shell_agent_about_the_bus() {
+        let mut execution = shell_execution();
+        execution.sandbox.session_bus = crate::config::SandboxSessionBusConfig::Deny;
+        let context = RunContext {
+            execution,
+            ..Default::default()
+        };
+
+        let message = build_system_prompt(&context, None, &[], &RunTrigger::Scheduled);
+        let text = match &message.content[0] {
+            ContentPart::Text { text } => text,
+            other => panic!("expected text content, got {:?}", other),
+        };
+
+        assert!(text.contains("- No session bus in shell commands:"));
+    }
+
+    #[test]
+    fn the_sandbox_lines_follow_the_platform_and_the_network_mode() {
+        use crate::assistant::sandbox::SandboxBackend::{self, Bubblewrap, Seatbelt};
+        use crate::config::{NetworkMode, NetworkPolicy, SandboxSessionBusConfig};
+        let platforms: [Option<SandboxBackend>; 3] = [Some(Bubblewrap), Some(Seatbelt), None];
+        for backend in platforms {
+            for mode in [
+                NetworkMode::Off,
+                NetworkMode::Allowlist,
+                NetworkMode::HostNetwork,
+            ] {
+                let network = NetworkPolicy {
+                    mode,
+                    allow_domains: vec!["github.com".to_string(), "*.npmjs.org".to_string()],
+                    deny_domains: Vec::new(),
+                    local_ports: Vec::new(),
+                };
+                let prompt = sandbox_prompt(backend, &network, SandboxSessionBusConfig::Deny);
+                let case = format!("{backend:?} {mode:?}: {}", prompt.sandbox);
+                let linux_allowlist = backend == Some(Bubblewrap) && mode == NetworkMode::Allowlist;
+
+                let name = match mode {
+                    NetworkMode::Off => "network: Off",
+                    NetworkMode::Allowlist => "network: Allowlist",
+                    NetworkMode::HostNetwork => "network: Host network (unfiltered)",
+                };
+                assert!(prompt.sandbox.contains(name), "{case}");
+                assert_eq!(
+                    prompt.sandbox.contains("refuses to run"),
+                    mode == NetworkMode::Allowlist && backend != Some(Bubblewrap),
+                    "{case}"
+                );
+                assert_eq!(
+                    prompt
+                        .sandbox
+                        .contains("applies to `web_search` and `web_fetch` only; shell commands are not network-restricted"),
+                    backend.is_none() && mode != NetworkMode::Allowlist,
+                    "{case}"
+                );
+
+                let allowlist = prompt.allowlist.unwrap_or_default();
+                assert_eq!(
+                    allowlist.contains("call `net_request_access`"),
+                    linux_allowlist,
+                    "{case}"
+                );
+                assert_eq!(
+                    allowlist.contains("with host `localhost:<port>`"),
+                    linux_allowlist,
+                    "{case}"
+                );
+                if linux_allowlist {
+                    for said in [
+                        "`ss`, `ps` and `netstat` there see only the sandbox",
+                        "a refused connection to localhost does not mean nothing listens",
+                        "answers on 127.0.0.1 and ::1 from your next command",
+                        "do not start your own server on it",
+                    ] {
+                        assert!(allowlist.contains(said), "{allowlist}");
+                    }
+                    assert!(!allowlist.contains("reachable directly"), "{allowlist}");
+                    assert!(
+                        allowlist.contains("only the hosts matching the 2 entries"),
+                        "{allowlist}"
+                    );
+                    assert!(allowlist.contains("`network.refused`"), "{allowlist}");
+                }
+
+                let ssh = prompt.ssh.unwrap_or_default();
+                assert_eq!(
+                    ssh.contains("OpenSSH only consults `~/.ssh/config`"),
+                    backend == Some(Bubblewrap) && !linux_allowlist,
+                    "{case}"
+                );
+                assert_eq!(
+                    ssh.contains("`/etc/ssh/ssh_config`"),
+                    linux_allowlist,
+                    "{case}"
+                );
+            }
         }
     }
 }

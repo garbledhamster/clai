@@ -3,23 +3,38 @@ use crate::assistant::sandbox::filesystem::{
 };
 use futures::StreamExt;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tokio::time::Duration;
 
-use crate::assistant::sandbox::{
-    run_command, SandboxCommand, SandboxEnv, SandboxNetworkMode, SandboxProfile,
-    SandboxSessionBusMode,
+use crate::assistant::network::addr::{
+    embedded_ipv4, is_blocked_web_fetch_hostname, reject_private_web_fetch_addrs,
+    reject_private_web_fetch_ip, strip_ipv6_url_brackets,
 };
+#[cfg(target_os = "linux")]
+use crate::assistant::network::local_listener::{Listener, ListenerInspector, Loopback};
+use crate::assistant::network::matcher::{
+    canonical_host, parse_entry, parse_local_port, HostDecision, LOCALHOST,
+};
+#[cfg(target_os = "linux")]
+use crate::assistant::network::run_state::{LocalDecision, LocalRule};
+use crate::assistant::network::run_state::{RefusedTargets, RunNetwork};
+use crate::assistant::sandbox::{
+    keyring_only_unavailable_note, run_command, ProxyEndpoint, SandboxCommand,
+    SandboxCommandOutput, SandboxEnv, SandboxNetworkMode, SandboxProfile, SandboxSessionBusMode,
+    SessionBusProxy, SocketPolicy,
+};
+#[cfg(target_os = "linux")]
+use crate::commands::network_access::{LocalListenerCard, LocalSnapshot, NetworkAccessDecision};
 use crate::config::{
-    ExecutionCapabilityConfig, FilesystemPathAccess, FilesystemPathGrant, GrantOrigin,
-    SandboxNetworkConfig, SandboxSessionBusConfig, ShellAccessMode,
+    ExecutionCapabilityConfig, FilesystemPathAccess, FilesystemPathGrant, GrantOrigin, NetworkMode,
+    SandboxSessionBusConfig, ShellAccessMode,
 };
 
-use super::{RunCommandGrant, ToolExecutionContext};
-use crate::commands::permissions::SegmentKind;
+use super::ToolExecutionContext;
+use crate::commands::permissions::{AskFirstDecision, AskFirstRow};
 
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 300_000;
 const MAX_BASH_TIMEOUT_MS: u64 = 1_800_000;
@@ -62,6 +77,15 @@ struct FsRequestGrantParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct NetRequestAccessParams {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WebSearchParams {
     query: String,
     #[serde(default)]
@@ -95,17 +119,30 @@ pub async fn execute_local_tool(
                 .map_err(|e| format!("Invalid fs_request_grant params: {}", e))?;
             execute_fs_request_grant(deps, context, params).await
         }
-        "web_search" => {
-            let params: WebSearchParams = serde_json::from_value(params)
-                .map_err(|e| format!("Invalid web_search params: {}", e))?;
-            execute_web_search(params).await
-        }
-        "web_fetch" => {
-            let params: WebFetchParams = serde_json::from_value(params)
-                .map_err(|e| format!("Invalid web_fetch params: {}", e))?;
-            execute_web_fetch(params).await
+        "web_search" | "web_fetch" => execute_web_tool(context, tool_name, params).await,
+        "net_request_access" => {
+            let params: NetRequestAccessParams = serde_json::from_value(params)
+                .map_err(|e| format!("Invalid net_request_access params: {}", e))?;
+            execute_net_request_access(deps, context, params).await
         }
         _ => Err(format!("Unknown local tool: {}", tool_name)),
+    }
+}
+
+async fn execute_web_tool(
+    context: &ToolExecutionContext,
+    tool_name: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let gate = web_gate(context)?;
+    if tool_name == "web_search" {
+        let params: WebSearchParams = serde_json::from_value(params)
+            .map_err(|e| format!("Invalid web_search params: {}", e))?;
+        execute_web_search(params).await
+    } else {
+        let params: WebFetchParams = serde_json::from_value(params)
+            .map_err(|e| format!("Invalid web_fetch params: {}", e))?;
+        execute_web_fetch(gate, params).await
     }
 }
 
@@ -124,33 +161,32 @@ async fn execute_bash_exec(
     let filesystem = filesystem_policy(context)?;
     let cwd = filesystem.authorize_cwd(params.cwd.as_deref().unwrap_or("."))?;
     let workspace_root = ensure_workspace_root(context)?;
+    // Before any ask-first card: a profile the sandbox cannot enforce fails
+    // here, so the user is never asked about a command that cannot run.
+    let profile = sandbox_profile(
+        context,
+        workspace_root,
+        filesystem,
+        &crate::assistant::sandbox::status(),
+    )
+    .inspect_err(|error| {
+        if error.starts_with("Sandboxed shell is unavailable") {
+            context.note_warning();
+        }
+    })?;
 
-    let run_allowed = context.session_allowed_command_prefixes_snapshot();
-    let run_blocked = context.session_blocked_command_prefixes_snapshot();
-    match evaluate_command_policy(
+    let sockets = profile.sockets.clone();
+
+    if params.command.trim().is_empty() {
+        return Err("Shell command cannot be empty".to_string());
+    }
+    let run_removed = context.run_removed_ask_first_snapshot();
+    if let PolicyResult::AskFirst(rows) = evaluate_command_policy(
         &context.run_context.execution,
         &params.command,
-        &run_allowed,
-        &run_blocked,
+        &run_removed,
     ) {
-        PolicyResult::Allow => { /* proceed */ }
-        PolicyResult::Block {
-            segment_text,
-            matched_prefix,
-        } => {
-            let message = if segment_text.is_empty() {
-                "Shell command cannot be empty".to_string()
-            } else {
-                format!(
-                    "Command `{}` is blocked for this agent (matched prefix `{}`)",
-                    segment_text, matched_prefix
-                )
-            };
-            return Err(message);
-        }
-        PolicyResult::NeedsApproval(segments) => {
-            await_user_permission(deps, context, &params.command, segments).await?;
-        }
+        await_ask_first(deps, context, &params.command, rows).await?;
     }
 
     // Whether the model set timeoutMs itself — drives the recovery hint on a
@@ -176,15 +212,19 @@ async fn execute_bash_exec(
         }
     };
 
-    let output = run_command(SandboxCommand {
-        argv,
-        cwd,
-        timeout_ms,
-        max_output_chars: output_limit,
-        profile: sandbox_profile(context, workspace_root, filesystem),
-    })
-    .await
-    .inspect_err(|error| {
+    let run = run_with_network(
+        SandboxCommand {
+            argv,
+            cwd,
+            timeout_ms,
+            max_output_chars: output_limit,
+            profile,
+        },
+        context.run_context.agent_display_name(),
+        &context.run_network,
+    )
+    .await;
+    let output = run.output.inspect_err(|error| {
         // Surface sandbox-availability failures (bwrap missing, kernel
         // refused namespaces, etc.) as a run warning so the run completes
         // with warnings rather than as a generic tool failure. The sandbox runner uses the
@@ -193,23 +233,430 @@ async fn execute_bash_exec(
         if error.starts_with("Sandboxed shell is unavailable") {
             context.note_warning();
         }
-    })
-    .map_err(|error| augment_timeout_error(error, timeout_ms, explicit_timeout))?;
+    });
+    let bus = run.session_bus_unavailable.as_deref();
+    bash_exec_outcome(
+        output,
+        &run.refused,
+        run.proxied,
+        &sockets,
+        bus,
+        timeout_ms,
+        explicit_timeout,
+    )
+}
 
-    if output.timed_out {
-        return Err(augment_timeout_error(
-            output.stderr,
-            timeout_ms,
-            explicit_timeout,
-        ));
+/// What a command run returned, and what the sandbox kept from it: the
+/// `host:port` targets the network proxy refused, kept when the command
+/// failed or timed out too (a client that kept retrying a refused host is a
+/// likely cause), and why a keyring-only agent got no session bus.
+struct NetworkRun {
+    output: Result<SandboxCommandOutput, String>,
+    refused: RefusedTargets,
+    /// Whether the command ran behind a network proxy session (Allowlist).
+    proxied: bool,
+    session_bus_unavailable: Option<String>,
+}
+
+/// Runs the command, in Allowlist behind a network proxy session of its
+/// own, and with the keyring-only bus behind a bus proxy of its own. A bus
+/// proxy that does not start leaves the command with no bus, never the
+/// whole one. The programs it starts are recorded as commands of `agent`.
+#[cfg(target_os = "linux")]
+async fn run_with_network(
+    mut command: SandboxCommand,
+    agent: Option<String>,
+    run_network: &std::sync::Arc<RunNetwork>,
+) -> NetworkRun {
+    use crate::assistant::network::{connect::HostConnector, proxy::ProxySession};
+    use crate::assistant::sandbox::bus_proxy::BusProxy;
+    // Starting waits for the proxy, and stopping waits for it to exit: both
+    // block, so neither runs on a runtime worker.
+    let bus_proxy = match command.profile.session_bus_proxy.clone() {
+        Some(plan) => match tokio::task::spawn_blocking(move || BusProxy::start(&plan)).await {
+            Ok(Ok(proxy)) => Some(proxy),
+            Ok(Err(error)) => {
+                command.profile.drop_session_bus(error);
+                None
+            }
+            Err(error) => {
+                command.profile.drop_session_bus(error.to_string());
+                None
+            }
+        },
+        None => None,
+    };
+    let session_bus_unavailable = command.profile.session_bus_unavailable.clone();
+    let stop_bus_proxy = || {
+        if let Some(proxy) = bus_proxy {
+            tokio::task::spawn_blocking(move || drop(proxy));
+        }
+    };
+    let session = match &mut command.profile.network {
+        SandboxNetworkMode::Proxied(endpoint) => {
+            // A port allowed later in the run answers from the next command.
+            endpoint.forward_ports = run_network.local_ports();
+            match ProxySession::start(
+                &endpoint.socket,
+                std::sync::Arc::clone(run_network),
+                std::sync::Arc::new(HostConnector),
+                crate::assistant::network::local_listener::host_inspector(),
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    stop_bus_proxy();
+                    return NetworkRun {
+                        output: Err(format!(
+                            "Sandboxed shell is unavailable: the network proxy did not start: \
+                             {error}"
+                        )),
+                        refused: RefusedTargets::default(),
+                        proxied: false,
+                        session_bus_unavailable,
+                    };
+                }
+            }
+        }
+        _ => None,
+    };
+    let output =
+        crate::assistant::network::spawn_roots::as_agent(agent, run_command(command)).await;
+    stop_bus_proxy();
+    NetworkRun {
+        output,
+        proxied: session.is_some(),
+        refused: session.map(|session| session.refused()).unwrap_or_default(),
+        session_bus_unavailable,
     }
-    Ok(serde_json::json!({
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_with_network(
+    command: SandboxCommand,
+    agent: Option<String>,
+    _run_network: &std::sync::Arc<RunNetwork>,
+) -> NetworkRun {
+    let session_bus_unavailable = command.profile.session_bus_unavailable.clone();
+    NetworkRun {
+        output: crate::assistant::network::spawn_roots::as_agent(agent, run_command(command)).await,
+        refused: RefusedTargets::default(),
+        proxied: false,
+        session_bus_unavailable,
+    }
+}
+
+const REFUSED_HINT: &str = "CLAI's network proxy refused these hosts: they are not in this \
+                            agent's allowed hosts, or are in its denied hosts. Call \
+                            `net_request_access` for a host the task needs; do not look for a \
+                            way around the proxy.";
+
+const SOCKET_HINT: &str = "The sandbox kept the command from reaching these Unix sockets of \
+                           this computer. Do not look for a way around the sandbox: if the task \
+                           needs one, call `fs_request_grant` with the exact socket path, not \
+                           its folder. A Docker, Podman or containerd socket gives control of \
+                           the whole computer, so say in the reason why the task needs it.";
+
+fn bash_exec_outcome(
+    output: Result<SandboxCommandOutput, String>,
+    refused: &RefusedTargets,
+    proxied: bool,
+    sockets: &SocketPolicy,
+    session_bus_unavailable: Option<&str>,
+    timeout_ms: u64,
+    explicit_timeout: bool,
+) -> Result<serde_json::Value, String> {
+    let output = output.and_then(|output| {
+        if output.timed_out {
+            Err(output.stderr)
+        } else {
+            Ok(output)
+        }
+    });
+    match output {
+        Ok(output) => Ok(bash_exec_result(
+            &output,
+            refused,
+            proxied,
+            sockets,
+            session_bus_unavailable,
+        )),
+        Err(error) => {
+            let mut error = augment_timeout_error(error, timeout_ms, explicit_timeout);
+            if let Some(reason) = session_bus_unavailable {
+                error = format!("{error}\n{}", keyring_only_unavailable_note(reason));
+            }
+            if refused.is_empty() {
+                return Err(error);
+            }
+            let more = match refused.more {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            Err(format!(
+                "{error}\nNetwork allowlist refused: {}{more}. {REFUSED_HINT}",
+                refused.targets.join(", ")
+            ))
+        }
+    }
+}
+
+/// Many clients hide the proxy's 403 body (curl prints only “CONNECT tunnel
+/// failed, response 403”), so the result itself names the refused hosts, and
+/// the host sockets the command could not reach. Behind the proxy
+/// (Allowlist), it also points a refused localhost connection at
+/// `net_request_access`.
+fn bash_exec_result(
+    output: &SandboxCommandOutput,
+    refused: &RefusedTargets,
+    proxied: bool,
+    sockets: &SocketPolicy,
+    session_bus_unavailable: Option<&str>,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
         "cwd": agent_path_string(&output.cwd),
         "exitCode": output.exit_code,
         "success": output.success,
         "stdout": output.stdout,
         "stderr": output.stderr
-    }))
+    });
+    if !refused.is_empty() {
+        result["network"] = serde_json::json!({
+            "refused": refused.targets,
+            "hint": REFUSED_HINT,
+        });
+        if refused.more > 0 {
+            result["network"]["refusedMore"] = refused.more.into();
+        }
+    }
+    if proxied {
+        if let Some(port) = localhost_refusal(output, refused) {
+            result["network"]["localhost"] = localhost_note(port);
+        }
+    }
+    let unreachable = unreachable_sockets(output, sockets);
+    if !unreachable.is_empty() {
+        result["sockets"] = serde_json::json!({
+            "unreachable": unreachable,
+            "hint": SOCKET_HINT,
+        });
+    }
+    if !sockets.skipped.is_empty() {
+        result["socketGrantsSkipped"] = serde_json::json!(sockets.skipped);
+    }
+    if let Some(reason) = session_bus_unavailable {
+        result["sessionBus"] = keyring_only_unavailable_note(reason).into();
+    }
+    result
+}
+
+/// Host Unix sockets a failed command could not reach, read from its output:
+/// a path on a line that says "no such file or directory" (the socket is not
+/// bound into the sandbox) or, where Landlock confines sockets, "permission
+/// denied", when that path is a socket on the host and not an allowed one.
+/// Only paths in `sockets.hint_places` are looked up, at most
+/// `MAX_LOOKUPS` per result: the command chooses what it prints.
+#[cfg(target_os = "linux")]
+fn unreachable_sockets(output: &SandboxCommandOutput, sockets: &SocketPolicy) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+    const MAX_SOCKETS: usize = 5;
+    const MAX_LOOKUPS: usize = 16;
+    let mut found: Vec<String> = Vec::new();
+    let mut lookups = 0;
+    if output.success {
+        return found;
+    }
+    for line in output.stderr.lines().chain(output.stdout.lines()) {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("no such file or directory")
+            || sockets.confined() && lower.contains("permission denied"))
+        {
+            continue;
+        }
+        for word in line.split(|c: char| c.is_whitespace() || "\"'(),;".contains(c)) {
+            let path = word.strip_prefix("unix://").unwrap_or(word);
+            let path = path.trim_end_matches([':', '.']);
+            let in_place = Path::new(path).is_absolute()
+                && sockets
+                    .hint_places
+                    .iter()
+                    .any(|place| Path::new(path).starts_with(place));
+            if !in_place || found.iter().any(|known| known == path) {
+                continue;
+            }
+            lookups += 1;
+            if lookups > MAX_LOOKUPS {
+                return found;
+            }
+            let Ok(resolved) = fs::canonicalize(path) else {
+                continue;
+            };
+            if !sockets
+                .hint_places
+                .iter()
+                .any(|place| resolved.starts_with(place))
+            {
+                continue;
+            }
+            let is_socket = resolved
+                .metadata()
+                .is_ok_and(|meta| meta.file_type().is_socket());
+            if is_socket && !sockets.allowed.iter().any(|socket| socket.host == resolved) {
+                found.push(path.to_string());
+                if found.len() == MAX_SOCKETS {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Only the Linux sandbox keeps sockets out; elsewhere nothing to report.
+#[cfg(not(target_os = "linux"))]
+fn unreachable_sockets(_output: &SandboxCommandOutput, _sockets: &SocketPolicy) -> Vec<String> {
+    Vec::new()
+}
+
+/// The `network.localhost` note for a refused localhost connection, naming
+/// the port when the output did.
+fn localhost_note(port: Option<u16>) -> serde_json::Value {
+    let host = port.map_or_else(
+        || "localhost:<port>".to_string(),
+        |port| format!("localhost:{port}"),
+    );
+    let mut note = serde_json::json!({
+        "hint": format!(
+            "A connection to localhost was refused. Inside the sandbox, localhost is the \
+             sandbox's own, not this computer's. If the service runs on this computer, call \
+             `net_request_access` with host `{host}`; once granted, the port answers \
+             from your next command."
+        ),
+    });
+    if let Some(port) = port {
+        note["port"] = port.into();
+    }
+    note
+}
+
+/// The localhost port the command output says a connection was refused on,
+/// `Some(None)` when the refusal names no port. A forwarded port never
+/// refuses (the forwarder accepts, then closes when nothing listens), so a
+/// refusal on an allowed port means it was allowed while the command ran,
+/// and it answers from the next one. A port the proxy refused is already
+/// named in `network.refused`.
+#[cfg(target_os = "linux")]
+fn localhost_refusal(
+    output: &SandboxCommandOutput,
+    refused: &RefusedTargets,
+) -> Option<Option<u16>> {
+    let mut portless = false;
+    for line in output.stderr.lines().chain(output.stdout.lines()) {
+        match refused_localhost_port(line) {
+            Some(Some(port)) if !refused.targets.contains(&format!("localhost:{port}")) => {
+                return Some(Some(port));
+            }
+            Some(None) => portless = true,
+            _ => {}
+        }
+    }
+    portless.then_some(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn localhost_refusal(
+    _output: &SandboxCommandOutput,
+    _refused: &RefusedTargets,
+) -> Option<Option<u16>> {
+    None
+}
+
+/// Whether `line` reports a refused connection to `localhost`, `127.0.0.1`
+/// or `::1`, and the port it names: right after the address
+/// (`localhost:3306`, `[::1]:3000`, `('127.0.0.1', 5678)`,
+/// `/dev/tcp/localhost/5678`) or as `port 5432` / `port=8000`. The sandbox
+/// keeps LANG and LC_*, so clients may print glibc's refusal and libpq's
+/// port word localized.
+#[cfg(target_os = "linux")]
+fn refused_localhost_port(line: &str) -> Option<Option<u16>> {
+    const REFUSALS: &[&str] = &[
+        "connection refused",
+        "econnrefused",
+        "connectionrefusederror",
+        "errno 111",
+        "can't connect",
+        "cannot connect",
+        "could not connect",
+        "couldn't connect",
+        "failed to connect",
+        "conexión rehusada",
+        "connexion refusée",
+        "verbindungsaufbau abgelehnt",
+        "connessione rifiutata",
+        "conexão recusada",
+        "ligação recusada",
+        "verbinding is geweigerd",
+        "conexión rexeitada",
+    ];
+    let line = line.to_ascii_lowercase().replace('\u{2019}', "'");
+    if !REFUSALS.iter().any(|refusal| line.contains(refusal)) {
+        return None;
+    }
+    let mut loopback = false;
+    for name in ["localhost", "127.0.0.1", "::1"] {
+        for (at, _) in line.match_indices(name) {
+            let after = &line[at + name.len()..];
+            let mut next = after.chars();
+            let longer = line[..at].chars().next_back().is_some_and(|c| {
+                c.is_ascii_alphanumeric() || "._-".contains(c) || (name == "::1" && c == ':')
+            }) || match next.next() {
+                Some('.') => next.next().is_some_and(|c| c.is_ascii_alphanumeric()),
+                Some(c) => c.is_ascii_alphanumeric() || "_-".contains(c),
+                None => false,
+            };
+            if longer {
+                continue;
+            }
+            loopback = true;
+            if let Some(port) = port_after_address(after) {
+                return Some(Some(port));
+            }
+        }
+    }
+    loopback.then(|| port_keyword(&line))
+}
+
+#[cfg(target_os = "linux")]
+fn port_after_address(after: &str) -> Option<u16> {
+    let after = after.trim_start_matches([']', '\'', '"']);
+    let digits = match after.strip_prefix([':', '/']) {
+        Some(digits) => digits,
+        None => after.strip_prefix(',')?.trim_start(),
+    };
+    leading_port(digits)
+}
+
+#[cfg(target_os = "linux")]
+fn port_keyword(line: &str) -> Option<u16> {
+    ["port", "puerto", "porta"].into_iter().find_map(|keyword| {
+        line.match_indices(keyword).find_map(|(at, word)| {
+            if line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                return None;
+            }
+            leading_port(line[at + word.len()..].trim_start_matches([' ', '=', ':']))
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn leading_port(text: &str) -> Option<u16> {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    text[..end].parse().ok().filter(|port| *port != 0)
 }
 
 /// Turn a bare sandbox timeout into an actionable error the model can recover
@@ -245,13 +692,18 @@ fn augment_timeout_error(error: String, timeout_ms: u64, explicit_timeout: bool)
 
 fn filesystem_policy(context: &ToolExecutionContext) -> Result<EffectiveFilesystemPolicy, String> {
     let workspace = ensure_workspace_root(context)?;
-    let mut grants = context.run_context.execution.filesystem.extra_paths.clone();
-    grants.extend(context.session_grants_snapshot());
     EffectiveFilesystemPolicy::from_config(
         &workspace,
-        &grants,
+        &path_grants(context),
         crate::paths::real_home().as_deref(),
     )
+}
+
+/// The agent's saved path grants and those approved for this run only.
+fn path_grants(context: &ToolExecutionContext) -> Vec<FilesystemPathGrant> {
+    let mut grants = context.run_context.execution.filesystem.extra_paths.clone();
+    grants.extend(context.session_grants_snapshot());
+    grants
 }
 
 fn ensure_workspace_root(context: &ToolExecutionContext) -> Result<PathBuf, String> {
@@ -268,6 +720,7 @@ fn ensure_workspace_root(context: &ToolExecutionContext) -> Result<PathBuf, Stri
             e
         )
     })?;
+    crate::assistant::sandbox::filesystem::ensure_cli_project_config_dirs(&workspace_root);
 
     Ok(workspace_root)
 }
@@ -276,16 +729,18 @@ fn sandbox_profile(
     context: &ToolExecutionContext,
     workspace_root: PathBuf,
     filesystem: EffectiveFilesystemPolicy,
-) -> SandboxProfile {
-    let network = match context.run_context.execution.sandbox.network {
-        SandboxNetworkConfig::Enabled => SandboxNetworkMode::Host,
-        SandboxNetworkConfig::Disabled => SandboxNetworkMode::Disabled,
-    };
+    sandbox: &crate::assistant::sandbox::SandboxStatus,
+) -> Result<SandboxProfile, String> {
+    let network = sandbox_network(
+        context.run_context.execution.sandbox.network_access.mode,
+        sandbox,
+        || proxy_endpoint(&workspace_root),
+    )?;
 
-    let session_bus = match context.run_context.execution.sandbox.session_bus {
-        SandboxSessionBusConfig::Deny => SandboxSessionBusMode::Deny,
-        SandboxSessionBusConfig::Allow => SandboxSessionBusMode::Allow,
-    };
+    let (session_bus, session_bus_proxy, session_bus_unavailable) =
+        session_bus_for(context.run_context.execution.sandbox.session_bus, || {
+            keyring_proxy(&workspace_root)
+        });
 
     let scratch_tmp = crate::assistant::sandbox::session_scratch(&workspace_root);
 
@@ -293,275 +748,260 @@ fn sandbox_profile(
         .home
         .as_deref()
         .unwrap_or(&filesystem.workspace_root);
-    SandboxProfile {
+    // Looked up for each command: a socket that appears, or a grant approved
+    // during the run, counts from the next command on.
+    #[cfg(target_os = "linux")]
+    let sockets = {
+        let grants: Vec<PathBuf> = path_grants(context)
+            .iter()
+            .filter_map(|grant| {
+                crate::assistant::sandbox::filesystem::resolve_configured_path(&grant.path).ok()
+            })
+            .collect();
+        let (allowed, skipped) = crate::assistant::sandbox::granted_sockets(&grants, &|path| {
+            filesystem.covers(path, FilesystemPathAccess::ReadWrite)
+        });
+        SocketPolicy {
+            allowed,
+            skipped,
+            ..crate::assistant::sandbox::socket_policy()
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sockets = Default::default();
+    Ok(SandboxProfile {
         env: SandboxEnv::filtered_from_current(env_home, session_bus),
         filesystem,
         network,
         session_bus,
         scratch_tmp,
+        sockets,
+        session_bus_proxy,
+        session_bus_unavailable,
+    })
+}
+
+/// The bus a command gets for the agent's setting. Only Full binds the
+/// real bus. Keyring only gets its proxy, or, where the bus cannot be
+/// filtered, no bus and the reason; `Ok(None)` from `plan` means the host
+/// has no bus to give.
+fn session_bus_for(
+    config: SandboxSessionBusConfig,
+    plan: impl FnOnce() -> Result<Option<SessionBusProxy>, String>,
+) -> (
+    SandboxSessionBusMode,
+    Option<SessionBusProxy>,
+    Option<String>,
+) {
+    match config {
+        SandboxSessionBusConfig::Deny => (SandboxSessionBusMode::Deny, None, None),
+        SandboxSessionBusConfig::Full => (SandboxSessionBusMode::Allow, None, None),
+        SandboxSessionBusConfig::KeyringOnly => match plan() {
+            Ok(Some(proxy)) => (SandboxSessionBusMode::Allow, Some(proxy), None),
+            Ok(None) => (SandboxSessionBusMode::Deny, None, None),
+            Err(reason) => (SandboxSessionBusMode::Deny, None, Some(reason)),
+        },
     }
 }
 
-/// Why a command was denied. Retained for the back-compat
-/// [`enforce_command_policy`] wrapper used by unit tests; new code paths
-/// branch on [`PolicyResult`] directly so they can surface per-segment
-/// info to the approval modal.
-#[allow(dead_code)]
-enum CommandDenial {
-    /// The command prefix is in the explicit block list — expected, no warning needed.
-    ExplicitlyBlocked(String),
-    /// The command prefix is not in the (non-empty) allow list — the user may not
-    /// have anticipated this, so a run warning is warranted.
-    NotInAllowList(String),
+/// The keyring-only bus proxy for a command (see `bus_proxy::plan`).
+#[cfg(target_os = "linux")]
+fn keyring_proxy(workspace_root: &Path) -> Result<Option<SessionBusProxy>, String> {
+    crate::assistant::sandbox::bus_proxy::plan(workspace_root)
 }
 
-#[allow(dead_code)]
-impl CommandDenial {
-    fn message(&self) -> &str {
-        match self {
-            CommandDenial::ExplicitlyBlocked(msg) | CommandDenial::NotInAllowList(msg) => msg,
+/// No session bus to filter: macOS and Windows have none.
+#[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the Linux signature so the call site has no cfg"
+)]
+fn keyring_proxy(_workspace_root: &Path) -> Result<Option<SessionBusProxy>, String> {
+    Ok(None)
+}
+
+/// The shell's network for a mode. A stored Allowlist where the sandbox
+/// cannot enforce it (macOS for now, a hand-edited or copied config), or
+/// whose helper or files are missing here, is an error, never the host
+/// network.
+fn sandbox_network(
+    mode: NetworkMode,
+    sandbox: &crate::assistant::sandbox::SandboxStatus,
+    proxy_endpoint: impl FnOnce() -> Result<ProxyEndpoint, String>,
+) -> Result<SandboxNetworkMode, String> {
+    match mode {
+        NetworkMode::Off => Ok(SandboxNetworkMode::Disabled),
+        NetworkMode::HostNetwork => Ok(SandboxNetworkMode::Host),
+        NetworkMode::Allowlist if sandbox.allowlist_available => {
+            proxy_endpoint().map(SandboxNetworkMode::Proxied)
         }
+        NetworkMode::Allowlist => Err(format!(
+            "Allowlist network mode: {}. Choose Off or Host network in the agent's Local access \
+             settings.",
+            sandbox
+                .allowlist_unavailable_reason
+                .as_deref()
+                .unwrap_or("not available with this sandbox")
+        )),
     }
 }
 
-/// Builds the tool error for a denied command. The denied parts are listed
-/// once; a reason is stated next to the parts it covers.
-pub(crate) fn denied_segments_message(
-    segments: &[crate::commands::permissions::SegmentApproval],
-    decisions: &[crate::commands::permissions::SegmentDecision],
-) -> String {
-    use crate::commands::permissions::SegmentDecision;
+#[cfg(target_os = "linux")]
+fn proxy_endpoint(workspace_root: &Path) -> Result<ProxyEndpoint, String> {
+    crate::assistant::sandbox::helper::endpoint(workspace_root)
+}
 
-    // (reason, denied parts) in the order each reason first appears.
-    let mut groups: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
-    let mut denied_parts: Vec<&str> = Vec::new();
-    for (segment, decision) in segments.iter().zip(decisions) {
-        let reason = match decision {
-            SegmentDecision::DenyOnce { reason } | SegmentDecision::DenyAlways { reason, .. } => {
-                reason
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty())
-            }
-            // An allowed part was not denied, so it is not part of the error.
-            _ => continue,
-        };
-        denied_parts.push(segment.text.as_str());
-        match groups
-            .iter()
-            .position(|(group_reason, _)| *group_reason == reason)
-        {
-            Some(index) => groups[index].1.push(segment.text.as_str()),
-            None => groups.push((reason, vec![segment.text.as_str()])),
-        }
-    }
+/// Only the Linux sandbox offers Allowlist; `sandbox_network` never asks
+/// for an endpoint elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn proxy_endpoint(_workspace_root: &Path) -> Result<ProxyEndpoint, String> {
+    Err("Sandboxed shell is unavailable: Allowlist needs the Linux sandbox".to_string())
+}
 
-    let quote = |parts: &[&str]| {
-        parts
-            .iter()
-            .map(|part| format!("`{part}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let mut message = "User denied one or more command segments".to_string();
-    if denied_parts.is_empty() {
-        message.push('.');
-        return message;
-    }
-    message.push_str(&format!(". Denied parts: {}", quote(&denied_parts)));
-
-    // One reason for the whole denial: state it plainly. Otherwise each
-    // reason names the parts it covers, so the model can tell them apart.
-    let reasons: Vec<(&str, &[&str])> = groups
+/// The tool error for a denied ask-first request: what was denied, the rule
+/// each part matched, and the user's reason when there is one.
+pub(crate) fn ask_first_denied_message(rows: &[AskFirstRow], reason: Option<&str>) -> String {
+    let denied = rows
         .iter()
-        .filter_map(|(reason, parts)| reason.map(|reason| (reason, parts.as_slice())))
-        .collect();
-    if reasons.len() == 1 && reasons[0].1.len() == denied_parts.len() {
-        message.push_str(&format!(". Reason: {}", reasons[0].0));
-    } else {
-        for (reason, parts) in reasons {
-            message.push_str(&format!(". Reason: {reason} for {}", quote(parts)));
-        }
+        .map(|row| format!("`{}` (ask-first rule `{}`)", row.text, row.rule))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = format!("User denied {denied}");
+    if let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        message.push_str(&format!(". Reason: {reason}"));
     }
     message.push('.');
     message
 }
 
-/// Richer per-segment policy evaluation result. Distinguishes a hard
-/// block (any segment matched the blocklist) from "needs approval"
-/// (some segments aren't in the allowlist but aren't blocked either).
-/// The approval flow in `execute_bash_exec` uses this to decide whether
-/// to deny outright or raise an interactive prompt.
+/// What `bash_exec` does with a command.
+#[derive(Debug)]
 pub(crate) enum PolicyResult {
-    /// All segments pass.
+    /// Run it.
     Allow,
-    /// One or more segments hit a blocklist entry. Whole command denied.
-    Block {
-        segment_text: String,
-        matched_prefix: String,
-    },
-    /// Segments that need user approval (Simple-not-in-allowlist or any
-    /// Opaque in Restricted mode). Each carries the smart-prefix
-    /// suggestion the modal pre-fills.
-    NeedsApproval(Vec<crate::commands::permissions::SegmentApproval>),
+    /// Ask the user first. Holds every row of the command that matched an
+    /// ask-first rule.
+    AskFirst(Vec<AskFirstRow>),
 }
 
+/// Checks `command` against the agent's ask-first list. Only Restricted
+/// agents have one in force: Full checks nothing. `run_removed` holds the
+/// rules "Always allow" removed earlier in this run, which the run's
+/// settings snapshot still lists.
 pub(crate) fn evaluate_command_policy(
     execution: &ExecutionCapabilityConfig,
     command: &str,
-    run_allowed: &[RunCommandGrant],
-    extra_blocked_prefixes: &[String],
+    run_removed: &[String],
 ) -> PolicyResult {
     use crate::assistant::tools::command_splitter::{split_command, Segment};
-    use crate::assistant::tools::prefix_detector::{
-        by_any_reading, by_argument_command, by_head_name, by_run_command, suggest_prefix,
-    };
-    use crate::commands::permissions::SegmentApproval;
 
-    if command.trim().is_empty() {
-        return PolicyResult::Block {
-            segment_text: String::new(),
-            matched_prefix: "<empty>".to_string(),
-        };
+    if !matches!(execution.shell.mode, ShellAccessMode::Restricted) {
+        return PolicyResult::Allow;
     }
-    // No segments means nothing runs but shell grammar and comments.
-    let segments = split_command(command);
-
-    let mut approvals: Vec<SegmentApproval> = Vec::new();
-    let restricted = matches!(execution.shell.mode, ShellAccessMode::Restricted);
-    let durable_allowed_prefixes = if restricted {
-        execution.shell.effective_allowed_command_prefixes()
-    } else {
-        Vec::new()
-    };
-    let run_prefixes: Vec<String> = run_allowed
+    let rules: Vec<String> = execution
+        .shell
+        .ask_first_command_prefixes
         .iter()
-        .filter_map(|grant| match grant {
-            RunCommandGrant::Prefix(prefix) => Some(prefix.clone()),
-            RunCommandGrant::Exact(_) => None,
+        .filter(|rule| {
+            !run_removed
+                .iter()
+                .any(|removed| removed.trim() == rule.trim())
         })
+        .cloned()
         .collect();
 
+    // No segments means nothing runs but shell grammar and comments.
+    let segments = split_command(command);
     // A row the splitter could not name or parse may hide what runs in any
-    // row of the input (`x='a[$(rm -rf y)]'; echo $((x))`), so the
-    // blocklist also reads every word of each row.
+    // row of the input (`x='a[$(rm -rf y)]'; echo $((x))`), so the rules
+    // are also read against every word of each row.
     let any_exact = segments
         .iter()
         .any(|s| matches!(s, Segment::Exact(_) | Segment::Unparsed(_)));
-    for segment in &segments {
-        let text = segment.text();
-        let unparsed = matches!(segment, Segment::Unparsed(_) | Segment::Exact(_));
+    let rows: Vec<AskFirstRow> = segments
+        .iter()
+        .flat_map(|segment| {
+            let text = segment.text();
+            matching_rules(&rules, text, any_exact)
+                .into_iter()
+                .map(|rule| AskFirstRow {
+                    text: text.to_string(),
+                    rule,
+                })
+        })
+        .collect();
 
-        // Blocklist applies to every segment. Durable blocklist is checked
-        // first; run-scoped blocklist (this run's accepted `DenyAlways`
-        // decisions) is checked next so a fresh deny-always takes effect
-        // mid-run. A blocked name is also blocked when run by path or after
-        // assignments (`FOO=1 /usr/bin/rm`); the allowlist is not widened.
-        let blocked = |text: &str| {
-            find_matching_prefix(
-                &execution.shell.blocked_command_prefixes,
-                text,
-                PolicySide::Deny,
-            )
-            .or_else(|| find_matching_prefix(extra_blocked_prefixes, text, PolicySide::Deny))
-        };
-        // The blocklist sees the command the segment runs, and the head it
-        // runs it with: `timeout 60 rm -rf x` is blocked by `rm` and by
-        // `timeout`, `xargs rm` by `rm` and by `xargs`. It also sees every
-        // command a misread option could hide: `xargs -0I rm echo` by `rm`.
-        if let Some(matched) = blocked(text)
-            .or_else(|| by_head_name(text).and_then(|head| blocked(&head)))
-            .or_else(|| by_run_command(text).and_then(|cmd| blocked(&cmd)))
-            .or_else(|| by_argument_command(text).and_then(|cmd| blocked(&cmd)))
-            .or_else(|| by_any_reading(text).iter().find_map(|cmd| blocked(cmd)))
-            .or_else(|| {
-                any_exact
-                    .then(|| blocked_word_run(execution, extra_blocked_prefixes, text))
-                    .flatten()
-            })
-        {
-            return PolicyResult::Block {
-                segment_text: text.to_string(),
-                matched_prefix: matched,
-            };
-        }
-
-        // Approval only exists in Restricted mode: Full mode never
-        // prompts, so the blocklist is best-effort for Unparsed input it
-        // cannot see into. See `is_exact_only`.
-        let needs_approval = restricted;
-        if !needs_approval {
-            continue;
-        }
-
-        // Benign shell constructs never need approval. Test expressions
-        // (`[ ... ]`, `[[ ... ]]`, `test ...`) only compare strings/files,
-        // and segments that are purely variable assignments (`FOO=bar`)
-        // just set shell state — neither runs a program of its own. The
-        // checked-for carve-out (a command substitution / backtick inside
-        // them) is handled in `is_benign_shell_construct`: those DO run
-        // code, so they fall through to normal approval. Blocklist was
-        // already applied above, so this can't bypass a hard deny.
-        if !unparsed && is_benign_shell_construct(text) {
-            continue;
-        }
-
-        // Run-scoped grants hold what was accepted this run via
-        // `AllowOnce`/`AllowAlways`. Without consulting them, every bash
-        // call after a fresh approval would re-prompt mid-run: durable
-        // list updates land on the next session, and persistence does
-        // not mutate the running execution snapshot.
-        let kind = if segment.is_opaque() {
-            SegmentKind::Opaque
-        } else {
-            SegmentKind::Simple
-        };
-        let suggested_prefix = if unparsed {
-            String::new()
-        } else {
-            suggest_prefix(text)
-        };
-        let allowed = if is_exact_only(&suggested_prefix) {
-            run_allowed.contains(&RunCommandGrant::Exact(text.to_string()))
-        } else {
-            find_matching_prefix(&durable_allowed_prefixes, text, PolicySide::Allow).is_some()
-                || find_matching_prefix(&run_prefixes, text, PolicySide::Allow).is_some()
-        };
-        if !allowed {
-            approvals.push(SegmentApproval {
-                text: text.to_string(),
-                kind,
-                suggested_prefix,
-            });
-        }
-    }
-
-    if approvals.is_empty() {
+    if rows.is_empty() {
         PolicyResult::Allow
     } else {
-        PolicyResult::NeedsApproval(approvals)
+        PolicyResult::AskFirst(rows)
     }
 }
 
-/// The blocklist entry that starts one of the [`word_runs`] of `text`.
-fn blocked_word_run(
-    execution: &ExecutionCapabilityConfig,
-    extra_blocked_prefixes: &[String],
-    text: &str,
-) -> Option<String> {
-    word_runs(text).find_map(|run| {
-        execution
-            .shell
-            .blocked_command_prefixes
-            .iter()
-            .chain(extra_blocked_prefixes)
-            .find(|p| !p.trim().is_empty() && matches_prefix_literal(p.trim(), &run))
-            .cloned()
-    })
+/// Every rule of `rules` that names a command the row `text` runs, trimmed,
+/// once each, in list order. "Always allow" removes all of them, so the row
+/// does not ask again through another rule.
+///
+/// A rule matches the row as written, and also when the command is run by
+/// path or after assignments (`FOO=1 /usr/bin/rm`). The row is also read
+/// as the head it runs a command with and the command that head runs:
+/// `timeout 60 rm -rf x` matches `rm` and `timeout`, `xargs rm` matches
+/// `rm` and `xargs`. Every command a misread option could hide is read
+/// too: `xargs -0I rm echo` matches `rm`, and so are the commands `find`
+/// runs for its matches and the method `gh api` requests. When `any_exact`
+/// is set, some row of the input could not be named, so every run of words
+/// is read.
+fn matching_rules(rules: &[String], text: &str, any_exact: bool) -> Vec<String> {
+    use crate::assistant::tools::prefix_detector::{
+        by_any_reading, by_argument_command, by_find_action, by_head_name, by_run_command,
+        canonicalize_for_deny, gh_api_method_forms,
+    };
+
+    let mut readings: Vec<String> = std::iter::once(text.to_string())
+        .chain(by_head_name(text))
+        .chain(by_run_command(text))
+        .chain(by_argument_command(text))
+        .chain(by_any_reading(text))
+        .collect();
+    // `find` first, so the method of a `gh api` that `find` runs is read too.
+    let find_actions: Vec<String> = readings
+        .iter()
+        .map(String::as_str)
+        .flat_map(by_find_action)
+        .collect();
+    readings.extend(find_actions);
+    let gh_api_methods: Vec<String> = readings
+        .iter()
+        .map(String::as_str)
+        .flat_map(gh_api_method_forms)
+        .collect();
+    readings.extend(gh_api_methods);
+    // A rule cannot hide behind leading assignments or global options either:
+    // `FOO=bar rm` reads as `rm`, `git -C repo push` as `git push`.
+    let canonical: Vec<String> = readings
+        .iter()
+        .filter_map(|reading| canonicalize_for_deny(reading))
+        .collect();
+    readings.extend(canonical);
+    if any_exact {
+        readings.extend(word_runs(text));
+    }
+
+    let mut matched: Vec<String> = Vec::new();
+    for rule in rules.iter().map(|rule| rule.trim()) {
+        if !rule.is_empty()
+            && !matched.iter().any(|seen| seen == rule)
+            && readings
+                .iter()
+                .any(|reading| matches_prefix_literal(rule, reading))
+        {
+            matched.push(rule.to_string());
+        }
+    }
+    matched
 }
 
-/// Words a blocklist entry may span in [`word_runs`].
+/// Words a rule may span in [`word_runs`].
 const WORD_RUN: usize = 16;
 
 /// Each word of `text` with up to [`WORD_RUN`] words after it, joined by single spaces,
@@ -579,95 +1019,6 @@ fn word_runs(text: &str) -> impl Iterator<Item = String> {
         .map(|word| word.rsplit('/').next().unwrap_or(word).to_string())
         .collect();
     (0..words.len()).map(move |at| words[at..words.len().min(at + WORD_RUN)].join(" "))
-}
-
-/// The rule for a row with no prefix to save: input the splitter could not
-/// parse (`Segment::Unparsed`), an Opaque segment whose commands it could
-/// not all identify, or a command no prefix names safely (bare `xargs`,
-/// which a prefix `xargs` would extend to every command). Such a row is
-/// asked as its exact text: "Allow once" covers that text alone and no
-/// "Always" is offered. Unparsed input needs that approval in Restricted
-/// mode only: Full mode never prompts, even while a blocklist is active.
-fn is_exact_only(suggested_prefix: &str) -> bool {
-    suggested_prefix.is_empty()
-}
-
-/// What an "Allow once" on `row` allows for the rest of the run.
-fn once_grant(row: &crate::commands::permissions::SegmentApproval) -> RunCommandGrant {
-    if is_exact_only(&row.suggested_prefix) {
-        RunCommandGrant::Exact(row.text.clone())
-    } else {
-        RunCommandGrant::Prefix(row.text.clone())
-    }
-}
-
-/// True for shell segments that have no execution surface of their own and
-/// therefore never need approval:
-///
-/// - **Test expressions** — `[ ... ]`, `[[ ... ]]`, or the `test` builtin.
-///   These only compare strings/files; they spawn no program.
-/// - **Pure assignments** — a segment whose every token is `NAME=value`
-///   (`FOO=bar`, `A=1 B=2`). These just set shell variables.
-/// - **Jumps** — `break`, `continue`, `return`, with at most a number.
-///   These only steer a loop or a function.
-///
-/// Carve-out: if the segment embeds a command substitution (`$(...)`) or
-/// backticks, it DOES run code — `[ -n "$(curl x)" ]` or `V=$(git log)` —
-/// so we report it as non-benign and let the normal approval path gate the
-/// embedded command. An assignment used as a *prefix* to a real command
-/// (`FOO=bar mycmd`) is likewise not benign: `mycmd` is a token that isn't
-/// an assignment, so the all-assignments check fails and we fall through.
-fn is_benign_shell_construct(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // A command or process substitution runs arbitrary code — defer to
-    // normal approval so the embedded command is gated.
-    if crate::assistant::tools::command_splitter::has_substitution(trimmed) {
-        return false;
-    }
-
-    let mut tokens = trimmed.split_whitespace();
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-
-    // Test expressions: the head token is the `test` builtin in one of its
-    // three spellings. Contents are side-effect-free (we already ruled out
-    // embedded substitutions above).
-    if first == "[" || first == "[[" || first == "test" {
-        return true;
-    }
-
-    if matches!(first, "break" | "continue" | "return") {
-        return tokens.all(|tok| tok.bytes().all(|b| b.is_ascii_digit()));
-    }
-
-    // Pure assignments: the head and every remaining token are `NAME=value`.
-    std::iter::once(first)
-        .chain(tokens)
-        .all(is_pure_assignment_token)
-}
-
-/// True if `tok` is a `NAME=value` assignment with a shell-valid name
-/// (leading letter/underscore, then alphanumerics/underscores). Mirrors the
-/// env-assignment recognizer used by the splitter and prefix detector.
-fn is_pure_assignment_token(tok: &str) -> bool {
-    let Some(eq) = tok.find('=') else {
-        return false;
-    };
-    if eq == 0 {
-        return false;
-    }
-    let mut chars = tok[..eq].chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Cleans up an abandoned permission request when the approval-wait future
@@ -734,25 +1085,22 @@ impl Drop for AbandonedApprovalGuard {
     }
 }
 
-/// Runs the interactive approval round-trip for a command that needs
-/// user input. Registers the request in app state, emits the request
-/// and attention events, waits for the user's decisions, and resolves to
-/// `Ok(())` if every segment was allowed or `Err(_)` on any deny / channel
-/// close. If the wait is abandoned without a decision, `AbandonedApprovalGuard`
-/// cancels the run so the model does not continue around a missing human
-/// decision. Persistence of "always" grants is performed by
-/// [`crate::commands::permissions::submit_permission_decision`] before the
-/// oneshot is fired, so the grant is durable across crashes between user click
-/// and command execution.
-async fn await_user_permission(
+/// Asks the user about a command that matched the ask-first list. Registers
+/// the request in app state, emits the request and attention events, waits
+/// for the decision, and resolves to `Ok(())` when the command may run or
+/// `Err(_)` carrying the user's reason on a denial. If the wait is abandoned
+/// without a decision, `AbandonedApprovalGuard` cancels the run so the model
+/// does not continue around a missing human decision. "Always allow" is saved
+/// on the agent by [`crate::commands::permissions::submit_permission_decision`]
+/// before the decision is delivered.
+async fn await_ask_first(
     deps: &crate::assistant::engine::AssistantDeps,
     context: &ToolExecutionContext,
     command: &str,
-    segments: Vec<crate::commands::permissions::SegmentApproval>,
+    rows: Vec<AskFirstRow>,
 ) -> Result<(), String> {
     use crate::commands::permissions::{
-        emit_attention, PendingApprovalOutcome, PermissionRequest, SegmentDecision,
-        PERMISSION_REQUEST_EVENT,
+        emit_attention, PendingApprovalOutcome, PermissionRequest, PERMISSION_REQUEST_EVENT,
     };
     use tauri::{Emitter, Manager};
 
@@ -760,17 +1108,18 @@ async fn await_user_permission(
     let workspace_id = Some(deps.workspace_id.clone());
     let agent_id = context.run_context.automation_id.clone();
 
-    // The constructor resolves where an "always" decision would be saved — in
-    // this workspace for its Main, or on a shared definition in force wherever
+    // The constructor resolves where "Always allow" would be saved — in this
+    // workspace for its Main, or on a shared definition in force wherever
     // that teammate works.
     let request = PermissionRequest::for_agent(
         &app_state,
         workspace_id.clone(),
         agent_id,
         command.to_string(),
-        segments.clone(),
+        rows.clone(),
     );
     let request_id = request.request_id.clone();
+    let rules = request.rules();
 
     // Supersede: if a previous request for this exact run + command is
     // still pending, it is an orphan — its CLI transport dropped mid-call
@@ -810,12 +1159,12 @@ async fn await_user_permission(
         armed: true,
     };
 
-    let decisions = match rx.await {
-        Ok(PendingApprovalOutcome::Decision(d)) => {
+    let decision = match rx.await {
+        Ok(PendingApprovalOutcome::Decision(decision)) => {
             // The submit command already removed the registry entry and
             // emitted `permissions://resolved`.
             abandon_guard.disarm();
-            d
+            decision
         }
         Ok(PendingApprovalOutcome::Superseded) => {
             // A fresh registration for the same run + command replaced
@@ -834,51 +1183,31 @@ async fn await_user_permission(
         }
     };
 
-    // Cache the user's intent on the run-scoped allow/block lists
-    // BEFORE the deny short-circuit, so a `DenyAlways` still ends the
-    // current call with an error but its block-prefix is recorded so
-    // subsequent retries of the same command don't re-prompt.
-    //
-    // - `AllowAlways` caches the user's chosen prefix (also persisted
-    //   durably by the submit command).
-    // - `AllowOnce` caches the segment's full text: `matches_prefix`
-    //   accepts an exact match or an additional-args extension (so an
-    //   `AllowOnce` of `git status` covers `git status -s` in the same
-    //   run, matching what the durable `AllowAlways` semantics would
-    //   give for the same prefix). A row `is_exact_only` covers its
-    //   exact text only.
-    // - `DenyAlways` caches the user's chosen prefix on the run-scoped
-    //   blocklist (also persisted durably). Without this, the LLM's
-    //   next retry of the just-denied command would re-prompt the user
-    //   because persistence updates the DB but not the running
-    //   `context.execution` snapshot.
-    // - `DenyOnce` is intentionally not cached. It's a single-shot
-    //   decision by design — re-prompting on retry lets the user
-    //   reconsider. (The current call is still denied by the check
-    //   below.)
-    for (segment, decision) in segments.iter().zip(decisions.iter()) {
-        match decision {
-            SegmentDecision::AllowAlways { prefix, .. } => {
-                context.add_session_allowed_command(RunCommandGrant::Prefix(
-                    prefix.trim().to_string(),
-                ));
-            }
-            SegmentDecision::AllowOnce => {
-                context.add_session_allowed_command(once_grant(segment));
-            }
-            SegmentDecision::DenyAlways { prefix, .. } => {
-                context.add_session_blocked_command_prefix(prefix.clone());
-            }
-            SegmentDecision::DenyOnce { .. } => {}
+    apply_ask_first_decision(context, &rows, &rules, decision)
+}
+
+/// Applies the user's answer to the command waiting on it: `Ok(())` runs
+/// it, and a denial is the tool error. `rules` are the rules the command
+/// matched, which "Always allow" removed from the agent's list.
+fn apply_ask_first_decision(
+    context: &ToolExecutionContext,
+    rows: &[AskFirstRow],
+    rules: &[String],
+    decision: AskFirstDecision,
+) -> Result<(), String> {
+    match decision {
+        AskFirstDecision::AllowOnce => Ok(()),
+        AskFirstDecision::AlwaysAllow => {
+            // This run reads its settings from a snapshot taken at start, so
+            // the removal saved on the agent would not reach it.
+            context.add_run_removed_ask_first(rules);
+            Ok(())
+        }
+        AskFirstDecision::Deny { reason } => {
+            context.note_warning();
+            Err(ask_first_denied_message(rows, reason.as_deref()))
         }
     }
-
-    if decisions.iter().any(|d| !d.is_allow()) {
-        context.note_warning();
-        return Err(denied_segments_message(&segments, &decisions));
-    }
-
-    Ok(())
 }
 
 async fn execute_fs_request_grant(
@@ -890,12 +1219,21 @@ async fn execute_fs_request_grant(
         canonicalize_requested_path(&params.path, crate::paths::real_home().as_deref())?;
     let canonical_str = agent_path_string(&canonical);
 
-    // If the path is already covered (by extra_paths, the preset, or an
+    // If the path is already granted (by extra_paths, the preset, or an
     // earlier session grant), short-circuit — no user prompt, just say yes.
     // This keeps repeated requests cheap and avoids modal spam when the LLM
     // forgets it already has the grant.
     let filesystem = filesystem_policy(context)?;
-    if filesystem.covers(&canonical, params.access) {
+    if matches!(params.access, FilesystemPathAccess::ReadWrite)
+        && filesystem.is_read_only_state(&canonical)
+    {
+        return Err(format!(
+            "{canonical_str} is CLAI's own state or a provider CLI's project \
+             configuration, which the shell may only read; \
+             agents write only under their own `.clai/memory/`"
+        ));
+    }
+    if already_granted(&filesystem, &canonical, params.access) {
         return Ok(serde_json::json!({
             "granted": true,
             "path": canonical_str,
@@ -952,6 +1290,29 @@ async fn execute_fs_request_grant(
     }
 }
 
+/// Whether the agent's grants answer a request for `path`. On Linux a
+/// socket needs a grant on itself: a folder grant shows the socket, but
+/// commands cannot connect to it.
+fn already_granted(
+    filesystem: &EffectiveFilesystemPolicy,
+    path: &Path,
+    access: FilesystemPathAccess,
+) -> bool {
+    filesystem.covers(path, access)
+        && (!is_socket(path) || filesystem.path_grants.iter().any(|g| g.host_path == path))
+}
+
+#[cfg(target_os = "linux")]
+fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_socket(_path: &Path) -> bool {
+    false
+}
+
 /// Turn the agent's requested path into the identity the compiled policy
 /// reasons about. `~` expands to the host home (not the process `HOME`, which
 /// differs under Flatpak) and resolution goes through
@@ -1004,10 +1365,6 @@ fn access_to_str(access: FilesystemPathAccess) -> &'static str {
     }
 }
 
-/// Awaits the user's decision on a path-grant request. Mirrors
-/// [`await_user_permission`] for shape; the only differences are the
-/// request type, the registry it talks to, and the single-decision
-/// return shape (path grants aren't per-segment).
 /// Path-grant analogue of [`AbandonedApprovalGuard`]: clears a pending
 /// filesystem path-grant request, drops its card, and cancels the run when
 /// the approval-wait future is abandoned (run cancellation, or run-end
@@ -1062,6 +1419,9 @@ impl Drop for AbandonedPathGrantGuard {
     }
 }
 
+/// Awaits the user's decision on a path-grant request. Mirrors
+/// [`await_ask_first`] for shape; the only differences are the
+/// request type and the registry it talks to.
 async fn await_path_grant_decision(
     deps: &crate::assistant::engine::AssistantDeps,
     context: &ToolExecutionContext,
@@ -1078,7 +1438,7 @@ async fn await_path_grant_decision(
 
     // Supersede a stale orphaned request for the same run + path + access
     // (the model re-asked after a CLI transport drop). See the analogous
-    // block in `await_user_permission` for the full rationale.
+    // block in `await_ask_first` for the full rationale.
     for stale in app_state
         .pending_path_grants
         .take_superseded(
@@ -1135,109 +1495,6 @@ async fn await_path_grant_decision(
     }
 }
 
-/// Back-compat wrapper around [`evaluate_command_policy`]. Maps the
-/// richer result to the historic `Result<(), CommandDenial>` shape used
-/// by existing tests and by the legacy "silent deny" code path when the
-/// approval round-trip is unavailable (e.g., during shutdown).
-#[allow(dead_code)]
-fn enforce_command_policy(
-    execution: &ExecutionCapabilityConfig,
-    _workspace_root: Option<&std::path::Path>,
-    command: &str,
-) -> Result<(), CommandDenial> {
-    match evaluate_command_policy(execution, command, &[], &[]) {
-        PolicyResult::Allow => Ok(()),
-        PolicyResult::Block {
-            segment_text,
-            matched_prefix,
-        } => {
-            if segment_text.is_empty() {
-                Err(CommandDenial::ExplicitlyBlocked(
-                    "Shell command cannot be empty".to_string(),
-                ))
-            } else {
-                Err(CommandDenial::ExplicitlyBlocked(format!(
-                    "Command `{}` is blocked for this agent (matched prefix `{}`)",
-                    segment_text, matched_prefix
-                )))
-            }
-        }
-        PolicyResult::NeedsApproval(segs) => {
-            let first = segs.into_iter().next().unwrap();
-            let short = command_preview(&first.text);
-            Err(CommandDenial::NotInAllowList(format!(
-                "Command `{}` is not in the allowed list. Add `{}` to allow it.",
-                short, short
-            )))
-        }
-    }
-}
-
-/// Extract the first two words of a command for display (e.g. "kubectl get").
-fn command_preview(command: &str) -> String {
-    let mut words = command.split_whitespace();
-    match (words.next(), words.next()) {
-        (Some(cmd), Some(sub)) if !sub.starts_with('-') => format!("{} {}", cmd, sub),
-        (Some(cmd), _) => cmd.to_string(),
-        _ => command.to_string(),
-    }
-}
-
-/// Word-boundary prefix match for command-policy lists. Returns the first
-/// matching prefix on a hit.
-///
-/// Matching rules:
-///   - prefix "kubectl get" matches command "kubectl get pods"
-///   - prefix "kubectl" matches command "kubectl delete pods"
-///   - prefix "kubectl get" does NOT match command "kubectl delete pods"
-fn find_matching_prefix(prefixes: &[String], command: &str, side: PolicySide) -> Option<String> {
-    prefixes
-        .iter()
-        .find(|p| matches_prefix(p, command, side))
-        .cloned()
-}
-
-/// Which policy list a prefix is matched against. The blocklist consults
-/// every canonical form — more forms can only block more. The allowlist
-/// consults only the form that keeps config-injecting options verbatim,
-/// so `git -c <cfg>=<cmd> diff` never rides a saved `git diff` grant.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PolicySide {
-    Allow,
-    Deny,
-}
-
-fn matches_prefix(prefix: &str, command: &str, side: PolicySide) -> bool {
-    let p = prefix.trim();
-    if p.is_empty() {
-        return false;
-    }
-    if matches_prefix_literal(p, command) {
-        return true;
-    }
-    // Fall back to the command's canonical forms so an allowlist entry the
-    // suggester proposed still matches the raw command it came from. The
-    // suggester strips leading env assignments and global flags between the
-    // binary and its subcommand (`git --no-pager log` → `git log`); the
-    // literal match above does not, so without this an "Always allow git
-    // log" grant would never cover a `git --no-pager log` invocation. The
-    // blocklist additionally consults the fully-stripped form (a blocked
-    // `rm` can't hide behind `FOO=bar rm`, a blocked `git push` behind
-    // `git -C repo push`).
-    let matches_form =
-        |form: Option<String>| form.is_some_and(|canonical| matches_prefix_literal(p, &canonical));
-    let allow_form = crate::assistant::tools::prefix_detector::canonicalize_for_allow(command);
-    match side {
-        PolicySide::Allow => matches_form(allow_form),
-        PolicySide::Deny => {
-            matches_form(allow_form)
-                || matches_form(
-                    crate::assistant::tools::prefix_detector::canonicalize_for_deny(command),
-                )
-        }
-    }
-}
-
 /// Literal word-boundary prefix test: `command` equals `p`, or starts with
 /// `p` followed by whitespace (so `git log` matches `git log --oneline` but
 /// not `git logs`).
@@ -1251,19 +1508,555 @@ fn matches_prefix_literal(p: &str, command: &str) -> bool {
 // Web tools
 // =============================================================================
 
+/// Which hosts the web tools may reach for one agent. They run in this
+/// process, so they follow the mode on every PC, one without a sandbox too.
+#[derive(Debug, Clone, Copy)]
+enum WebGate<'a> {
+    /// Host network: any public host.
+    AnyHost,
+    /// Allowlist: only the hosts the run allows, on every redirect hop.
+    Allowlist(&'a RunNetwork),
+}
+
+fn web_gate(context: &ToolExecutionContext) -> Result<WebGate<'_>, String> {
+    web_access(
+        context.run_context.execution.sandbox.network_access.mode,
+        &context.run_network,
+    )
+}
+
+fn web_access(mode: NetworkMode, network: &RunNetwork) -> Result<WebGate<'_>, String> {
+    match mode {
+        NetworkMode::Off => Err("Network access is off for this agent".to_string()),
+        NetworkMode::Allowlist => Ok(WebGate::Allowlist(network)),
+        NetworkMode::HostNetwork => Ok(WebGate::AnyHost),
+    }
+}
+
+/// `host` as the URL carries it: lower case, punycode, IPv6 in brackets.
+/// In Allowlist the run's host log records the outcome.
+fn check_web_host(gate: WebGate<'_>, host: &str, port: Option<u16>) -> Result<(), String> {
+    let WebGate::Allowlist(network) = gate else {
+        return Ok(());
+    };
+    let decision = network.decide(host);
+    network.record(host, port, decision == HostDecision::Allowed);
+    match decision.refusal(
+        host,
+        crate::assistant::sandbox::status().allowlist_available,
+    ) {
+        None => Ok(()),
+        Some(refusal) => Err(refusal),
+    }
+}
+
+// =============================================================================
+// net_request_access
+// =============================================================================
+
+async fn execute_net_request_access(
+    deps: &crate::assistant::engine::AssistantDeps,
+    context: &ToolExecutionContext,
+    params: NetRequestAccessParams,
+) -> Result<serde_json::Value, String> {
+    use crate::commands::network_access::NetworkAccessRequest;
+    use tauri::Manager;
+
+    let ask = requested_host(
+        &context.run_context.execution,
+        crate::assistant::sandbox::status().allowlist_available,
+        &context.run_network,
+        &params.host,
+        params.port,
+    )?;
+    let host = match ask {
+        Ask::Allowed => {
+            return Ok(serde_json::json!({
+                "granted": true,
+                "host": canonical_host(&params.host),
+                "scope": "already-allowed",
+            }))
+        }
+        Ask::Host(host) => host,
+        Ask::LocalPort(local) => {
+            return local_port_access(deps, context, local, params.reason).await
+        }
+    };
+
+    let request = NetworkAccessRequest::for_agent(
+        &deps.app.state::<crate::AppState>(),
+        Some(deps.workspace_id.clone()),
+        context.run_context.automation_id.clone(),
+        host.clone(),
+        params.port,
+        params.reason,
+        context.run_network.host_log(),
+    );
+    let decision = await_network_access_decision(deps, context, request).await?;
+    apply_network_decision(context, &host, decision)
+}
+
+/// What `net_request_access` asks the user about.
+#[derive(Debug, PartialEq, Eq)]
+enum Ask {
+    /// The run already reaches the host.
+    Allowed,
+    Host(String),
+    /// A port on this computer: what listens there decides next whether a
+    /// card is shown.
+    LocalPort(LocalAsk),
+}
+
+/// A port on this computer, which the request names as [`LOCALHOST`]
+/// whatever its spelling, so a re-ask spelled `127.0.0.1` or `[::1]`
+/// replaces a pending request for the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalAsk {
+    port: u16,
+    /// The name the agent used, which decides the loopback address looked
+    /// at, as in the network proxy.
+    dialled: &'static str,
+}
+
+/// Asks for a port on this computer, with a card that shows what listens
+/// there.
+#[cfg(target_os = "linux")]
+async fn local_port_access(
+    deps: &crate::assistant::engine::AssistantDeps,
+    context: &ToolExecutionContext,
+    local: LocalAsk,
+    reason: String,
+) -> Result<serde_json::Value, String> {
+    use crate::commands::network_access::NetworkAccessRequest;
+    use tauri::Manager;
+
+    let inspector = crate::assistant::network::local_listener::host_inspector();
+    request_local_port(context, inspector, local, |listener| async move {
+        let request = NetworkAccessRequest::for_local_port(
+            &deps.app.state::<crate::AppState>(),
+            Some(deps.workspace_id.clone()),
+            context.run_context.automation_id.clone(),
+            local.port,
+            reason,
+            context.run_network.host_log(),
+            listener,
+        );
+        await_network_access_decision(deps, context, request).await
+    })
+    .await
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_port_access(
+    _deps: &crate::assistant::engine::AssistantDeps,
+    _context: &ToolExecutionContext,
+    local: LocalAsk,
+    _reason: String,
+) -> std::future::Ready<Result<serde_json::Value, String>> {
+    std::future::ready(Err(format!(
+        "`{LOCALHOST}:{}` cannot be requested on this PC.",
+        local.port
+    )))
+}
+
+/// Asks the user about a port on this computer, unless the deny list
+/// refuses it, nothing a card could show listens there, or the run already
+/// reaches the listener. Then applies the answer, bound to what listened
+/// when the card was made: `ask` shows the card and waits.
+#[cfg(target_os = "linux")]
+async fn request_local_port<F, Fut>(
+    context: &ToolExecutionContext,
+    inspector: std::sync::Arc<dyn ListenerInspector>,
+    local: LocalAsk,
+    ask: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(LocalListenerCard) -> Fut,
+    Fut: std::future::Future<Output = Result<NetworkAccessDecision, String>>,
+{
+    let network = &context.run_network;
+    let port = local.port;
+    if let Some((name, denied)) = network.local_denial() {
+        return Err(denied.refusal(name, true).unwrap_or_default());
+    }
+    let dials = crate::assistant::network::proxy::dials(local.dialled);
+    let listener = tokio::task::spawn_blocking(move || first_listener(&*inspector, port, dials))
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+        .map_err(|error| {
+            format!("CLAI could not check what listens on port {port} on this computer: {error}")
+        })?;
+    if network.decide_local(port, &listener) == LocalDecision::Allowed {
+        return Ok(serde_json::json!({
+            "granted": true,
+            "host": LOCALHOST,
+            "port": port,
+            "scope": "already-allowed",
+        }));
+    }
+    let Some(card) = LocalListenerCard::of(&listener) else {
+        return Err(if listener == Listener::Clai {
+            crate::assistant::network::local_listener::served_by_clai(port)
+        } else {
+            format!(
+                "Nothing listens on port {port} on this computer. Ask the user to start \
+                 the service or tunnel that should serve it, then call \
+                 `net_request_access` again."
+            )
+        });
+    };
+    let snapshot = card.snapshot().clone();
+    let decision = ask(card).await?;
+    apply_local_decision(context, local, &snapshot, decision)
+}
+
+/// What listens on `port` at the first of `dials` where anything does, from
+/// a full scan, as a card must show.
+#[cfg(target_os = "linux")]
+fn first_listener(
+    inspector: &dyn ListenerInspector,
+    port: u16,
+    dials: &[Loopback],
+) -> std::io::Result<Listener> {
+    for &dial in dials {
+        let listener = inspector.inspect(port, dial)?;
+        if listener != Listener::Nothing {
+            return Ok(listener);
+        }
+    }
+    Ok(Listener::Nothing)
+}
+
+/// Applies the answer for a port on this computer to the run, bound to
+/// `snapshot`: “Allow this run” adds its run bindings; “Always”,
+/// already saved on the agent, adds the saved grant. A denial is the tool
+/// error and the run's warning. The result names the port only, never the
+/// listener the card showed.
+#[cfg(target_os = "linux")]
+fn apply_local_decision(
+    context: &ToolExecutionContext,
+    local: LocalAsk,
+    snapshot: &LocalSnapshot,
+    decision: NetworkAccessDecision,
+) -> Result<serde_json::Value, String> {
+    let entry = format!("{LOCALHOST}:{}", local.port);
+    let (rules, scope, note) = match decision {
+        NetworkAccessDecision::AllowRun => (
+            run_rules(local.port, snapshot),
+            "run",
+            "Allowed for the rest of this run only, for what listens there now; a later \
+             run has to ask again.",
+        ),
+        NetworkAccessDecision::AllowAlways { .. } => (
+            vec![LocalRule::from(&snapshot.always_grant(local.port)?)],
+            "always",
+            "Saved on this agent for what listens there now.",
+        ),
+        NetworkAccessDecision::Deny { reason } => {
+            context.note_warning();
+            return Err(network_denied_message(&entry, reason.as_deref()));
+        }
+    };
+    for rule in rules {
+        context.run_network.allow_local(rule);
+    }
+    Ok(serde_json::json!({
+        "granted": true,
+        "host": LOCALHOST,
+        "port": local.port,
+        "entry": entry,
+        "scope": scope,
+        "note": format!("{note} Connect to `{entry}` from your next command."),
+    }))
+}
+
+/// The rules “Allow this run” adds on `port`.
+#[cfg(target_os = "linux")]
+fn run_rules(port: u16, snapshot: &LocalSnapshot) -> Vec<LocalRule> {
+    snapshot
+        .run_bindings()
+        .into_iter()
+        .map(|binding| LocalRule { port, binding })
+        .collect()
+}
+
+/// What to ask the user about. Refuses, without a card, where the tool is
+/// not offered (a stale tool list), a host that is not one, a host on the
+/// deny list, and this computer without a port or without the shell.
+fn requested_host(
+    execution: &ExecutionCapabilityConfig,
+    allowlist_available: bool,
+    network: &RunNetwork,
+    raw: &str,
+    port: Option<u16>,
+) -> Result<Ask, String> {
+    if let Some(refusal) =
+        super::registry::net_request_access_refusal(execution, allowlist_available)
+    {
+        return Err(refusal.to_string());
+    }
+    if let Some((port, dialled)) = requested_local_port(raw.trim(), port)? {
+        if matches!(execution.shell.mode, ShellAccessMode::Off) {
+            return Err(
+                "Ports on this computer are reached from `bash_exec`, which this \
+                        agent does not have; web_fetch never reaches them."
+                    .to_string(),
+            );
+        }
+        return Ok(Ask::LocalPort(LocalAsk { port, dialled }));
+    }
+    // An entry, so that what reaches the card is what “Allow this run” can
+    // apply: `parse_entry` refuses `%` (`%2a` would decode to a wildcard)
+    // and characters a host entry may not hold.
+    let raw = raw.trim();
+    let entry = parse_entry(raw).map_err(|reason| {
+        format!(
+            "`{raw}` is not a host name ({reason}). Give the host only, such as \
+             `mirror.example.org`, without a scheme, path or port."
+        )
+    })?;
+    if entry.is_wildcard() {
+        return Err(
+            "Ask for one host, not a wildcard; the user can choose to allow its parent domain."
+                .to_string(),
+        );
+    }
+    let host = entry.normalized();
+    match network.decide(&host) {
+        HostDecision::Allowed => Ok(Ask::Allowed),
+        HostDecision::Unlisted => Ok(Ask::Host(host)),
+        refused => Err(refused.refusal(&host, true).unwrap_or_default()),
+    }
+}
+
+/// The port and loopback name of a request for a port on this computer:
+/// `localhost:<port>`, `127.0.0.1:<port>` or `[::1]:<port>`, or the name
+/// alone with `port`. `None` for any other host.
+fn requested_local_port(
+    raw: &str,
+    port: Option<u16>,
+) -> Result<Option<(u16, &'static str)>, String> {
+    let named = match parse_local_port(raw) {
+        Ok(None) => return Ok(None),
+        Ok(Some(named)) => named,
+        Err(reason) => {
+            let with_port = |port: u16| match raw.parse::<std::net::Ipv6Addr>() {
+                Ok(_) => format!("[{raw}]:{port}"),
+                Err(_) => format!("{raw}:{port}"),
+            };
+            match port {
+                Some(port) if parse_local_port(&with_port(port)) == Ok(Some(port)) => port,
+                _ => {
+                    return Err(format!(
+                        "`{raw}` is not a port on this computer ({reason}). Ask for \
+                         `localhost:<port>`, such as `localhost:5432`."
+                    ))
+                }
+            }
+        }
+    };
+    if let Some(port) = port.filter(|port| *port != named) {
+        return Err(format!(
+            "`{raw}` names port {named}, but `port` is {port}; give the port once."
+        ));
+    }
+    let dialled = if raw.starts_with('[') || raw.parse::<std::net::Ipv6Addr>().is_ok() {
+        "::1"
+    } else if raw.starts_with("127.") {
+        "127.0.0.1"
+    } else {
+        "localhost"
+    };
+    Ok(Some((named, dialled)))
+}
+
+/// Applies the user's answer to the run: an allowed host or entry joins
+/// the run's lists at once (an “Always” entry is already saved on the
+/// agent); a denial is the tool error and, as for ask-first, the run's
+/// warning.
+fn apply_network_decision(
+    context: &ToolExecutionContext,
+    host: &str,
+    decision: crate::commands::network_access::NetworkAccessDecision,
+) -> Result<serde_json::Value, String> {
+    use crate::commands::network_access::NetworkAccessDecision;
+
+    let (entry, scope) = match decision {
+        NetworkAccessDecision::AllowRun => (host.to_string(), "run"),
+        NetworkAccessDecision::AllowAlways { entry } => (entry, "always"),
+        NetworkAccessDecision::Deny { reason } => {
+            context.note_warning();
+            return Err(network_denied_message(host, reason.as_deref()));
+        }
+    };
+    let parsed = parse_entry(&entry).map_err(|reason| format!("`{entry}`: {reason}"))?;
+    context.run_network.allow(parsed);
+    let mut result = serde_json::json!({
+        "granted": true,
+        "host": host,
+        "entry": entry,
+        "scope": scope,
+    });
+    if scope == "run" {
+        result["note"] = serde_json::json!(
+            "Allowed for the rest of this run only; a later run has to ask again."
+        );
+    }
+    Ok(result)
+}
+
+pub(crate) fn network_denied_message(host: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("User denied network access to `{host}`. Reason: {reason}."),
+        None => format!("User denied network access to `{host}`."),
+    }
+}
+
+/// Network-request analogue of [`AbandonedPathGrantGuard`]: when the wait
+/// ends without a decision (the run is cancelled, or a CLI transport drop
+/// orphaned it), it runs `clear` once, which takes the request off the
+/// queue and drops its card, and cancels the run. `clear` is a closure so
+/// the guard is tested without an app.
+struct AbandonedNetworkRequestGuard<C: FnOnce()> {
+    cancel_token: tokio_util::sync::CancellationToken,
+    clear: Option<C>,
+}
+
+impl<C: FnOnce()> AbandonedNetworkRequestGuard<C> {
+    fn disarm(&mut self) {
+        self.clear = None;
+    }
+
+    async fn expire_and_stop<T>(&mut self) -> T {
+        if let Some(clear) = self.clear.take() {
+            clear();
+        }
+        super::cancel_run_and_park(&self.cancel_token).await
+    }
+}
+
+impl<C: FnOnce()> Drop for AbandonedNetworkRequestGuard<C> {
+    fn drop(&mut self) {
+        if let Some(clear) = self.clear.take() {
+            self.cancel_token.cancel();
+            clear();
+        }
+    }
+}
+
+/// Registers the request, shows the card and waits for the user, as
+/// [`await_path_grant_decision`] does for paths.
+async fn await_network_access_decision(
+    deps: &crate::assistant::engine::AssistantDeps,
+    context: &ToolExecutionContext,
+    request: crate::commands::network_access::NetworkAccessRequest,
+) -> Result<crate::commands::network_access::NetworkAccessDecision, String> {
+    use crate::commands::network_access::{
+        emit_attention, emit_network_access_resolved, PendingNetworkOutcome,
+        NETWORK_ACCESS_REQUEST_EVENT,
+    };
+    use tauri::{Emitter, Manager};
+
+    let app_state = deps.app.state::<crate::AppState>();
+    let workspace_id = Some(deps.workspace_id.clone());
+
+    // A request of this run for the same host still pending is an orphan of
+    // a CLI transport drop; the fresh one replaces it and its card.
+    for stale in app_state
+        .pending_network_requests
+        .take_superseded(&context.run_id, &request.host, request.port)
+        .await
+    {
+        emit_network_access_resolved(&deps.app, &stale.request_id);
+        emit_attention(&deps.app, stale.workspace_id, stale.remaining);
+    }
+
+    let (rx, count) = app_state
+        .pending_network_requests
+        .register(request.clone(), context.run_id.clone())
+        .await;
+    if let Err(e) = deps.app.emit(NETWORK_ACCESS_REQUEST_EVENT, &request) {
+        tracing::warn!("Failed to emit network access request event: {}", e);
+    }
+    emit_attention(&deps.app, workspace_id.clone(), count);
+
+    let app = deps.app.clone();
+    let request_id = request.request_id;
+    let mut abandon_guard = AbandonedNetworkRequestGuard {
+        cancel_token: context.cancel_token.clone(),
+        clear: Some(move || {
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<crate::AppState>();
+                if let Some((_, remaining)) = state.pending_network_requests.take(&request_id).await
+                {
+                    emit_network_access_resolved(&app, &request_id);
+                    emit_attention(&app, workspace_id, remaining);
+                }
+            });
+        }),
+    };
+
+    match rx.await {
+        Ok(PendingNetworkOutcome::Decision(decision)) => {
+            abandon_guard.disarm();
+            Ok(decision)
+        }
+        Ok(PendingNetworkOutcome::Superseded) => {
+            abandon_guard.disarm();
+            Err(
+                "Network access request was superseded by a newer request for the same host \
+                 before a decision was made"
+                    .to_string(),
+            )
+        }
+        Err(_) if context.cancel_token.is_cancelled() => {
+            super::cancel_run_and_park(&context.cancel_token).await
+        }
+        Err(_) => abandon_guard.expire_and_stop().await,
+    }
+}
+
+const MAX_WEB_SEARCH_REDIRECTS: usize = 3;
+
+/// web_search calls only its provider's fixed endpoint, which is allowed
+/// implicitly; a redirect may not leave the provider or drop https.
+fn provider_redirect_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
+}
+
+/// Follows at most [`MAX_WEB_SEARCH_REDIRECTS`] redirects, each to a URL
+/// `allowed` accepts. The counting rule is reqwest's `Policy::limited`.
+fn redirect_policy_within(allowed: fn(&reqwest::Url) -> bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_WEB_SEARCH_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if allowed(attempt.url()) {
+            attempt.follow()
+        } else {
+            let message = format!("redirect to `{}` leaves the search provider", attempt.url());
+            attempt.error(message)
+        }
+    })
+}
+
+fn web_search_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(WEB_SEARCH_TIMEOUT_MS))
+        .redirect(redirect_policy_within(provider_redirect_allowed))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
 async fn execute_web_search(params: WebSearchParams) -> Result<serde_json::Value, String> {
     let max_results = params
         .max_results
         .unwrap_or(DEFAULT_WEB_SEARCH_MAX_RESULTS)
         .min(MAX_WEB_SEARCH_MAX_RESULTS);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(WEB_SEARCH_TIMEOUT_MS))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-    let response = client
+    let response = web_search_client()?
         .get("https://html.duckduckgo.com/html/")
         .query(&[("q", &params.query)])
         .header("User-Agent", "CLAI/1.0")
@@ -1386,7 +2179,10 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-async fn execute_web_fetch(params: WebFetchParams) -> Result<serde_json::Value, String> {
+async fn execute_web_fetch(
+    gate: WebGate<'_>,
+    params: WebFetchParams,
+) -> Result<serde_json::Value, String> {
     let content_limit = params
         .max_content_chars
         .unwrap_or(DEFAULT_WEB_FETCH_CONTENT_LIMIT)
@@ -1397,7 +2193,7 @@ async fn execute_web_fetch(params: WebFetchParams) -> Result<serde_json::Value, 
         .min(MAX_WEB_FETCH_TIMEOUT_MS);
 
     let url = parse_web_fetch_url(params.url.trim())?;
-    let response = fetch_public_url(url, timeout_ms).await?;
+    let response = fetch_public_url(url, timeout_ms, gate).await?;
     let final_url = response.url().clone();
 
     let status = response.status().as_u16();
@@ -1466,6 +2262,7 @@ fn validate_web_fetch_scheme(url: &reqwest::Url) -> Result<(), String> {
 async fn fetch_public_url(
     mut url: reqwest::Url,
     timeout_ms: u64,
+    gate: WebGate<'_>,
 ) -> Result<reqwest::Response, String> {
     // A redirect must never downgrade the transport: if the original request
     // was https, refuse to follow a redirect to plain http (a MITM/attacker
@@ -1473,7 +2270,7 @@ async fn fetch_public_url(
     let started_https = url.scheme() == "https";
     let mut redirects_followed = 0;
     loop {
-        let dns_override = resolve_public_web_fetch_target(&url).await?;
+        let dns_override = resolve_public_web_fetch_target(&url, gate).await?;
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .redirect(reqwest::redirect::Policy::none());
@@ -1531,8 +2328,10 @@ fn is_followable_redirect(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
+/// Runs on every redirect hop.
 async fn resolve_public_web_fetch_target(
     url: &reqwest::Url,
+    gate: WebGate<'_>,
 ) -> Result<Option<(String, Vec<SocketAddr>)>, String> {
     validate_web_fetch_scheme(url)?;
     let host = url
@@ -1540,13 +2339,23 @@ async fn resolve_public_web_fetch_target(
         .ok_or_else(|| "URL must include a host".to_string())?;
     let host_literal = strip_ipv6_url_brackets(host);
     let normalized_host = host_literal.trim_end_matches('.').to_ascii_lowercase();
+    if is_loopback_web_host(&normalized_host) {
+        let allowed_first = match gate {
+            WebGate::Allowlist(_) => ", once the port is allowed",
+            WebGate::AnyHost => "",
+        };
+        return Err(format!(
+            "Fetching private/local URLs is not allowed: `web_fetch` never reaches this \
+             computer's localhost. Use curl in `bash_exec` instead{allowed_first}."
+        ));
+    }
     if is_blocked_web_fetch_hostname(&normalized_host) {
         return Err("Fetching private/local URLs is not allowed".to_string());
     }
-
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "URL must include a valid port".to_string())?;
+    check_web_host(gate, host, Some(port))?;
 
     if let Ok(ip) = host_literal.parse::<IpAddr>() {
         reject_private_web_fetch_ip(ip)?;
@@ -1568,87 +2377,17 @@ async fn resolve_public_web_fetch_target(
     Ok(Some((host.to_string(), addrs)))
 }
 
-fn is_blocked_web_fetch_hostname(normalized_host: &str) -> bool {
-    normalized_host == "localhost"
-        || normalized_host.ends_with(".localhost")
-        || normalized_host.ends_with(".local")
-        || normalized_host.ends_with(".internal")
-}
-
-fn strip_ipv6_url_brackets(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host)
-}
-
-fn reject_private_web_fetch_ip(ip: IpAddr) -> Result<(), String> {
-    if is_private_web_fetch_ip(ip) {
-        Err("Fetching private/local URLs is not allowed".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_private_web_fetch_addrs(addrs: &[SocketAddr]) -> Result<(), String> {
-    for addr in addrs {
-        reject_private_web_fetch_ip(addr.ip())?;
-    }
-    Ok(())
-}
-
-fn is_private_web_fetch_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_private_web_fetch_ipv4(ip),
-        IpAddr::V6(ip) => is_private_web_fetch_ipv6(ip),
-    }
-}
-
-fn is_private_web_fetch_ipv4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 198 && (b == 18 || b == 19))
-        || (a == 192 && b == 0 && c == 0)
-        || a >= 240
-}
-
-fn is_private_web_fetch_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return is_private_web_fetch_ipv4(mapped);
-    }
-
-    let octets = ip.octets();
-    let segments = ip.segments();
-
-    // NAT64: the well-known prefix 64:ff9b::/96 embeds a target IPv4 in the
-    // low 32 bits, so `64:ff9b::7f00:1` would reach 127.0.0.1. Extract and
-    // apply the IPv4 blocklist rather than trusting the v6 literal. The
-    // local-use prefix 64:ff9b:1::/48 (RFC 8215) is site-internal by
-    // definition, so block it wholesale.
-    if segments[0] == 0x0064 && segments[1] == 0xff9b {
-        if segments[2] == 0x0001 {
-            return true;
+/// Whether `host` (lower case, without brackets) names this computer.
+fn is_loopback_web_host(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => ip.is_loopback(),
+            Ok(IpAddr::V6(ip)) => {
+                ip.is_loopback() || embedded_ipv4(ip).is_some_and(|ip| ip.is_loopback())
+            }
+            Err(_) => false,
         }
-        if segments[2] == 0 && segments[3] == 0 && segments[4] == 0 && segments[5] == 0 {
-            let embedded = std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
-            return is_private_web_fetch_ipv4(embedded);
-        }
-    }
-
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (octets[0] & 0xfe) == 0xfc
-        || (segments[0] & 0xffc0) == 0xfe80
-        || (segments[0] & 0xffc0) == 0xfec0
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || segments[0] == 0x2002
 }
 
 fn web_fetch_body_limit(content_limit: usize) -> usize {
@@ -1693,6 +2432,7 @@ fn append_limited_web_fetch_body_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: 
 mod tests {
     use super::*;
     use crate::assistant::run_context::RunContext;
+    use crate::config::NetworkPolicy;
     use tempfile::tempdir;
 
     fn context_with_grants(
@@ -1714,12 +2454,8 @@ mod tests {
             }),
             had_warnings: Default::default(),
             session_grants: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            session_allowed_command_prefixes: std::sync::Arc::new(
-                std::sync::Mutex::new(Vec::new()),
-            ),
-            session_blocked_command_prefixes: std::sync::Arc::new(
-                std::sync::Mutex::new(Vec::new()),
-            ),
+            run_removed_ask_first: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            run_network: Default::default(),
         }
     }
 
@@ -1881,75 +2617,6 @@ mod tests {
     }
 
     #[test]
-    fn web_fetch_ip_filter_blocks_non_public_ranges() {
-        for ip in [
-            "0.0.0.0",
-            "10.0.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "169.254.169.254",
-            "172.16.0.1",
-            "192.168.1.1",
-            "192.0.0.1",
-            "198.18.0.1",
-            "224.0.0.1",
-            "240.0.0.1",
-            "::",
-            "::1",
-            "::ffff:127.0.0.1",
-            "fc00::1",
-            "fe80::1",
-            "fec0::1",
-            "2001:db8::1",
-            "2002:0a00:0001::1",
-            // NAT64 well-known prefix embedding 127.0.0.1 (64:ff9b::7f00:1).
-            "64:ff9b::7f00:1",
-            // NAT64 local-use prefix 64:ff9b:1::/48 (site-internal by definition).
-            "64:ff9b:1::1",
-        ] {
-            assert!(is_private_web_fetch_ip(ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    #[test]
-    fn web_fetch_ip_filter_allows_public_addresses() {
-        for ip in [
-            "8.8.8.8",
-            "1.1.1.1",
-            "2606:4700:4700::1111",
-            // NAT64 well-known prefix embedding a public IPv4 (8.8.8.8) must
-            // still be reachable — only the embedded IPv4 decides.
-            "64:ff9b::808:808",
-        ] {
-            assert!(!is_private_web_fetch_ip(ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    #[test]
-    fn web_fetch_blocks_private_dns_results() {
-        let addrs = [
-            SocketAddr::new("93.184.216.34".parse().unwrap(), 80),
-            SocketAddr::new("192.168.1.1".parse().unwrap(), 80),
-        ];
-
-        let err = reject_private_web_fetch_addrs(&addrs).unwrap_err();
-        assert!(err.contains("private/local"));
-    }
-
-    #[test]
-    fn web_fetch_hostname_filter_blocks_local_names() {
-        for host in [
-            "localhost",
-            "api.localhost",
-            "myhost.local",
-            "service.internal",
-        ] {
-            assert!(is_blocked_web_fetch_hostname(host), "{host}");
-        }
-        assert!(!is_blocked_web_fetch_hostname("example.com"));
-    }
-
-    #[test]
     fn parse_web_fetch_url_rejects_non_absolute_http_urls() {
         assert!(parse_web_fetch_url("/relative/path").is_err());
         assert!(parse_web_fetch_url("ftp://example.com/file").is_err());
@@ -2025,7 +2692,7 @@ mod tests {
             max_content_chars: None,
             timeout_ms: None,
         };
-        let result = execute_web_fetch(params).await;
+        let result = execute_web_fetch(WebGate::AnyHost, params).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("http:// or https://"));
     }
@@ -2037,7 +2704,7 @@ mod tests {
             max_content_chars: None,
             timeout_ms: None,
         };
-        let result = execute_web_fetch(params).await;
+        let result = execute_web_fetch(WebGate::AnyHost, params).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("private/local"));
     }
@@ -2046,7 +2713,9 @@ mod tests {
     async fn web_fetch_rejects_private_ipv6_literals() {
         let url = parse_web_fetch_url("http://[::1]/admin").unwrap();
 
-        let err = resolve_public_web_fetch_target(&url).await.unwrap_err();
+        let err = resolve_public_web_fetch_target(&url, WebGate::AnyHost)
+            .await
+            .unwrap_err();
         assert!(err.contains("private/local"));
     }
 
@@ -2055,647 +2724,2304 @@ mod tests {
         let start = parse_web_fetch_url("https://example.com/start").unwrap();
         let redirected = start.join("http://127.0.0.1/admin").unwrap();
 
-        let err = resolve_public_web_fetch_target(&redirected)
+        let err = resolve_public_web_fetch_target(&redirected, WebGate::AnyHost)
             .await
             .unwrap_err();
         assert!(err.contains("private/local"));
     }
 
     // ------------------------------------------------------------------
-    // enforce_command_policy — agent policy wiring
+    // Web tools under the agent's network mode
+    // ------------------------------------------------------------------
+
+    fn allowlist(allow: &[&str], deny: &[&str]) -> NetworkPolicy {
+        NetworkPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_domains: allow.iter().map(|entry| entry.to_string()).collect(),
+            deny_domains: deny.iter().map(|entry| entry.to_string()).collect(),
+            local_ports: Vec::new(),
+        }
+    }
+
+    fn run_network(allow: &[&str], deny: &[&str]) -> RunNetwork {
+        RunNetwork::new(&allowlist(allow, deny))
+    }
+
+    fn logged(network: &RunNetwork) -> Vec<(String, Option<u16>, bool)> {
+        network
+            .host_log()
+            .into_iter()
+            .map(|entry| (entry.host, entry.port, entry.allowed))
+            .collect()
+    }
+
+    #[test]
+    fn web_access_follows_the_mode() {
+        let network = run_network(&["github.com"], &[]);
+        assert!(matches!(
+            web_access(NetworkMode::Allowlist, &network),
+            Ok(WebGate::Allowlist(_))
+        ));
+        assert!(matches!(
+            web_access(NetworkMode::HostNetwork, &network),
+            Ok(WebGate::AnyHost)
+        ));
+        assert_eq!(
+            web_access(NetworkMode::Off, &network).unwrap_err(),
+            "Network access is off for this agent"
+        );
+    }
+
+    /// `net_request_access` is offered only where Allowlist is enforceable for
+    /// shell commands, so elsewhere the way out is the settings alone.
+    #[tokio::test]
+    async fn web_fetch_refuses_an_unlisted_host_naming_it_and_the_way_out() {
+        let network = run_network(&["github.com"], &[]);
+        let url = parse_web_fetch_url("https://example.org/page").unwrap();
+        let err = resolve_public_web_fetch_target(&url, WebGate::Allowlist(&network))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("`example.org` is not in this agent's allowed hosts"),
+            "{err}"
+        );
+        assert_eq!(
+            err.contains("net_request_access"),
+            crate::assistant::sandbox::status().allowlist_available,
+            "{err}"
+        );
+        assert!(err.contains("Local access settings"), "{err}");
+        assert_eq!(
+            logged(&network),
+            [("example.org".to_string(), Some(443), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_refuses_a_denied_host_naming_the_entry() {
+        let network = run_network(&["*.amazonaws.com"], &["*.s3.amazonaws.com"]);
+        let url = parse_web_fetch_url("https://bucket.s3.amazonaws.com/x").unwrap();
+        let err = resolve_public_web_fetch_target(&url, WebGate::Allowlist(&network))
+            .await
+            .unwrap_err();
+        assert!(err.contains("`*.s3.amazonaws.com`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_checks_the_allowlist_on_every_redirect_hop() {
+        let network = run_network(&["github.com"], &[]);
+        let start = parse_web_fetch_url("https://github.com/start").unwrap();
+        let redirected = start.join("https://example.org/landing").unwrap();
+        let err = resolve_public_web_fetch_target(&redirected, WebGate::Allowlist(&network))
+            .await
+            .unwrap_err();
+        assert!(err.contains("`example.org`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_keeps_the_private_address_filter_in_every_mode() {
+        let listed = run_network(&["10.0.0.5", "localhost"], &[]);
+        for (gate, raw) in [
+            (WebGate::AnyHost, "http://127.0.0.1/admin"),
+            (WebGate::AnyHost, "http://[::1]/"),
+            (WebGate::Allowlist(&listed), "http://10.0.0.5/"),
+            (WebGate::Allowlist(&listed), "http://localhost:8080/"),
+        ] {
+            let url = parse_web_fetch_url(raw).unwrap();
+            let err = resolve_public_web_fetch_target(&url, gate)
+                .await
+                .unwrap_err();
+            assert!(err.contains("private/local"), "{raw}: {err}");
+        }
+    }
+
+    /// `web_fetch` never reaches this computer, so it points at `bash_exec`,
+    /// not at `net_request_access`, listed or not.
+    #[tokio::test]
+    async fn web_fetch_sends_this_computers_localhost_to_bash_exec() {
+        let listed = run_network(&["localhost", "127.0.0.1"], &[]);
+        let unlisted = run_network(&[], &[]);
+        for raw in [
+            "http://127.0.0.1:5678/",
+            "http://127.1.2.3/",
+            "http://[::1]:5678/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://localhost:5678/",
+            "http://api.localhost/",
+        ] {
+            let url = parse_web_fetch_url(raw).unwrap();
+            for (gate, once) in [
+                (WebGate::Allowlist(&unlisted), true),
+                (WebGate::Allowlist(&listed), true),
+                (WebGate::AnyHost, false),
+            ] {
+                let err = resolve_public_web_fetch_target(&url, gate)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.contains("`web_fetch` never reaches this computer's localhost. Use curl in `bash_exec` instead"),
+                    "{raw}: {err}"
+                );
+                assert_eq!(
+                    err.contains(", once the port is allowed."),
+                    once,
+                    "{raw}: {err}"
+                );
+                assert!(!err.contains("net_request_access"), "{raw}: {err}");
+            }
+        }
+        assert!(logged(&unlisted).is_empty());
+    }
+
+    #[test]
+    fn only_the_allowlist_gate_checks_and_logs_hosts() {
+        let network = run_network(&["github.com"], &[]);
+        let gate = WebGate::Allowlist(&network);
+        assert!(check_web_host(gate, "github.com", Some(443)).is_ok());
+        assert!(check_web_host(gate, "example.org", Some(80)).is_err());
+        assert!(check_web_host(gate, "[2606:4700::1111]", Some(443)).is_err());
+        assert_eq!(
+            logged(&network),
+            [
+                ("github.com".to_string(), Some(443), true),
+                ("example.org".to_string(), Some(80), false),
+                ("2606:4700::1111".to_string(), Some(443), false),
+            ]
+        );
+        assert!(check_web_host(WebGate::AnyHost, "example.org", Some(443)).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // net_request_access
+    // ------------------------------------------------------------------
+
+    fn allowlist_execution(allow: &[&str], deny: &[&str]) -> ExecutionCapabilityConfig {
+        let mut execution = ExecutionCapabilityConfig::default();
+        execution.sandbox.network_access = allowlist(allow, deny);
+        execution.shell.mode = ShellAccessMode::Restricted;
+        execution
+    }
+
+    #[test]
+    fn a_request_is_refused_without_a_card_where_the_tool_is_not_offered() {
+        let network = RunNetwork::default();
+        let mut execution = allowlist_execution(&[], &[]);
+        assert!(
+            requested_host(&execution, false, &network, "example.org", None)
+                .unwrap_err()
+                .contains("not available on this PC")
+        );
+        for (mode, says) in [
+            (NetworkMode::Off, "Network access is off"),
+            (NetworkMode::HostNetwork, "can already reach any host"),
+        ] {
+            execution.sandbox.network_access.mode = mode;
+            let error =
+                requested_host(&execution, true, &network, "example.org", None).unwrap_err();
+            assert!(error.contains(says), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_request_names_one_host_the_lists_do_not_decide() {
+        let execution = allowlist_execution(&["github.com"], &["*.s3.amazonaws.com"]);
+        let network = RunNetwork::new(&execution.sandbox.network_access);
+        let ask = |raw| requested_host(&execution, true, &network, raw, None);
+
+        assert_eq!(
+            ask(" Mirror.Example.ORG. "),
+            Ok(Ask::Host("mirror.example.org".to_string()))
+        );
+        assert_eq!(
+            ask("[2001:db8::1]"),
+            Ok(Ask::Host("2001:db8::1".to_string()))
+        );
+        assert_eq!(
+            ask("GitHub.com"),
+            Ok(Ask::Allowed),
+            "already allowed: no card"
+        );
+        let denied = ask("bucket.s3.amazonaws.com").unwrap_err();
+        assert!(
+            denied.contains("denied hosts (entry `*.s3.amazonaws.com`)")
+                && denied.contains("Local access settings"),
+            "{denied}"
+        );
+        for raw in [
+            "*.example.org",
+            "%2a.com",
+            "%2a.example.org",
+            "a!b.example.org",
+            "https://example.org",
+            "example.org/x",
+            "example.org:443",
+            "a b",
+            "",
+        ] {
+            assert!(ask(raw).is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_deny_entry_refuses_web_hosts_and_requests_naming_it() {
+        let execution = allowlist_execution(&["github.com"], &["github.com:443"]);
+        let network = RunNetwork::new(&execution.sandbox.network_access);
+        let errors = [
+            check_web_host(WebGate::Allowlist(&network), "github.com", Some(443)).unwrap_err(),
+            requested_host(&execution, true, &network, "example.org", None).unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                error.contains("`github.com:443`") && error.contains("Local access settings"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_widens_this_run_and_a_denial_carries_its_reason() {
+        use crate::commands::network_access::NetworkAccessDecision;
+
+        let workspace = tempdir().unwrap();
+        let mut context = context_with_grants(workspace.path(), Vec::new());
+        context.run_network = std::sync::Arc::new(run_network(&[], &["secret.example.org"]));
+
+        let allowed = apply_network_decision(
+            &context,
+            "mirror.example.org",
+            NetworkAccessDecision::AllowRun,
+        )
+        .unwrap();
+        assert_eq!(allowed["scope"], "run");
+        assert_eq!(
+            context.run_network.decide("mirror.example.org"),
+            HostDecision::Allowed
+        );
+        assert_eq!(
+            context.run_network.decide("www.example.org"),
+            HostDecision::Unlisted
+        );
+
+        let always = apply_network_decision(
+            &context,
+            "www.example.org",
+            NetworkAccessDecision::AllowAlways {
+                entry: "*.example.org".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(always["entry"], "*.example.org");
+        assert_eq!(
+            context.run_network.decide("cdn.example.org"),
+            HostDecision::Allowed
+        );
+        assert!(matches!(
+            context.run_network.decide("secret.example.org"),
+            HostDecision::Denied { .. }
+        ));
+        assert!(!context.had_warnings(), "an allow is not a warning");
+
+        let error = apply_network_decision(
+            &context,
+            "other.example.com",
+            NetworkAccessDecision::Deny {
+                reason: Some("not needed".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "User denied network access to `other.example.com`. Reason: not needed."
+        );
+        assert!(
+            context.had_warnings(),
+            "a denial ends the run with warnings"
+        );
+        assert_eq!(
+            context.run_network.decide("other.example.com"),
+            HostDecision::Unlisted
+        );
+    }
+
+    /// Ports on this computer: what the card shows, what the answer binds
+    /// to, and what the agent is told.
+    #[cfg(target_os = "linux")]
+    mod local_port_requests {
+        use super::*;
+        use crate::assistant::network::local_listener::{Holder, Program, RunOnly};
+        use crate::commands::network_access::{NetworkAccessRequest, PendingNetworkRequests};
+        use crate::config::types::LocalPortGrant;
+        use std::sync::{Arc, Mutex};
+
+        const SSH: &str = "/usr/bin/ssh";
+        const PYTHON: &str = "/usr/bin/python3";
+        /// In every command line: the card shows it, the agent never sees it.
+        const SECRET: &str = "secret-host";
+
+        struct FakeInspector {
+            listener: Mutex<Result<Listener, String>>,
+            dials: Mutex<Vec<Loopback>>,
+        }
+
+        impl FakeInspector {
+            fn new(listener: Result<Listener, String>) -> Arc<Self> {
+                Arc::new(Self {
+                    listener: Mutex::new(listener),
+                    dials: Mutex::default(),
+                })
+            }
+
+            fn serving(listener: Listener) -> Arc<Self> {
+                Self::new(Ok(listener))
+            }
+
+            fn set(&self, listener: Listener) {
+                *self.listener.lock().unwrap() = Ok(listener);
+            }
+
+            fn dials(&self) -> Vec<Loopback> {
+                self.dials.lock().unwrap().clone()
+            }
+        }
+
+        impl ListenerInspector for FakeInspector {
+            fn inspect(&self, _port: u16, dial: Loopback) -> std::io::Result<Listener> {
+                self.dials.lock().unwrap().push(dial);
+                self.listener
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map_err(std::io::Error::other)
+            }
+
+            fn still_serves(&self, _port: u16, _dial: Loopback, _programs: &[String]) -> bool {
+                panic!("a card comes from a full scan only")
+            }
+        }
+
+        fn program(exe: &str) -> Listener {
+            Listener::Program(Program {
+                exe: exe.to_string(),
+                pid: 4321,
+                cmdline: format!("{exe} -N -L 5432:db:5432 {SECRET}"),
+                interpreter: false,
+                started_by: None,
+            })
+        }
+
+        fn other_user(sockets: &[u64]) -> Listener {
+            Listener::OtherUser {
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                uid: unsafe { libc::geteuid() }.wrapping_add(1),
+                name: "postgres".to_string(),
+                sockets: sockets.to_vec(),
+            }
+        }
+
+        fn run_only(reason: RunOnly, sockets: &[u64]) -> Listener {
+            Listener::RunOnly {
+                reason,
+                sockets: sockets.to_vec(),
+                holders: vec![Holder {
+                    pid: 77,
+                    exe: "/usr/bin/rootlessport".to_string(),
+                    cmdline: format!("rootlessport {SECRET}"),
+                }],
+                started_by: None,
+            }
+        }
+
+        fn port_5432() -> LocalAsk {
+            LocalAsk {
+                port: 5432,
+                dialled: "localhost",
+            }
+        }
+
+        fn context_with(policy: NetworkPolicy) -> (tempfile::TempDir, ToolExecutionContext) {
+            let workspace = tempdir().unwrap();
+            let mut context = context_with_grants(workspace.path(), Vec::new());
+            context.run_network = Arc::new(RunNetwork::new(&policy));
+            (workspace, context)
+        }
+
+        async fn no_card(_: LocalListenerCard) -> Result<NetworkAccessDecision, String> {
+            panic!("no card is shown")
+        }
+
+        #[tokio::test]
+        async fn a_port_on_this_computer_is_asked_as_localhost_whatever_its_spelling() {
+            let execution = allowlist_execution(&[], &[]);
+            let network = RunNetwork::new(&execution.sandbox.network_access);
+            let ask = |raw, port| requested_host(&execution, true, &network, raw, port);
+            for (raw, port, dialled) in [
+                ("localhost:5432", None, "localhost"),
+                (" LOCALHOST:5432 ", None, "localhost"),
+                ("127.0.0.1:5432", None, "127.0.0.1"),
+                ("[::1]:5432", None, "::1"),
+                ("localhost", Some(5432), "localhost"),
+                ("localhost:5432", Some(5432), "localhost"),
+                ("::1", Some(5432), "::1"),
+                ("[::1]", Some(5432), "::1"),
+            ] {
+                assert_eq!(
+                    ask(raw, port),
+                    Ok(Ask::LocalPort(LocalAsk {
+                        port: 5432,
+                        dialled
+                    })),
+                    "{raw:?} {port:?}"
+                );
+            }
+            for (raw, port, says) in [
+                ("localhost", None, "add the port"),
+                ("127.0.0.1", None, "add the port"),
+                ("localhost:0", None, "1 to 65535"),
+                ("localhost:5432-5433", None, "one port"),
+                ("localhost:5432", Some(6379), "give the port once"),
+                ("127.0.0.2:5432", None, "as localhost"),
+                ("app.localhost:3000", None, "as localhost"),
+            ] {
+                let error = ask(raw, port).unwrap_err();
+                assert!(error.contains(says), "{raw:?}: {error}");
+            }
+
+            // A re-ask under another spelling replaces the pending request.
+            let request = |ask: Result<Ask, String>| {
+                let Ok(Ask::LocalPort(local)) = ask else {
+                    panic!("expected a local port, got {ask:?}");
+                };
+                NetworkAccessRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: Some("ws".to_string()),
+                    agent_id: None,
+                    agent_name: None,
+                    host: LOCALHOST.to_string(),
+                    port: Some(local.port),
+                    reason: String::new(),
+                    run_hosts: Vec::new(),
+                    suggested_wildcard: None,
+                    persists_to_shared_agent: false,
+                    also_affects_workspaces: Vec::new(),
+                    local_listener: None,
+                }
+            };
+            let pending = PendingNetworkRequests::default();
+            let mut earlier = request(ask("localhost:5432", None));
+            for raw in ["[::1]:5432", "127.0.0.1:5432"] {
+                let _ = pending.register(earlier.clone(), "run".into()).await;
+                let again = request(ask(raw, None));
+                let taken = pending
+                    .take_superseded("run", &again.host, again.port)
+                    .await;
+                assert_eq!(taken.len(), 1, "{raw}");
+                assert_eq!(taken[0].request_id, earlier.request_id);
+                earlier = again;
+            }
+
+            let mut no_shell = allowlist_execution(&[], &[]);
+            no_shell.shell.mode = ShellAccessMode::Off;
+            no_shell.web.enabled = true;
+            let error =
+                requested_host(&no_shell, true, &network, "localhost:5432", None).unwrap_err();
+            assert!(error.contains("bash_exec"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn nothing_clai_or_a_denied_name_is_refused_without_a_card() {
+            for (listener, says) in [
+                (Ok(Listener::Nothing), "Nothing listens on port 5432"),
+                (Ok(Listener::Clai), "served by CLAI"),
+                (Err("permission denied".to_string()), "could not check"),
+            ] {
+                let inspector = FakeInspector::new(listener);
+                let (_workspace, context) = context_with(allowlist(&[], &[]));
+                let error = request_local_port(&context, inspector.clone(), port_5432(), no_card)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains(says), "{error}");
+                assert!(!error.contains(SECRET), "{error}");
+                assert_eq!(
+                    context.run_network.decide_local(5432, &program(SSH)),
+                    LocalDecision::NotGranted
+                );
+            }
+
+            let inspector = FakeInspector::serving(Listener::Nothing);
+            let (_workspace, context) = context_with(allowlist(&[], &[]));
+            let _ = request_local_port(&context, inspector.clone(), port_5432(), no_card).await;
+            assert_eq!(inspector.dials(), [Loopback::V4, Loopback::V6]);
+            let inspector = FakeInspector::serving(Listener::Nothing);
+            let ipv6 = LocalAsk {
+                dialled: "::1",
+                ..port_5432()
+            };
+            let _ = request_local_port(&context, inspector.clone(), ipv6, no_card).await;
+            assert_eq!(inspector.dials(), [Loopback::V6]);
+
+            for denied in ["localhost", "127.0.0.1", "::1"] {
+                let inspector = FakeInspector::serving(program(SSH));
+                let (_workspace, context) = context_with(allowlist(&[], &[denied]));
+                let error = request_local_port(&context, inspector.clone(), port_5432(), no_card)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("denied hosts"), "{denied}: {error}");
+                assert!(inspector.dials().is_empty(), "not even looked up");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_answer_binds_the_listener_the_card_showed() {
+            for (shown, then, allowed, changed) in [
+                (program(SSH), program(PYTHON), program(SSH), program(PYTHON)),
+                (
+                    run_only(RunOnly::OtherNamespace, &[11]),
+                    run_only(RunOnly::OtherNamespace, &[12]),
+                    run_only(RunOnly::OtherNamespace, &[11]),
+                    run_only(RunOnly::OtherNamespace, &[12]),
+                ),
+            ] {
+                let inspector = FakeInspector::serving(shown);
+                let (_workspace, context) = context_with(allowlist(&[], &[]));
+                let changing = inspector.clone();
+                let result = request_local_port(&context, inspector, port_5432(), |_| {
+                    // The listener changes before the user answers.
+                    changing.set(then);
+                    async { Ok(NetworkAccessDecision::AllowRun) }
+                })
+                .await
+                .unwrap();
+                assert_eq!(result["scope"], "run");
+                let network = &context.run_network;
+                assert_eq!(network.decide_local(5432, &allowed), LocalDecision::Allowed);
+                assert_eq!(network.decide_local(5432, &changed), LocalDecision::Changed);
+                assert_eq!(
+                    network.decide_local(6379, &allowed),
+                    LocalDecision::NotGranted
+                );
+            }
+        }
+
+        /// As “Always” would save it, “Allow this run” for another user's
+        /// service allows that user on the port: the socket the card did not
+        /// show (the other loopback address) and the service restarted
+        /// mid-run are the same service.
+        #[tokio::test]
+        async fn allow_this_run_for_another_users_service_allows_that_user() {
+            let inspector = FakeInspector::serving(other_user(&[11]));
+            let (_workspace, context) = context_with(allowlist(&[], &[]));
+            let result = request_local_port(&context, inspector, port_5432(), |_| async {
+                Ok(NetworkAccessDecision::AllowRun)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result["scope"], "run");
+            let network = &context.run_network;
+            let ipv4 = other_user(&[11]);
+            let ipv6 = other_user(&[12]);
+            let restarted = other_user(&[13]);
+            for listener in [&ipv4, &ipv6, &restarted] {
+                assert_eq!(
+                    network.decide_local(5432, listener),
+                    LocalDecision::Allowed,
+                    "{listener:?}"
+                );
+            }
+            let someone_else = Listener::OtherUser {
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                uid: unsafe { libc::geteuid() }.wrapping_add(2),
+                name: "redis".to_string(),
+                sockets: vec![11],
+            };
+            assert_eq!(
+                network.decide_local(5432, &someone_else),
+                LocalDecision::Changed
+            );
+            assert_eq!(network.decide_local(6379, &ipv6), LocalDecision::NotGranted);
+        }
+
+        /// A user grant never names the user CLAI runs as: a listener of
+        /// that user is allowed for the run by the sockets the card showed.
+        #[tokio::test]
+        async fn allow_this_run_never_allows_the_user_clai_runs_as() {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let own = |sockets: &[u64]| Listener::OtherUser {
+                uid: unsafe { libc::geteuid() },
+                name: "me".to_string(),
+                sockets: sockets.to_vec(),
+            };
+            let inspector = FakeInspector::serving(own(&[11]));
+            let (_workspace, context) = context_with(allowlist(&[], &[]));
+            request_local_port(&context, inspector, port_5432(), |_| async {
+                Ok(NetworkAccessDecision::AllowRun)
+            })
+            .await
+            .unwrap();
+            let network = &context.run_network;
+            assert_eq!(
+                network.decide_local(5432, &own(&[11])),
+                LocalDecision::Allowed
+            );
+            assert_eq!(
+                network.decide_local(5432, &own(&[12])),
+                LocalDecision::Changed
+            );
+        }
+
+        #[tokio::test]
+        async fn always_adds_the_saved_grant_and_the_result_names_the_port_only() {
+            let always = || NetworkAccessDecision::AllowAlways {
+                entry: "localhost:5432".to_string(),
+            };
+            for (listener, decision, scope, later) in [
+                (
+                    program(SSH),
+                    NetworkAccessDecision::AllowRun,
+                    "run",
+                    program(SSH),
+                ),
+                (program(SSH), always(), "always", program(SSH)),
+                // A user grant covers a restarted service of that user.
+                (other_user(&[11]), always(), "always", other_user(&[12])),
+            ] {
+                let inspector = FakeInspector::serving(listener);
+                let (_workspace, context) = context_with(allowlist(&[], &[]));
+                let mut shown = Vec::new();
+                let result = request_local_port(&context, inspector, port_5432(), |card| {
+                    shown.push(serde_json::to_value(&card).unwrap());
+                    async move { Ok(decision) }
+                })
+                .await
+                .unwrap();
+
+                let mut keys: Vec<&str> = result
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, ["entry", "granted", "host", "note", "port", "scope"]);
+                assert_eq!(result["host"], "localhost");
+                assert_eq!(result["port"], 5432);
+                assert_eq!(result["entry"], "localhost:5432");
+                assert_eq!(result["scope"], scope);
+                assert!(!result.to_string().contains(SECRET), "{result}");
+                assert_eq!(
+                    context.run_network.decide_local(5432, &later),
+                    LocalDecision::Allowed
+                );
+                let [card] = shown.as_slice() else {
+                    panic!("one card, got {shown:?}");
+                };
+                if card["kind"] == "program" {
+                    let command_line = card["commandLine"].as_str().unwrap();
+                    assert!(command_line.contains(SECRET), "the card shows it");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_denial_is_the_tool_error_and_allows_nothing() {
+            let inspector = FakeInspector::serving(program(SSH));
+            let (_workspace, context) = context_with(allowlist(&[], &[]));
+            let error = request_local_port(&context, inspector, port_5432(), |_| async {
+                Ok(NetworkAccessDecision::Deny {
+                    reason: Some("use the staging database".to_string()),
+                })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "User denied network access to `localhost:5432`. Reason: use the staging database."
+            );
+            assert!(context.had_warnings());
+            assert_eq!(
+                context.run_network.decide_local(5432, &program(SSH)),
+                LocalDecision::NotGranted
+            );
+        }
+
+        #[tokio::test]
+        async fn a_listener_the_run_already_reaches_needs_no_card() {
+            let mut policy = allowlist(&[], &[]);
+            policy.local_ports = vec![LocalPortGrant::Program {
+                port: 5432,
+                program: SSH.to_string(),
+            }];
+            let (_workspace, context) = context_with(policy);
+            let result = request_local_port(
+                &context,
+                FakeInspector::serving(program(SSH)),
+                port_5432(),
+                no_card,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "granted": true,
+                    "host": "localhost",
+                    "port": 5432,
+                    "scope": "already-allowed",
+                })
+            );
+        }
+    }
+
+    fn network_guard(
+        token: &tokio_util::sync::CancellationToken,
+        cleared: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> AbandonedNetworkRequestGuard<impl FnOnce()> {
+        let cleared = cleared.clone();
+        AbandonedNetworkRequestGuard {
+            cancel_token: token.clone(),
+            clear: Some(move || {
+                cleared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        }
+    }
+
+    #[test]
+    fn an_abandoned_network_wait_clears_its_request_and_cancels_the_run() {
+        use std::sync::atomic::Ordering;
+        let cleared = std::sync::Arc::default();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        drop(network_guard(&token, &cleared));
+        assert!(token.is_cancelled());
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut decided = network_guard(&token, &cleared);
+        decided.disarm();
+        drop(decided);
+        assert!(!token.is_cancelled(), "a decided wait leaves the run alone");
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wait_whose_sender_is_gone_clears_once_and_parks_the_cancelled_run() {
+        use std::sync::atomic::Ordering;
+        let cleared = std::sync::Arc::default();
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut guard = network_guard(&token, &cleared);
+
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            guard.expire_and_stop::<()>(),
+        )
+        .await;
+        assert!(parked.is_err(), "the tool returns no result");
+        assert!(token.is_cancelled());
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert_eq!(cleared.load(Ordering::SeqCst), 1, "cleared once");
+    }
+
+    #[tokio::test]
+    async fn web_tools_refuse_before_any_request_when_network_is_off() {
+        let workspace = tempdir().unwrap();
+        let mut context = context_with_grants(workspace.path(), Vec::new());
+        let mut execution = context.run_context.execution.clone();
+        execution.sandbox.network_access = network(NetworkMode::Off);
+        context.run_context = std::sync::Arc::new(RunContext {
+            execution,
+            ..(*context.run_context).clone()
+        });
+        for (tool, params) in [
+            ("web_search", serde_json::json!({ "query": "rust" })),
+            // Private, so even a missing gate fails fast without a request.
+            (
+                "web_fetch",
+                serde_json::json!({ "url": "http://192.168.1.1/" }),
+            ),
+        ] {
+            assert_eq!(
+                execute_web_tool(&context, tool, params).await.unwrap_err(),
+                "Network access is off for this agent",
+                "{tool}"
+            );
+        }
+    }
+
+    /// A server on 127.0.0.1 that answers every request with a redirect to
+    /// itself, and counts the requests.
+    async fn redirecting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {base}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = socket.read(&mut head).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    #[tokio::test]
+    async fn web_search_refuses_a_redirect_off_the_provider() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = redirecting_server().await;
+        let error = web_search_client()
+            .unwrap()
+            .get(format!("{base}/start"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("leaves the search provider"),
+            "{error:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_provider_redirect_policy_follows_at_most_three_hops() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = redirecting_server().await;
+        let error = reqwest::Client::builder()
+            .redirect(redirect_policy_within(|_| true))
+            .build()
+            .unwrap()
+            .get(format!("{base}/start"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("too many redirects"),
+            "{error:?}"
+        );
+        // The first request and three redirects, as `Policy::limited(3)`.
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + MAX_WEB_SEARCH_REDIRECTS);
+    }
+
+    #[test]
+    fn web_search_redirects_stay_on_the_provider_over_https() {
+        for (raw, allowed) in [
+            ("https://html.duckduckgo.com/html/?q=x", true),
+            ("https://duckduckgo.com/", true),
+            ("http://html.duckduckgo.com/html/", false),
+            ("https://duckduckgo.com.evil.org/", false),
+            ("https://evilduckduckgo.com/", false),
+            ("https://example.org/", false),
+        ] {
+            let url = reqwest::Url::parse(raw).unwrap();
+            assert_eq!(provider_redirect_allowed(&url), allowed, "{raw}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Network mode in bash_exec
+    // ------------------------------------------------------------------
+
+    fn network(mode: NetworkMode) -> NetworkPolicy {
+        NetworkPolicy {
+            mode,
+            allow_domains: Vec::new(),
+            deny_domains: Vec::new(),
+            local_ports: Vec::new(),
+        }
+    }
+
+    fn test_endpoint() -> ProxyEndpoint {
+        ProxyEndpoint {
+            socket: PathBuf::from("/c/.clai-net/0123456789ab.sock"),
+            helper: PathBuf::from("/opt/clai/clai-sandbox-helper"),
+            ssh_config: PathBuf::from("/c/.clai-net/ssh_config"),
+            forward_ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn network_modes_map_onto_the_sandbox_network_per_platform() {
+        use crate::assistant::sandbox::{status_for, SandboxBackend};
+        use NetworkMode::{Allowlist, HostNetwork, Off};
+        use SandboxNetworkMode::{Disabled, Host, Proxied};
+        let linux = status_for(Some(SandboxBackend::Bubblewrap));
+        let macos = status_for(Some(SandboxBackend::Seatbelt));
+        let none = status_for(None);
+        for (status, mode, expected) in [
+            (&linux, Off, Ok(Disabled)),
+            (&linux, Allowlist, Ok(Proxied(test_endpoint()))),
+            (&linux, HostNetwork, Ok(Host)),
+            (&macos, Off, Ok(Disabled)),
+            (&macos, Allowlist, Err(())),
+            (&macos, HostNetwork, Ok(Host)),
+            (&none, Off, Ok(Disabled)),
+            (&none, Allowlist, Err(())),
+            (&none, HostNetwork, Ok(Host)),
+        ] {
+            let asked = std::cell::Cell::new(false);
+            let endpoint = || {
+                asked.set(true);
+                Ok(test_endpoint())
+            };
+            assert_eq!(
+                sandbox_network(mode, status, endpoint).map_err(|_| ()),
+                expected,
+                "{:?} {mode:?}",
+                status.backend
+            );
+            assert_eq!(
+                asked.get(),
+                matches!(expected, Ok(Proxied(_))),
+                "only an enforceable Allowlist prepares the proxy files"
+            );
+        }
+        assert_eq!(
+            sandbox_network(Allowlist, &macos, || Ok(test_endpoint())).unwrap_err(),
+            "Allowlist network mode: Not available on macOS yet. Choose Off or Host network \
+             in the agent's Local access settings."
+        );
+        let missing = || Err("Sandboxed shell is unavailable: network helper not found".into());
+        assert_eq!(
+            sandbox_network(Allowlist, &linux, missing),
+            Err("Sandboxed shell is unavailable: network helper not found".to_string()),
+            "a missing helper fails closed, never the host network"
+        );
+    }
+
+    /// The sandbox of a command is recorded as started by its agent while
+    /// the command runs, so a server it starts can be asked for. Needs bwrap.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_agent_command_is_recorded_while_it_runs() {
+        use crate::assistant::network::spawn_roots::{self, StartedBy};
+        let workspace = tempdir().unwrap();
+        let agent = || Some("Ana, in bash_exec".to_string());
+        let by = StartedBy::Agent(agent());
+        let command = SandboxCommand {
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+            cwd: workspace.path().to_path_buf(),
+            timeout_ms: 10_000,
+            max_output_chars: 10_000,
+            profile: SandboxProfile::for_test(
+                workspace.path().to_path_buf(),
+                Vec::new(),
+                SandboxNetworkMode::Disabled,
+                SandboxSessionBusMode::Deny,
+                SandboxEnv::filtered_from_iter(
+                    [("PATH", "/usr/bin:/bin")],
+                    workspace.path(),
+                    SandboxSessionBusMode::Deny,
+                ),
+                None,
+            ),
+        };
+        let network = std::sync::Arc::new(run_network(&[], &[]));
+        let run = run_with_network(command, agent(), &network);
+        let running = spawn_roots::eventually(|| !spawn_roots::started_by(&by).is_empty());
+        let (run, running) = tokio::join!(run, running);
+        assert!(!run.proxied, "no proxy, so no localhost hint");
+        match run.output {
+            Ok(output) => assert_eq!(output.exit_code, Some(0), "{output:?}"),
+            Err(error) if error.contains("Sandboxed shell is unavailable") => {
+                crate::assistant::sandbox::skip_without_bwrap(&error);
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        }
+        assert!(running, "recorded while the command runs");
+        assert!(spawn_roots::started_by(&by).is_empty(), "gone once reaped");
+    }
+
+    /// The helper `cargo test` builds next to the test binary.
+    #[cfg(target_os = "linux")]
+    fn built_helper() -> Option<PathBuf> {
+        let exe = std::env::current_exe().unwrap();
+        let helper = exe
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("clai-sandbox-helper");
+        if helper.is_file() {
+            return Some(helper);
+        }
+        crate::assistant::sandbox::skip_without_bwrap(&format!(
+            "{} is not built",
+            helper.display()
+        ));
+        None
+    }
+
+    /// An Allowlist command running `script` in `workspace`, with its proxy
+    /// files in `files`.
+    #[cfg(target_os = "linux")]
+    fn allowlist_command(
+        workspace: &Path,
+        files: &Path,
+        helper: PathBuf,
+        script: &str,
+        timeout_ms: u64,
+    ) -> SandboxCommand {
+        let endpoint = ProxyEndpoint {
+            socket: files.join("net.sock"),
+            helper,
+            ssh_config: files.join("ssh_config"),
+            forward_ports: Vec::new(),
+        };
+        std::fs::write(&endpoint.ssh_config, "").unwrap();
+        SandboxCommand {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: workspace.to_path_buf(),
+            timeout_ms,
+            max_output_chars: 10_000,
+            profile: SandboxProfile::for_test(
+                workspace.to_path_buf(),
+                Vec::new(),
+                SandboxNetworkMode::Proxied(endpoint),
+                SandboxSessionBusMode::Deny,
+                SandboxEnv::filtered_from_iter(
+                    [("PATH", "/usr/bin:/bin")],
+                    workspace,
+                    SandboxSessionBusMode::Deny,
+                ),
+                None,
+            ),
+        }
+    }
+
+    /// The proxy session lives for the command and its refusals reach the
+    /// result. Needs bwrap and the helper `cargo test` builds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_allowlist_command_runs_behind_its_own_proxy_session() {
+        let Some(helper) = built_helper() else {
+            return;
+        };
+        let files = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let socket = files.path().join("net.sock");
+        let command = |script: &str, timeout_ms| {
+            allowlist_command(
+                workspace.path(),
+                files.path(),
+                helper.clone(),
+                script,
+                timeout_ms,
+            )
+        };
+        let refuse = "/run/clai/helper connect --proxy 127.0.0.1:3128 example.org 443 </dev/null";
+        let network = std::sync::Arc::new(run_network(&["github.com"], &[]));
+        let run = run_with_network(command(refuse, 20_000), None, &network).await;
+        let (output, refused) = match run.output {
+            Ok(output) => (output, run.refused),
+            Err(error) if error.contains("Sandboxed shell is unavailable") => {
+                crate::assistant::sandbox::skip_without_bwrap(&error);
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(output.exit_code, Some(255), "{output:?}");
+        assert_eq!(refused.targets, ["example.org:443"]);
+        assert_eq!(
+            logged(&network),
+            [("example.org".to_string(), Some(443), false)]
+        );
+        assert!(!socket.exists(), "the session ended with the command");
+
+        let run = run_with_network(
+            command(&format!("{refuse}; sleep 30"), 2_000),
+            None,
+            &network,
+        )
+        .await;
+        let refused = run.refused;
+        let error = run.output.unwrap_err();
+        assert!(error.contains("timed out after"), "{error}");
+        assert_eq!(
+            refused.targets,
+            ["example.org:443"],
+            "a timed-out command keeps its refusals"
+        );
+        assert!(!socket.exists(), "the session ended with the timeout");
+    }
+
+    /// The local ports a command forwards are those of the run as it starts:
+    /// one allowed while it runs still refuses there, so that result gets the
+    /// localhost hint, and answers from the next command. This test
+    /// listens on the port, so the proxy refuses it as CLAI's own; only a
+    /// forwarded port gets that far. Needs bwrap.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_port_allowed_during_a_command_is_forwarded_from_the_next() {
+        use crate::assistant::network::run_state::{LocalBinding, LocalRule};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Some(helper) = built_helper() else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let files = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let refusal = format!("connect to 127.0.0.1 port {port} failed: Connection refused");
+        let connect = format!(
+            "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {port}), 5).recv(1); print(\"connected\")' 2>/dev/null || echo '{refusal}'"
+        );
+        let command = |script: &str| {
+            allowlist_command(
+                workspace.path(),
+                files.path(),
+                helper.clone(),
+                script,
+                20_000,
+            )
+        };
+        let network = std::sync::Arc::new(run_network(&[], &[]));
+        let finished = AtomicBool::new(false);
+        let first = async {
+            let script =
+                format!("touch started; while [ ! -e go ]; do sleep 0.05; done; {connect}");
+            let run = run_with_network(command(&script), None, &network).await;
+            finished.store(true, Ordering::SeqCst);
+            run
+        };
+        let grant = async {
+            while !workspace.path().join("started").exists() && !finished.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            network.allow_local(LocalRule {
+                port,
+                binding: LocalBinding::Program("/usr/bin/served".to_string()),
+            });
+            std::fs::write(workspace.path().join("go"), "").unwrap();
+        };
+        let (first, ()) = tokio::join!(first, grant);
+        let output = match first.output {
+            Ok(output) => output,
+            Err(error) if error.contains("Sandboxed shell is unavailable") => {
+                crate::assistant::sandbox::skip_without_bwrap(&error);
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(output.stdout, format!("{refusal}\n"), "{output:?}");
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        let result = bash_exec_result(
+            &output,
+            &first.refused,
+            first.proxied,
+            &SocketPolicy::default(),
+            None,
+        );
+        assert_eq!(
+            result["network"]["localhost"]["port"], port,
+            "allowed while the command ran, so it refused there: {result}"
+        );
+
+        let next = run_with_network(command(&connect), None, &network).await;
+        let output = next.output.unwrap();
+        assert_eq!(output.stdout, "connected\n", "{output:?}");
+        assert_eq!(next.refused.targets, [format!("localhost:{port}")]);
+    }
+
+    #[test]
+    fn a_failed_command_still_names_the_hosts_the_proxy_refused() {
+        let mut refused = RefusedTargets::default();
+        let timed_out = || {
+            Ok(SandboxCommandOutput {
+                timed_out: true,
+                cwd: PathBuf::from("/w"),
+                exit_code: None,
+                success: false,
+                stdout: String::new(),
+                stderr: "Command timed out after 2000 ms".to_string(),
+            })
+        };
+        let error = bash_exec_outcome(
+            timed_out(),
+            &refused,
+            false,
+            &SocketPolicy::default(),
+            None,
+            2_000,
+            true,
+        )
+        .unwrap_err();
+        assert!(!error.contains("Network allowlist refused"), "{error}");
+
+        refused.add("example.org:443".to_string());
+        refused.add("pypi.org:443".to_string());
+        refused.more = 2;
+        let error = bash_exec_outcome(
+            timed_out(),
+            &refused,
+            false,
+            &SocketPolicy::default(),
+            None,
+            2_000,
+            true,
+        )
+        .unwrap_err();
+        let (timeout, network) = error.split_once('\n').unwrap();
+        assert!(
+            timeout.contains("re-run with a higher `timeoutMs`"),
+            "{error}"
+        );
+        assert_eq!(
+            network,
+            format!("Network allowlist refused: example.org:443, pypi.org:443 and 2 more. {REFUSED_HINT}")
+        );
+    }
+
+    #[test]
+    fn a_result_names_the_hosts_the_proxy_refused() {
+        let output = SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(7),
+            success: false,
+            stdout: String::new(),
+            stderr: "curl: (56) CONNECT tunnel failed, response 403".to_string(),
+        };
+        assert!(bash_exec_result(
+            &output,
+            &RefusedTargets::default(),
+            false,
+            &SocketPolicy::default(),
+            None
+        )
+        .get("network")
+        .is_none());
+        let mut refused = RefusedTargets::default();
+        refused.add("example.org:443".to_string());
+        let result = bash_exec_result(&output, &refused, false, &SocketPolicy::default(), None);
+        assert_eq!(
+            result["network"]["refused"],
+            serde_json::json!(["example.org:443"])
+        );
+        assert!(result["network"].get("refusedMore").is_none());
+        let hint = result["network"]["hint"].as_str().unwrap();
+        assert!(hint.contains("net_request_access"), "{hint}");
+        assert_eq!(result["exitCode"], 7);
+
+        refused.more = 3;
+        assert_eq!(
+            bash_exec_result(&output, &refused, false, &SocketPolicy::default(), None)["network"]
+                ["refusedMore"],
+            3
+        );
+    }
+
+    /// One line per client as it reports a refused connection to localhost,
+    /// and the port it names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_localhost_connection_is_read_from_the_client_output() {
+        for (line, port) in [
+            (r#"psql: error: connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused"#, Some(5432)),
+            (r#"psql: error: connection to server at "localhost" (::1), port 5678 failed: Connection refused"#, Some(5678)),
+            ("Could not connect to Redis at 127.0.0.1:6379: Connection refused", Some(6379)),
+            ("curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server", Some(8080)),
+            ("curl: (7) Failed to connect to ::1 port 8081 after 0 ms: Connection refused", Some(8081)),
+            ("Error: connect ECONNREFUSED 127.0.0.1:3000", Some(3000)),
+            ("Error: connect ECONNREFUSED ::1:3001", Some(3001)),
+            ("ERROR 2003 (HY000): Can't connect to MySQL server on 'localhost:3306' (111)", Some(3306)),
+            ("Can\u{2019}t connect to MySQL server on \u{2019}localhost:3307\u{2019}", Some(3307)),
+            ("ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1' (111)", None),
+            ("requests.exceptions.ConnectionError: HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: / (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x7f>: Failed to establish a new connection: [Errno 111] Connection refused'))", Some(8000)),
+            ("ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 5679)", Some(5679)),
+            ("nc: connect to localhost (127.0.0.1) port 5680 (tcp) failed: Connection refused", Some(5680)),
+            ("bash: line 1: /dev/tcp/localhost/5681: Connection refused", Some(5681)),
+            ("dial tcp [::1]:9000: connect: connection refused", Some(9000)),
+            ("psql: error: falló la conexión al servidor en «localhost» (127.0.0.1), puerto 5678: Conexión rehusada", Some(5678)),
+            ("psql: Fehler: Verbindung zum Server auf »localhost« (127.0.0.1), Port 5432 fehlgeschlagen: Verbindungsaufbau abgelehnt", Some(5432)),
+            ("psql: erreur : la connexion au serveur sur « localhost » (::1), port 5433 a échoué : Connexion refusée", Some(5433)),
+            (r#"psql: erro: a conexão com o servidor em "localhost" (127.0.0.1), porta 5434 falhou: Conexão recusada"#, Some(5434)),
+            ("OSError: Multiple exceptions: [Errno 111] Connect call failed ('::1', 8001, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 8001)", Some(8001)),
+        ] {
+            assert_eq!(refused_localhost_port(line), Some(port), "{line}");
+        }
+        // glibc's ECONNREFUSED text in the locales the detector reads.
+        for refusal in [
+            "Conexión rehusada",
+            "Connexion refusée",
+            "Verbindungsaufbau abgelehnt",
+            "Connessione rifiutata",
+            "Conexão recusada",
+            "Ligação recusada",
+            "Verbinding is geweigerd",
+            "Conexión rexeitada",
+        ] {
+            let line = format!("bash: /dev/tcp/127.0.0.1/5682: {refusal}");
+            assert_eq!(refused_localhost_port(&line), Some(Some(5682)), "{line}");
+        }
+        for line in [
+            r#"psql: error: connection to server at "db.example.org" (10.0.0.5), port 5432 failed: Connection refused"#,
+            "Listening on http://localhost:8080",
+            "connected to 127.0.0.1:6379",
+            "curl: (7) Failed to connect to localhost.example.org port 80: Connection refused",
+            "dial tcp [fe80::1]:9000: connect: connection refused",
+            "Error: connect ECONNREFUSED 127.0.0.10:3000",
+            // Python and Ncat name no host here: out of reach of the hint.
+            "ConnectionRefusedError: [Errno 111] Connection refused",
+            "Ncat: Connection refused.",
+        ] {
+            assert_eq!(refused_localhost_port(line), None, "{line}");
+        }
+    }
+
+    /// Every refused localhost port but one the proxy already named, which
+    /// `network.refused` covers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_localhost_hint_skips_a_port_the_proxy_named() {
+        let output = |stderr: &str| SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(2),
+            success: false,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        };
+        let psql = |port: u16| {
+            format!(
+                r#"psql: error: connection to server at "localhost" (::1), port {port} failed: Connection refused"#
+            )
+        };
+        let none = RefusedTargets::default();
+        let refused = output(&psql(5678));
+        assert_eq!(localhost_refusal(&refused, &none), Some(Some(5678)));
+        let mut named = RefusedTargets::default();
+        named.add("localhost:5678".to_string());
+        assert_eq!(localhost_refusal(&refused, &named), None);
+
+        let both = output(&format!("{}\n{}", psql(5678), psql(6379)));
+        assert_eq!(localhost_refusal(&both, &named), Some(Some(6379)));
+        let portless =
+            output("ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1' (111)");
+        assert_eq!(localhost_refusal(&portless, &none), Some(None));
+        let on_stdout = SandboxCommandOutput {
+            stdout: psql(5678),
+            ..output("")
+        };
+        assert_eq!(localhost_refusal(&on_stdout, &none), Some(Some(5678)));
+    }
+
+    /// Behind the proxy only (Allowlist), next to the hosts it refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_result_behind_the_proxy_points_a_refused_localhost_at_net_request_access() {
+        let output = SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(1),
+            success: false,
+            stdout: String::new(),
+            stderr: "Error: connect ECONNREFUSED 127.0.0.1:3000".to_string(),
+        };
+        let mut refused = RefusedTargets::default();
+        let sockets = SocketPolicy::default();
+        let result = bash_exec_result(&output, &refused, false, &sockets, None);
+        assert!(
+            result.get("network").is_none(),
+            "Host network or Off: {result}"
+        );
+        let result = bash_exec_result(&output, &refused, true, &sockets, None);
+        assert_eq!(
+            result["network"],
+            serde_json::json!({"localhost": localhost_note(Some(3000))})
+        );
+        refused.add("example.org:443".to_string());
+        let result = bash_exec_result(&output, &refused, true, &sockets, None);
+        assert_eq!(
+            result["network"]["refused"],
+            serde_json::json!(["example.org:443"])
+        );
+        assert_eq!(result["network"]["localhost"], localhost_note(Some(3000)));
+    }
+
+    #[test]
+    fn the_localhost_note_names_the_port_to_ask_for() {
+        let note = localhost_note(Some(5678));
+        assert_eq!(note["port"], 5678);
+        let hint = note["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("call `net_request_access` with host `localhost:5678`"),
+            "{hint}"
+        );
+        assert!(hint.contains("not this computer's"), "{hint}");
+        let note = localhost_note(None);
+        assert!(note.get("port").is_none());
+        assert!(note["hint"]
+            .as_str()
+            .unwrap()
+            .contains("`localhost:<port>`"));
+    }
+
+    /// The hint leads to the folder-access card, for the socket itself.
+    #[test]
+    fn the_socket_hint_asks_for_a_grant_on_the_socket_and_says_why() {
+        assert!(SOCKET_HINT.contains("call `fs_request_grant` with the exact socket path"));
+        assert!(SOCKET_HINT.contains("not its folder"));
+        assert!(SOCKET_HINT.contains("A Docker, Podman or containerd socket gives control"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_result_names_the_host_sockets_a_failed_command_could_not_reach() {
+        let temp = tempdir().unwrap();
+        let socket = temp.path().canonicalize().unwrap().join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let file = temp.path().join("plain.sock");
+        fs::write(&file, "").unwrap();
+        let path = socket.display().to_string();
+        let output = |success: bool, stderr: &str| SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(if success { 0 } else { 1 }),
+            success,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        };
+        let unreachable = |output: &SandboxCommandOutput, sockets: &SocketPolicy| {
+            bash_exec_result(output, &RefusedTargets::default(), false, sockets, None)
+                .get("sockets")
+                .map(|sockets| sockets["unreachable"].clone())
+        };
+        let confined = SocketPolicy {
+            helper: Some(PathBuf::from("/opt/h")),
+            kernel_confines: true,
+            allowed: Vec::new(),
+            skipped: Vec::new(),
+            hint_places: vec![temp.path().canonicalize().unwrap()],
+        };
+        let denied = output(
+            false,
+            &format!(
+                "permission denied while trying to connect to the Docker daemon socket at \
+                 unix://{path}: dial unix {path}: connect: permission denied\nopen {}: \
+                 permission denied",
+                file.display()
+            ),
+        );
+        assert_eq!(
+            unreachable(&denied, &confined),
+            Some(serde_json::json!([path]))
+        );
+        let result = bash_exec_result(&denied, &RefusedTargets::default(), false, &confined, None);
+        assert_eq!(result["sockets"]["hint"], SOCKET_HINT);
+
+        // Without Landlock a refusal comes from the host's permissions.
+        let unconfined = SocketPolicy {
+            kernel_confines: false,
+            ..confined.clone()
+        };
+        assert_eq!(unreachable(&denied, &unconfined), None);
+        // A socket not bound into the sandbox is named either way.
+        let missing = output(
+            false,
+            &format!("dial unix {path}: connect: no such file or directory"),
+        );
+        assert_eq!(
+            unreachable(&missing, &unconfined),
+            Some(serde_json::json!([path]))
+        );
+        let allowed = SocketPolicy {
+            allowed: vec![crate::assistant::sandbox::AllowedSocket {
+                path: socket.clone(),
+                host: socket.clone(),
+            }],
+            ..confined.clone()
+        };
+        assert_eq!(unreachable(&denied, &allowed), None);
+        assert_eq!(unreachable(&output(true, &denied.stderr), &confined), None);
+
+        // m3: a path outside the usual socket places is never looked up, so
+        // a command cannot probe the host by printing paths.
+        let elsewhere = tempdir().unwrap();
+        let hidden = elsewhere.path().canonicalize().unwrap().join("hidden.sock");
+        let _hidden = std::os::unix::net::UnixListener::bind(&hidden).unwrap();
+        let probe = |path: String| output(false, &format!("{path}: no such file or directory"));
+        assert_eq!(
+            unreachable(&probe(hidden.display().to_string()), &confined),
+            None
+        );
+        // Nor is one that only seems to be in such a place.
+        let dotdot = format!(
+            "{}/../{}",
+            temp.path().canonicalize().unwrap().display(),
+            hidden
+                .strip_prefix(elsewhere.path().parent().unwrap().canonicalize().unwrap())
+                .unwrap()
+                .display()
+        );
+        assert_eq!(unreachable(&probe(dotdot), &confined), None);
+        // At most 16 lookups per result: a socket after 16 other paths is
+        // not named.
+        let mut many: String = (0..16)
+            .map(|index| {
+                format!(
+                    "{}/missing-{index}: no such file or directory\n",
+                    temp.path().display()
+                )
+            })
+            .collect();
+        many.push_str(&missing.stderr);
+        assert_eq!(unreachable(&output(false, &many), &unconfined), None);
+        // Paths elsewhere are not even looked up, so they use none of them.
+        let mut elsewhere_paths: String = (0..16)
+            .map(|index| format!("/elsewhere/missing-{index}: no such file or directory\n"))
+            .collect();
+        elsewhere_paths.push_str(&missing.stderr);
+        assert_eq!(
+            unreachable(&output(false, &elsewhere_paths), &unconfined),
+            Some(serde_json::json!([path]))
+        );
+    }
+
+    #[test]
+    fn the_shell_profile_takes_its_network_from_the_mode() {
+        use crate::assistant::sandbox::{status_for, SandboxBackend};
+        let workspace = tempdir().unwrap();
+        let profile = |mode, status| {
+            let mut context = context_with_grants(workspace.path(), Vec::new());
+            let mut execution = context.run_context.execution.clone();
+            execution.sandbox.network_access = network(mode);
+            context.run_context = std::sync::Arc::new(RunContext {
+                execution,
+                ..(*context.run_context).clone()
+            });
+            let filesystem = filesystem_policy(&context).unwrap();
+            sandbox_profile(&context, workspace.path().to_path_buf(), filesystem, status)
+        };
+        let linux = status_for(Some(SandboxBackend::Bubblewrap));
+        assert_eq!(
+            profile(NetworkMode::Off, &linux).unwrap().network,
+            SandboxNetworkMode::Disabled
+        );
+        // The test binary has no helper beside it, as an install without one.
+        #[cfg(target_os = "linux")]
+        assert!(profile(NetworkMode::Allowlist, &linux)
+            .unwrap_err()
+            .starts_with("Sandboxed shell is unavailable: network helper not found"));
+        let macos = status_for(Some(SandboxBackend::Seatbelt));
+        assert!(profile(NetworkMode::Allowlist, &macos).is_err());
+    }
+
+    #[test]
+    fn only_full_binds_the_whole_bus_and_keyring_only_fails_closed() {
+        let proxy = SessionBusProxy {
+            socket: PathBuf::from("/c/.clai-net/bus-1.sock"),
+            bus: PathBuf::from("/run/user/1000/bus"),
+        };
+        let unused = || -> Result<Option<SessionBusProxy>, String> { panic!("no plan needed") };
+        assert_eq!(
+            session_bus_for(SandboxSessionBusConfig::Full, unused),
+            (SandboxSessionBusMode::Allow, None, None)
+        );
+        assert_eq!(
+            session_bus_for(SandboxSessionBusConfig::Deny, unused),
+            (SandboxSessionBusMode::Deny, None, None)
+        );
+        let keyring = |plan: Result<Option<SessionBusProxy>, String>| {
+            session_bus_for(SandboxSessionBusConfig::KeyringOnly, || plan)
+        };
+        assert_eq!(
+            keyring(Ok(Some(proxy.clone()))),
+            (SandboxSessionBusMode::Allow, Some(proxy), None)
+        );
+        assert_eq!(
+            keyring(Err("xdg-dbus-proxy is not installed".to_string())),
+            (
+                SandboxSessionBusMode::Deny,
+                None,
+                Some("xdg-dbus-proxy is not installed".to_string())
+            )
+        );
+        assert_eq!(keyring(Ok(None)), (SandboxSessionBusMode::Deny, None, None));
+    }
+
+    /// The review's B1 case: a keyring-only agent whose workspace is outside
+    /// the home directory. Whatever this host offers, the profile never binds
+    /// the real bus: it has the proxy, or no bus.
+    #[test]
+    fn a_keyring_only_profile_never_binds_the_real_bus() {
+        use crate::assistant::sandbox::{status_for, SandboxBackend};
+        let workspace = tempdir().unwrap();
+        let mut context = context_with_grants(workspace.path(), Vec::new());
+        let mut execution = context.run_context.execution.clone();
+        execution.sandbox.network_access = network(NetworkMode::Off);
+        execution.sandbox.session_bus = SandboxSessionBusConfig::KeyringOnly;
+        context.run_context = std::sync::Arc::new(RunContext {
+            execution,
+            ..(*context.run_context).clone()
+        });
+        let filesystem = filesystem_policy(&context).unwrap();
+        let profile = sandbox_profile(
+            &context,
+            workspace.path().to_path_buf(),
+            filesystem,
+            &status_for(Some(SandboxBackend::Bubblewrap)),
+        )
+        .unwrap();
+        match profile.session_bus {
+            SandboxSessionBusMode::Allow => assert!(profile.session_bus_proxy.is_some()),
+            SandboxSessionBusMode::Deny => {
+                assert!(profile.session_bus_proxy.is_none());
+                let address: Vec<_> = profile
+                    .env
+                    .iter()
+                    .filter(|(key, _)| *key == "DBUS_SESSION_BUS_ADDRESS")
+                    .map(|(_, value)| value)
+                    .collect();
+                assert_eq!(
+                    address,
+                    [crate::assistant::sandbox::profile::SESSION_BUS_OFF_ADDRESS]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_result_says_why_keyring_only_has_no_bus_and_how_to_get_it() {
+        let output = SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(0),
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let none = SocketPolicy::default();
+        let refused = RefusedTargets::default();
+        assert!(bash_exec_result(&output, &refused, false, &none, None)
+            .get("sessionBus")
+            .is_none());
+        let reason = Some("xdg-dbus-proxy is not installed");
+        let note = bash_exec_result(&output, &refused, false, &none, reason)["sessionBus"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!note.contains('\n'), "one line: {note}");
+        assert!(note.contains("xdg-dbus-proxy is not installed"), "{note}");
+        assert!(note.contains("set its Session bus to Full"), "{note}");
+        let error = bash_exec_outcome(
+            Err("Command timed out after 2000 ms".to_string()),
+            &refused,
+            false,
+            &none,
+            reason,
+            2_000,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.ends_with(&note), "{error}");
+    }
+
+    /// A keyring proxy that cannot start leaves the command with no bus and
+    /// says so; it neither fails the command nor binds the real bus.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_keyring_proxy_that_does_not_start_leaves_no_bus() {
+        let workspace = tempdir().unwrap();
+        let bus = workspace.path().join("host-bus");
+        let mut profile = SandboxProfile::for_test(
+            workspace.path().to_path_buf(),
+            Vec::new(),
+            SandboxNetworkMode::Disabled,
+            SandboxSessionBusMode::Allow,
+            SandboxEnv::filtered_from_iter(
+                [
+                    ("PATH", "/usr/bin:/bin"),
+                    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus"),
+                ],
+                workspace.path(),
+                SandboxSessionBusMode::Allow,
+            ),
+            None,
+        );
+        profile.session_bus_proxy = Some(SessionBusProxy {
+            socket: PathBuf::from("/nonexistent/dir/bus-1.sock"),
+            bus: bus.clone(),
+        });
+        let command = SandboxCommand {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo ${DBUS_SESSION_BUS_ADDRESS-none}".into(),
+            ],
+            cwd: workspace.path().to_path_buf(),
+            timeout_ms: 10_000,
+            max_output_chars: 10_000,
+            profile,
+        };
+        let network = std::sync::Arc::new(run_network(&[], &[]));
+        let run = run_with_network(command, None, &network).await;
+        assert!(
+            run.session_bus_unavailable.is_some(),
+            "the result says why there is no bus"
+        );
+        let output = match run.output {
+            Ok(output) => output,
+            Err(error) if error.contains("Sandboxed shell is unavailable") => {
+                crate::assistant::sandbox::skip_without_bwrap(&error);
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(
+            output.stdout.trim(),
+            crate::assistant::sandbox::profile::SESSION_BUS_OFF_ADDRESS,
+            "{output:?}"
+        );
+    }
+
+    /// The sockets a shell profile hands over for these saved and run-only
+    /// grants.
+    #[cfg(target_os = "linux")]
+    fn sockets_for(
+        workspace: &Path,
+        saved: Vec<FilesystemPathGrant>,
+        run_only: Vec<FilesystemPathGrant>,
+    ) -> SocketPolicy {
+        use crate::assistant::sandbox::{status_for, SandboxBackend};
+        let mut context = context_with_grants(workspace, saved);
+        let mut execution = context.run_context.execution.clone();
+        execution.sandbox.network_access = network(NetworkMode::Off);
+        context.run_context = std::sync::Arc::new(RunContext {
+            execution,
+            ..(*context.run_context).clone()
+        });
+        for grant in run_only {
+            context.add_session_grant(grant);
+        }
+        let filesystem = filesystem_policy(&context).unwrap();
+        sandbox_profile(
+            &context,
+            workspace.to_path_buf(),
+            filesystem,
+            &status_for(Some(SandboxBackend::Bubblewrap)),
+        )
+        .unwrap()
+        .sockets
+    }
+
+    #[cfg(target_os = "linux")]
+    fn grant_on(path: &Path, access: FilesystemPathAccess) -> FilesystemPathGrant {
+        FilesystemPathGrant {
+            path: path.display().to_string(),
+            access,
+            origin: None,
+        }
+    }
+
+    /// A socket and the directory that holds it, outside the workspace.
+    #[cfg(target_os = "linux")]
+    fn listening_socket() -> (tempfile::TempDir, PathBuf, std::os::unix::net::UnixListener) {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().canonicalize().unwrap().join("docker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        (dir, socket, listener)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exact_grant_on_a_socket_lets_commands_connect_read_only_or_read_write() {
+        let workspace = tempdir().unwrap();
+        let (_dir, socket, _listener) = listening_socket();
+        for access in [
+            FilesystemPathAccess::ReadWrite,
+            FilesystemPathAccess::ReadOnly,
+        ] {
+            let sockets = sockets_for(
+                workspace.path(),
+                vec![grant_on(&socket, access)],
+                Vec::new(),
+            );
+            assert_eq!(
+                sockets.allowed,
+                [crate::assistant::sandbox::AllowedSocket {
+                    path: socket.clone(),
+                    host: socket.clone(),
+                }],
+                "{access:?}: {sockets:?}"
+            );
+            assert!(sockets.skipped.is_empty(), "{access:?}: {sockets:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grant_on_a_socket_for_this_run_only_counts() {
+        let workspace = tempdir().unwrap();
+        let (_dir, socket, _listener) = listening_socket();
+        let run_only = vec![grant_on(&socket, FilesystemPathAccess::ReadOnly)];
+        let sockets = sockets_for(workspace.path(), Vec::new(), run_only);
+        assert_eq!(sockets.allowed.len(), 1, "{sockets:?}");
+        assert_eq!(sockets.allowed[0].host, socket);
+    }
+
+    /// The hint sends the agent to `fs_request_grant` for a socket; a folder
+    /// grant over it must not answer that request without a card.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_under_a_granted_folder_still_needs_its_own_grant() {
+        let workspace = tempdir().unwrap();
+        let (dir, socket, _listener) = listening_socket();
+        let file = dir.path().canonicalize().unwrap().join("notes.txt");
+        fs::write(&file, "").unwrap();
+        let read = FilesystemPathAccess::ReadOnly;
+        let context = context_with_grants(workspace.path(), vec![grant_on(dir.path(), read)]);
+        let filesystem = filesystem_policy(&context).unwrap();
+        assert!(already_granted(&filesystem, &file, read));
+        assert!(!already_granted(&filesystem, &socket, read));
+
+        context.add_session_grant(grant_on(&socket, read));
+        let filesystem = filesystem_policy(&context).unwrap();
+        assert!(already_granted(&filesystem, &socket, read));
+        assert!(!already_granted(
+            &filesystem,
+            &socket,
+            FilesystemPathAccess::ReadWrite
+        ));
+    }
+
+    /// H2: a directory grant shows a socket in it, but does not let a
+    /// command connect to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_under_a_granted_directory_stays_unreachable() {
+        let workspace = tempdir().unwrap();
+        let (dir, _socket, _listener) = listening_socket();
+        for access in [
+            FilesystemPathAccess::ReadOnly,
+            FilesystemPathAccess::ReadWrite,
+        ] {
+            let sockets = sockets_for(
+                workspace.path(),
+                vec![grant_on(dir.path(), access)],
+                Vec::new(),
+            );
+            assert!(sockets.allowed.is_empty(), "{access:?}: {sockets:?}");
+            assert!(sockets.skipped.is_empty(), "{access:?}: {sockets:?}");
+        }
+    }
+
+    /// M2: in a directory the sandbox can write, a command could swap the
+    /// socket for a link to another one, so its grant is refused and the
+    /// result says why: under a read-write directory grant, or in the
+    /// workspace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_grant_in_a_writable_directory_is_refused_and_the_result_says_why() {
+        let workspace = tempdir().unwrap();
+        let (dir, socket, _listener) = listening_socket();
+        let in_workspace = workspace.path().canonicalize().unwrap().join("dev.sock");
+        let _dev = std::os::unix::net::UnixListener::bind(&in_workspace).unwrap();
+        let sockets = sockets_for(
+            workspace.path(),
+            vec![
+                grant_on(dir.path(), FilesystemPathAccess::ReadWrite),
+                grant_on(&socket, FilesystemPathAccess::ReadWrite),
+            ],
+            vec![grant_on(&in_workspace, FilesystemPathAccess::ReadOnly)],
+        );
+        assert!(sockets.allowed.is_empty(), "{sockets:?}");
+        let output = SandboxCommandOutput {
+            timed_out: false,
+            cwd: PathBuf::from("/w"),
+            exit_code: Some(0),
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let result = bash_exec_result(&output, &RefusedTargets::default(), false, &sockets, None);
+        let skipped = result["socketGrantsSkipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        let dir = dir.path().canonicalize().unwrap();
+        for (refusal, (path, writable)) in skipped.iter().zip([
+            (&socket, dir.as_path()),
+            (&in_workspace, in_workspace.parent().unwrap()),
+        ]) {
+            let refusal = refusal.as_str().unwrap();
+            assert!(
+                refusal.starts_with(&path.display().to_string()),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains(&format!("can write at {}", writable.display())),
+                "{refusal}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // evaluate_command_policy — the ask-first list
     // ------------------------------------------------------------------
 
     use crate::config::types::ShellCapabilityConfig;
     use crate::config::{ExecutionCapabilityConfig, ShellAccessMode};
 
-    fn restricted_execution_config(
-        allowed: &[&str],
-        blocked: &[&str],
-    ) -> ExecutionCapabilityConfig {
+    fn config_in(mode: ShellAccessMode, rules: &[&str]) -> ExecutionCapabilityConfig {
         ExecutionCapabilityConfig {
             shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Restricted,
-                allowed_command_prefixes: allowed.iter().map(|s| s.to_string()).collect(),
-                blocked_command_prefixes: blocked.iter().map(|s| s.to_string()).collect(),
+                mode,
+                ask_first_command_prefixes: rules.iter().map(|s| s.to_string()).collect(),
             },
             ..Default::default()
         }
     }
 
-    fn full_execution_config(blocked: &[&str]) -> ExecutionCapabilityConfig {
-        ExecutionCapabilityConfig {
-            shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Full,
-                allowed_command_prefixes: vec![],
-                blocked_command_prefixes: blocked.iter().map(|s| s.to_string()).collect(),
-            },
-            ..Default::default()
+    /// A Restricted (Ask first) agent whose ask-first list is `rules`.
+    fn ask_first_config(rules: &[&str]) -> ExecutionCapabilityConfig {
+        config_in(ShellAccessMode::Restricted, rules)
+    }
+
+    /// A Full agent with `rules` on its ask-first list, which Full never reads.
+    fn full_execution_config(rules: &[&str]) -> ExecutionCapabilityConfig {
+        config_in(ShellAccessMode::Full, rules)
+    }
+
+    /// The rows `command` asks about; empty when it runs without asking.
+    fn asked(exec: &ExecutionCapabilityConfig, command: &str) -> Vec<AskFirstRow> {
+        match evaluate_command_policy(exec, command, &[]) {
+            PolicyResult::AskFirst(rows) => rows,
+            PolicyResult::Allow => Vec::new(),
+        }
+    }
+
+    fn asks_first(exec: &ExecutionCapabilityConfig, command: &str) -> bool {
+        !asked(exec, command).is_empty()
+    }
+
+    #[test]
+    fn ask_first_reads_every_command_of_the_input() {
+        // The matcher's readings of each row, each run against a rule on the
+        // ask-first list.
+        let cases: &[(&str, &str)] = &[
+            ("git push", "git push"),
+            ("git push", "git push --force origin main"),
+            ("git push", "cd x && git push"),
+            ("git push", "git log | git push"),
+            ("git push", "timeout 60 git push origin main"),
+            ("git push", "git -C ../r push"),
+            ("git push", "git -c x=y push"),
+            ("git push", "git --no-pager -C repo push"),
+            ("git push", "FOO=1 /usr/bin/git push"),
+            ("git push", "printf x | xargs git push"),
+            ("git push", "if true; then git push; fi"),
+            ("git push", "echo $(git push)"),
+            ("git push", "cat <<EOF\n$(git push)\nEOF"),
+            ("git push", "git -c diff.external=/bin/echo push"),
+            ("git push", "git -C repo -c e=v push"),
+            ("git status", "git --git-dir=.git status --short"),
+            ("git status", "git --git-dir .git status --short"),
+            ("git status", "git status -C repo"),
+            ("git status", "git --config-env core.fsmonitor=FSMON status"),
+            ("git status", "timeout 600 git -C repo status --short"),
+            ("git status", "FOO=bar git -C repo status --short"),
+            ("git -c", "FOO=bar git -c diff.external=/bin/echo diff"),
+            ("rm", "rm -rf /tmp"),
+            ("rm", "timeout 5 rm x"),
+            ("rm", "xargs rm"),
+            ("rm", "find . | xargs rm -f"),
+            ("rm", "find . -exec rm {} +"),
+            ("rm", "find . -name x -execdir rm -f {} \\;"),
+            ("rm", "find . -ok /bin/rm {} ';'"),
+            ("git push", "find . -exec git -C r push \\;"),
+            ("rm", "FOO=bar rm -rf /tmp/x"),
+            ("rm", "/usr/bin/rm -rf x"),
+            ("rm", "./rm x"),
+            ("rm", "FOO=1 /bin/rm x"),
+            ("rm", "ls; ../bin/rm x"),
+            ("rm", "FOO='a b' /usr/bin/rm x"),
+            ("rm", "rm\tx"),
+            ("rm", "/bin/rm\t-rf x"),
+            ("rm", "A=$'\\'' rm x"),
+            ("rm", "FOO=$'a\\' b' /usr/bin/rm x/y"),
+            ("rm", "A+=x A[1 + 1]=y rm x"),
+            ("rm", "timeout 60 rm -rf x"),
+            ("rm", "timeout --signal=KILL 60 rm -rf x"),
+            ("rm", "nice -n 5 rm -rf x"),
+            ("rm", "env FOO=1 rm -rf x"),
+            ("timeout", "timeout 60 cargo build"),
+            ("[", "[ -f /tmp/x ]"),
+        ];
+        for (rule, command) in cases {
+            let rules = asked(&ask_first_config(&[rule]), command)
+                .into_iter()
+                .map(|row| row.rule)
+                .collect::<Vec<_>>();
+            assert!(
+                rules.iter().any(|matched| matched == rule),
+                "`{command}` must ask for `{rule}`, asked for {rules:?}"
+            );
         }
     }
 
     #[test]
-    fn policy_blocks_using_agent_blocklist() {
-        let exec = restricted_execution_config(&[], &["rm"]);
-        let err = enforce_command_policy(&exec, None, "rm -rf /tmp").unwrap_err();
-        assert!(matches!(err, CommandDenial::ExplicitlyBlocked(_)));
-    }
-
-    #[test]
-    fn policy_allows_using_agent_allowlist_even_without_workspace_root() {
-        let exec = restricted_execution_config(&["git status"], &[]);
-        assert!(enforce_command_policy(&exec, None, "git status -s").is_ok());
-    }
-
-    #[test]
-    fn policy_workspace_root_is_not_a_policy_source() {
-        // Legacy `.clai/permissions.json` files are no longer part of command
-        // policy. The root argument is accepted only for the old test wrapper.
-        let temp = tempdir().unwrap();
-        let exec = restricted_execution_config(&["git"], &[]);
-        assert!(enforce_command_policy(&exec, Some(temp.path()), "git status").is_ok());
-    }
-
-    #[test]
-    fn policy_allows_seeded_restricted_prefix_from_allowlist() {
-        let exec = restricted_execution_config(&["rg"], &[]);
-        assert!(enforce_command_policy(&exec, None, "rg --files").is_ok());
-    }
-
-    #[test]
-    fn policy_restricted_prefix_removed_from_allowlist_needs_approval() {
-        let exec = restricted_execution_config(&[], &[]);
-        let err = enforce_command_policy(&exec, None, "rg --files").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-    }
-
-    #[test]
-    fn policy_restricted_with_no_matching_allowed_prefix_denies() {
-        let temp = tempdir().unwrap();
-        let exec = restricted_execution_config(&[], &[]);
-        let err = enforce_command_policy(&exec, Some(temp.path()), "obscure-tool").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-    }
-
-    // ------------------------------------------------------------------
-    // Per-segment evaluation
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn policy_pipeline_passes_when_all_segments_allowed() {
-        let exec = restricted_execution_config(&["git log", "head", "wc"], &[]);
-        assert!(enforce_command_policy(&exec, None, "git log | head | wc -l").is_ok());
-    }
-
-    #[test]
-    fn policy_pipeline_denies_when_any_segment_unmatched() {
-        // `git log` is allowed, but `obscure-tool` isn't.
-        let exec = restricted_execution_config(&["git log"], &[]);
-        let err = enforce_command_policy(&exec, None, "git log | obscure-tool").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-        // Denial should specifically reference the unapproved segment.
-        let msg = err.message();
-        assert!(
-            msg.contains("obscure-tool"),
-            "denial msg should mention the offending segment, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn policy_pipeline_block_in_one_segment_denies_whole() {
-        // Allow git, block rm — the rm segment denies even when git log is fine.
-        let exec = restricted_execution_config(&["git log"], &["rm"]);
-        let err = enforce_command_policy(&exec, None, "git log | rm -rf /tmp/foo").unwrap_err();
-        assert!(matches!(err, CommandDenial::ExplicitlyBlocked(_)));
-    }
-
-    #[test]
-    fn policy_closes_pipe_bypass_foot_gun() {
-        // The motivating bug: pre-segment matcher would word-boundary-match
-        // `git log` as a prefix of the whole pipeline and silently approve
-        // arbitrary downstream commands. Per-segment evaluation now treats
-        // the second segment as its own command — and `rm -rf` (with no
-        // allow entry) denies the pipeline.
-        let exec = restricted_execution_config(&["git log"], &[]);
-        assert!(enforce_command_policy(&exec, None, "git log | rm -rf ~/").is_err());
-    }
-
-    #[test]
-    fn policy_allowlist_never_covers_unparsed_input() {
-        // A quoted command name is not a plain word, so the splitter
-        // leaves it Unparsed. No prefix rule covers it, however broad.
-        let exec = restricted_execution_config(&["touch"], &[]);
-        let command = "\"touch\" PWN";
-        assert_eq!(
-            approval_texts(&exec, command),
-            vec![(command.to_string(), String::new())]
-        );
-        let run_allowed = vec![RunCommandGrant::Prefix(command.to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, command, &run_allowed, &[]),
-            PolicyResult::NeedsApproval(_)
-        ));
-    }
-
-    #[test]
-    fn policy_opaque_segment_in_restricted_denies_when_head_not_allowlisted() {
-        // Negative case: only commands whose head matches the allowlist
-        // pass. The redirect makes this row Opaque, and it gets no free
-        // ride just because `find` is allowlisted.
-        let exec = restricted_execution_config(&["find"], &[]);
-        let err =
-            enforce_command_policy(&exec, None, "bash tools/check-links.sh 2>&1").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-    }
-
-    #[test]
-    fn policy_opaque_segment_in_full_mode_passes() {
-        // Full mode skips the allowlist check, so an Opaque redirect row
-        // only fails if it hits a blocklist entry.
-        let exec = ExecutionCapabilityConfig {
-            shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Full,
-                allowed_command_prefixes: vec![],
-                blocked_command_prefixes: vec![],
-            },
-            ..Default::default()
-        };
-        assert!(enforce_command_policy(&exec, None, "echo hi > f").is_ok());
-    }
-
-    #[test]
-    fn policy_mixed_pipeline_with_opaque_passes_when_all_heads_allowlisted() {
-        // `find . 2>/dev/null` is Opaque (redirect), `wc -l` is Simple.
-        // With both heads on the allowlist the pipeline passes.
-        let exec = restricted_execution_config(&["find", "wc"], &[]);
-        assert!(enforce_command_policy(&exec, None, "find . 2>/dev/null | wc -l").is_ok());
-    }
-
-    #[test]
-    fn policy_mixed_pipeline_denies_when_opaque_head_missing() {
-        // If the Opaque segment's head isn't allowlisted, the pipeline
-        // still hits NeedsApproval — only `find` covered, `xargs` is not.
-        let exec = restricted_execution_config(&["find"], &[]);
-        let err = enforce_command_policy(&exec, None, "find . | xargs rm").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-    }
-
-    #[test]
-    fn policy_redirect_segment_in_restricted_allows_when_head_allowlisted() {
-        // `cat /etc/hosts > /tmp/x` — the redirect forces Opaque, but
-        // `cat` is the head and it's on the allowlist. Passes.
-        let exec = restricted_execution_config(&["cat"], &[]);
-        assert!(enforce_command_policy(&exec, None, "cat /etc/hosts > /tmp/x").is_ok());
-    }
-
-    #[test]
-    fn policy_redirect_segment_in_restricted_denies_when_head_not_allowlisted() {
-        let exec = restricted_execution_config(&["ls"], &[]);
-        let err = enforce_command_policy(&exec, None, "cat /etc/hosts > /tmp/x").unwrap_err();
-        assert!(matches!(err, CommandDenial::NotInAllowList(_)));
-    }
-
-    #[test]
-    fn policy_empty_command_still_errors() {
-        let exec = restricted_execution_config(&[], &[]);
-        let err = enforce_command_policy(&exec, None, "   ").unwrap_err();
-        assert!(matches!(err, CommandDenial::ExplicitlyBlocked(_)));
-    }
-
-    // -------------------------------------------------------------------
-    // Run-scoped allowed prefixes — the within-run cache populated by
-    // AllowOnce/AllowAlways so the user isn't re-prompted mid-run.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn policy_run_scoped_prefix_covers_simple_segment() {
-        // Empty durable allowlist, but a run-scoped entry for `git status`.
-        // A fresh `git status` should pass without approval.
-        let exec = restricted_execution_config(&[], &[]);
-        let run_allowed = vec![RunCommandGrant::Prefix("git status".to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git status", &run_allowed, &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_prefix_covers_descendant_args() {
-        // `matches_prefix` accepts the cached prefix plus more arguments,
-        // mirroring durable-allowlist semantics. AllowOnce on `git status`
-        // therefore also covers `git status -s` in the same run.
-        let exec = restricted_execution_config(&[], &[]);
-        let run_allowed = vec![RunCommandGrant::Prefix("git status".to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git status -s", &run_allowed, &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_prefix_does_not_cover_different_command() {
-        let exec = restricted_execution_config(&[], &[]);
-        let run_allowed = vec![RunCommandGrant::Prefix("git status".to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git add -A", &run_allowed, &[]),
-            PolicyResult::NeedsApproval(_),
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_prefix_covers_opaque_segment() {
-        // The run-scoped cache holds the segment text from a prior
-        // AllowOnce — honor it so the user isn't re-prompted for the same
-        // Opaque segment in the same run.
-        let exec = restricted_execution_config(&[], &[]);
-        let command = "find /tmp -name foo 2>/dev/null";
-        let run_allowed = vec![RunCommandGrant::Prefix(command.to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, command, &run_allowed, &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_durable_allowlist_covers_opaque_segment_by_head() {
-        // The durable allowlist matches Opaque segments by their binary
-        // head (via `matches_prefix`), same as it does for Simple. This
-        // lets users persist trust for tools whose syntactic shape
-        // forces Opaque classification (heredocs, redirects, $()) using
-        // the same "Always allow <prefix>" flow as Simple segments.
-        let exec = restricted_execution_config(&["git log"], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git log --oneline > /tmp/log", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_durable_allowlist_covers_redirect_opaque() {
-        // Real-world case from the friction screenshots: a redirect
-        // (`2>/dev/null`) turns a perfectly safe `which go` into an
-        // Opaque segment. With this fix, allowlisting `which` covers
-        // both `which go` and `which go 2>/dev/null` without re-asking.
-        let exec = restricted_execution_config(&["which"], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "which go 2>/dev/null", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_durable_allowlist_git_log_covers_no_pager_variant() {
-        // The reported friction: the agent runs `git --no-pager log …`, the
-        // suggester proposes `git log` (stripping the global flag), the user
-        // clicks "Always allow", yet every later `git --no-pager log` was
-        // re-prompted because the literal matcher never reconciled the saved
-        // `git log` with the flagged command. With matcher-side
-        // canonicalization the durable `git log` now covers it.
-        let exec = restricted_execution_config(&["git log"], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git --no-pager log --oneline -2", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_git_log_covers_no_pager_variant() {
-        // Same agreement must hold for the within-run cache populated by a
-        // fresh AllowAlways/AllowOnce, so the user isn't re-prompted for the
-        // rest of the run after granting once.
-        let exec = restricted_execution_config(&[], &[]);
-        let run_allowed = vec![RunCommandGrant::Prefix("git log".to_string())];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git --no-pager log --oneline", &run_allowed, &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_blocklist_canonicalization_blocks_env_prefixed_command() {
-        // Canonicalization strengthens the blocklist symmetrically: a blocked
-        // `rm` can't slip through behind an env assignment.
-        let exec = restricted_execution_config(&["git log"], &["rm"]);
-        let err = enforce_command_policy(&exec, None, "FOO=bar rm -rf /tmp/x").unwrap_err();
-        assert!(matches!(err, CommandDenial::ExplicitlyBlocked(_)));
-    }
-
-    #[test]
-    fn policy_blocklist_blocks_a_command_run_by_path() {
-        let exec = restricted_execution_config(&["git log"], &["rm"]);
+    fn ask_first_does_not_fire_for_what_is_not_the_command() {
+        let exec = ask_first_config(&["git push", "rm"]);
         for command in [
-            "/usr/bin/rm -rf x",
-            "./rm x",
-            "FOO=1 /bin/rm x",
-            "ls; ../bin/rm x",
-            "FOO='a b' /usr/bin/rm x",
-            "rm\tx",
-            "/bin/rm\t-rf x",
-            "A=$'\\'' rm x",
-            "FOO=$'a\\' b' /usr/bin/rm x/y",
-            "A+=x A[1 + 1]=y rm x",
+            "echo git push",
+            "git pushes",
+            "git status",
+            "cat <<'EOF'\ngit push\nEOF",
+            "rmdir x",
+            "bash -c \"git push\"",
+            "gh api repos/o/r -X DELETE",
+            "find . -name x",
+            "find . -name rm -print",
+            "find . -exec ls {} +",
         ] {
-            let err = enforce_command_policy(&exec, None, command).unwrap_err();
-            assert!(
-                matches!(err, CommandDenial::ExplicitlyBlocked(_)),
-                "{command}"
-            );
+            assert!(asked(&exec, command).is_empty(), "`{command}` must run");
         }
     }
 
     #[test]
-    fn policy_blocklist_sees_the_command_a_wrapper_runs() {
-        // `timeout` only changes how the command runs, so the blocklist sees
-        // the command itself.
-        let exec = restricted_execution_config(&["git log"], &["rm"]);
+    fn two_matches_in_one_input_give_one_request_with_two_rows() {
+        let exec = ask_first_config(&["git push", "rm"]);
+        assert_eq!(
+            asked(&exec, "rm -f x && cargo test && git push origin main"),
+            vec![
+                AskFirstRow {
+                    text: "rm -f x".to_string(),
+                    rule: "rm".to_string(),
+                },
+                AskFirstRow {
+                    text: "git push origin main".to_string(),
+                    rule: "git push".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_list_asks_in_restricted_and_never_in_full() {
+        let mut restricted = ask_first_config(&[]);
+        restricted.shell.ask_first_command_prefixes =
+            crate::config::types::default_ask_first_command_prefixes();
+        let mut full = restricted.clone();
+        full.shell.mode = ShellAccessMode::Full;
         for command in [
-            "timeout 60 rm -rf x",
-            "timeout --signal=KILL 60 rm -rf x",
-            "nice -n 5 rm -rf x",
-            "env FOO=1 rm -rf x",
+            "git push",
+            "cd x && git push",
+            "timeout 5 rm x",
+            "rm -rf x",
+            "printf x | xargs rm",
+            "sudo ls",
+            "cargo publish",
+            "gh api -X DELETE repos/o/r",
         ] {
-            let err = enforce_command_policy(&exec, None, command).unwrap_err();
-            assert!(
-                matches!(err, CommandDenial::ExplicitlyBlocked(_)),
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn policy_blocklist_sees_the_wrapper_too() {
-        let exec = restricted_execution_config(&["git log"], &["timeout"]);
-        let err = enforce_command_policy(&exec, None, "timeout 60 cargo build").unwrap_err();
-        assert!(matches!(err, CommandDenial::ExplicitlyBlocked(_)));
-    }
-
-    #[test]
-    fn policy_suggests_the_command_a_wrapper_runs() {
-        // The row the user approves is the whole wrapper, but the prefix it
-        // offers is the command inside it, so the grant is specific and
-        // covers the row it came from.
-        let exec = restricted_execution_config(&[], &[]);
-        let rows = approval_texts(&exec, "timeout 600 cargo build 2>&1 | tail -20");
-        assert_eq!(
-            rows,
-            vec![
-                (
-                    "timeout 600 cargo build 2>&1".to_string(),
-                    "cargo build".to_string()
-                ),
-                ("tail -20".to_string(), "tail".to_string()),
-            ]
-        );
-        // The saved prefix covers the row it came from.
-        let exec = restricted_execution_config(&["cargo build"], &[]);
-        assert!(enforce_command_policy(&exec, None, "timeout 600 cargo build 2>&1").is_ok());
-    }
-
-    #[test]
-    fn policy_allowlist_matches_the_command_bash_runs() {
-        // Bash reads `$'\''` as one quoted `'`, so this runs `rm`.
-        let exec = restricted_execution_config(&["git status"], &[]);
-        let command = "A=$'\\'' rm -rf x ' git status '";
-        assert!(matches!(
-            evaluate_command_policy(&exec, command, &[], &[]),
-            PolicyResult::NeedsApproval(_)
-        ));
-    }
-
-    #[test]
-    fn policy_opaque_segment_suggests_prefix_when_unmatched() {
-        // When an Opaque segment isn't allowlisted, the approval payload
-        // now carries a non-empty `suggested_prefix` so the FE can
-        // surface an "Always allow <prefix>" button — the affordance that
-        // makes the user's trust persistable. Previously this was empty
-        // and only "Allow once" was offered for Opaque rows.
-        let exec = restricted_execution_config(&[], &[]);
-        let result = evaluate_command_policy(&exec, "find /tmp -name foo 2>/dev/null", &[], &[]);
-        let PolicyResult::NeedsApproval(approvals) = result else {
-            panic!("expected NeedsApproval, got {:?}", policy_label(&result));
-        };
-        assert_eq!(approvals.len(), 1);
-        assert!(approvals[0].kind == crate::commands::permissions::SegmentKind::Opaque);
-        assert_eq!(approvals[0].suggested_prefix, "find");
-    }
-
-    #[test]
-    fn policy_asks_for_every_command_even_when_prefixes_repeat() {
-        // A user's decision on a row applies to exactly the command it shows,
-        // so a second command with the same head must get its own row.
-        let exec = restricted_execution_config(&[], &[]);
-        assert_eq!(
-            approval_texts(&exec, "rm a.txt; rm -rf ~/x"),
-            vec![
-                ("rm a.txt".to_string(), "rm".to_string()),
-                ("rm -rf ~/x".to_string(), "rm".to_string()),
-            ]
-        );
-        assert_eq!(
-            approval_texts(&exec, "sed -i 's/a/b/' f1 && sed -i '1d' /etc/hosts"),
-            vec![
-                ("sed -i 's/a/b/' f1".to_string(), "sed".to_string()),
-                ("sed -i '1d' /etc/hosts".to_string(), "sed".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn git_dash_c_forms_cannot_escape_a_broad_block() {
-        // `git -C <dir> status` is `git status` run elsewhere; a broad
-        // `git status` block must catch it even while `git` at large is
-        // allowed. Before option-aware normalization the matcher read the
-        // directory as the subcommand (`git repo status`) and the block
-        // never fired.
-        let exec = restricted_execution_config(&["git"], &["git status"]);
-        for cmd in [
-            "git -C repo status --short",
-            "git --git-dir=.git status --short",
-            "git --git-dir .git status --short",
-            "git --no-pager -C repo status",
-            "git status -C repo",
-        ] {
+            assert!(asks_first(&restricted, command), "`{command}` must ask");
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, cmd, &[], &[]),
-                    PolicyResult::Block { .. }
-                ),
-                "`{cmd}` must be blocked by `git status`"
-            );
-        }
-    }
-
-    #[test]
-    fn git_dash_c_block_applies_in_full_mode_and_behind_wrappers() {
-        // The blocklist is mode-independent, and neither a wrapper nor an
-        // env prefix may interpose itself between `git status` and its
-        // block.
-        let exec = full_execution_config(&["git status"]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git -C repo status --short", &[], &[]),
-            PolicyResult::Block { .. }
-        ));
-        let exec = restricted_execution_config(&[], &["git status"]);
-        for cmd in [
-            "timeout 600 git -C repo status --short",
-            "FOO=bar git -C repo status --short",
-        ] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, cmd, &[], &[]),
-                    PolicyResult::Block { .. }
-                ),
-                "`{cmd}` must be blocked by `git status`"
-            );
-        }
-    }
-
-    #[test]
-    fn git_status_allowlist_covers_dash_c_forms_without_widening() {
-        let exec = restricted_execution_config(&["git status"], &[]);
-        // The saved prefix matches the commands it was suggested for…
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git -C repo status --short", &[], &[]),
-            PolicyResult::Allow
-        ));
-        // …and nothing more: another subcommand behind -C stays uncovered.
-        assert!(matches!(
-            evaluate_command_policy(&exec, "git -C repo push", &[], &[]),
-            PolicyResult::NeedsApproval(_)
-        ));
-    }
-
-    #[test]
-    fn git_suggested_prefix_round_trips_through_saved_allow() {
-        let exec = restricted_execution_config(&[], &[]);
-        for (command, expected) in [
-            ("git -C repo status --short", "git status"),
-            ("git --git-dir=.git log --oneline", "git log"),
-            ("git --no-pager show HEAD", "git show"),
-        ] {
-            let rows = approval_texts(&exec, command);
-            assert_eq!(rows, vec![(command.to_string(), expected.to_string())]);
-            let saved = restricted_execution_config(&[&rows[0].1], &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&saved, command, &[], &[]),
+                    evaluate_command_policy(&full, command, &[]),
                     PolicyResult::Allow
                 ),
-                "saved suggestion must authorize its own command: `{command}`"
+                "`{command}` must run without a card in Full"
             );
+        }
+        // A former Restricted agent runs everyday commands without a card.
+        for command in ["cargo test", "ls -la", "git status", "touch x && cat x"] {
+            assert!(!asks_first(&restricted, command), "`{command}` must run");
         }
     }
 
     #[test]
-    fn git_config_injection_has_no_persistent_subcommand_suggestion() {
-        let exec = restricted_execution_config(&["git show", "git status", "git log"], &[]);
-        for command in [
-            "git -c core.pager=less show HEAD",
-            "git --config-env core.fsmonitor=FSMON status",
-            "git --config-env=core.fsmonitor=FSMON status",
-            "git -C repo -c core.pager=less log --oneline",
-            "git --no-pager --config-env=core.fsmonitor=FSMON status",
-            "FOO=bar git -c core.pager=less show HEAD",
-            "timeout 600 git --config-env=core.fsmonitor=FSMON status",
-        ] {
-            assert_eq!(
-                approval_texts(&exec, command),
-                vec![(command.to_string(), String::new())],
-                "config-carrying command must require approval without offering a saved subcommand rule"
-            );
-        }
-    }
-
-    #[test]
-    fn git_config_injection_cannot_ride_a_saved_allow() {
-        // `-c` and `--config-env` inject configuration into the run, and
-        // configuration can name commands to execute (core.fsmonitor,
-        // diff.external). Normalization must not strip them for allow
-        // matching: `git -c diff.external=/bin/echo diff …` would
-        // otherwise run /bin/echo under a saved `git diff` — the same
-        // value-word skipping that fixed `-C` opened this gap, so
-        // config-carrying invocations stay outside every saved
-        // subcommand prefix and ask for approval on their own.
-        let exec = restricted_execution_config(&["git diff", "git status", "git log"], &[]);
-        for cmd in [
-            "git -c diff.external=/bin/echo diff HEAD~1 HEAD",
-            "git -c core.fsmonitor=/bin/evil status",
-            "git --config-env core.fsmonitor=FSMON status",
-            "git --config-env=core.fsmonitor=FSMON status",
-            "git -C repo -c core.pager=/bin/evil log --oneline",
-        ] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, cmd, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "`{cmd}` must need approval despite the saved allow"
-            );
-        }
-    }
-
-    #[test]
-    fn git_config_injection_still_meets_blocks() {
-        // Deny matching reads through every documented global option, so a
-        // block keeps catching the subcommand however the run is
-        // configured — and a deny aimed at the config form itself fires
-        // too, even behind an env prefix the literal match cannot see
-        // through.
-        let exec = restricted_execution_config(&["git"], &["git push", "git status"]);
-        for cmd in [
-            "git -c diff.external=/bin/echo push",
-            "git --config-env core.fsmonitor=FSMON status",
-            "git -C repo -c e=v push",
-        ] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, cmd, &[], &[]),
-                    PolicyResult::Block { .. }
-                ),
-                "`{cmd}` must be blocked"
-            );
-        }
-        let exec = restricted_execution_config(&[], &["git -c"]);
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                "FOO=bar git -c diff.external=/bin/echo diff",
-                &[],
-                &[]
+    fn the_default_list_asks_for_common_spellings_of_its_commands() {
+        let mut exec = ask_first_config(&[]);
+        exec.shell.ask_first_command_prefixes =
+            crate::config::types::default_ask_first_command_prefixes();
+        for (command, rule) in [
+            ("kubectl -n ns delete pod x", "kubectl delete"),
+            ("kubectl --context prod delete pod x", "kubectl delete"),
+            ("kubectl --namespace=ns delete pod x", "kubectl delete"),
+            (
+                "kubectl --certificate-authority ca.crt delete pod x",
+                "kubectl delete",
             ),
-            PolicyResult::Block { .. }
-        ));
+            ("kubectl --profile cpu delete pod x", "kubectl delete"),
+            ("docker --context x push img", "docker push"),
+            ("docker -H tcp://x push img", "docker push"),
+            ("docker image push img", "docker image push"),
+            ("docker --context x image push img", "docker image push"),
+            ("npm --prefix x publish", "npm publish"),
+            ("npm -w pkg publish", "npm publish"),
+            ("npm --tag beta publish", "npm publish"),
+            ("npm --otp 123456 publish", "npm publish"),
+            ("npm --access public publish", "npm publish"),
+            ("npm -L project publish", "npm publish"),
+            ("npm --location project publish", "npm publish"),
+            ("npm --scope @o --auth-type web publish", "npm publish"),
+            ("cargo +nightly publish", "cargo publish"),
+            ("cargo -Z unstable publish", "cargo publish"),
+            ("pnpm --filter x publish", "pnpm publish"),
+            ("pnpm -C dir publish", "pnpm publish"),
+            ("yarn npm publish", "yarn npm publish"),
+            ("gh -R o/r release create v1", "gh release"),
+            ("gh --repo o/r release delete v1", "gh release"),
+            ("gh api -X DELETE repos/o/r", "gh api -X DELETE"),
+            ("gh api -XDELETE repos/o/r", "gh api -X DELETE"),
+            ("gh api --method DELETE repos/o/r", "gh api -X DELETE"),
+            ("gh api --method=DELETE repos/o/r", "gh api -X DELETE"),
+            ("gh api -X=DELETE repos/o/r", "gh api -X DELETE"),
+            ("timeout 5 gh api --method DELETE x", "gh api -X DELETE"),
+            (
+                "gh api repos/o/r/git/refs/heads/x -X DELETE",
+                "gh api -X DELETE",
+            ),
+            (
+                "env -S \"gh api --method DELETE repos/o/r\"",
+                "gh api -X DELETE",
+            ),
+            (
+                "find . -exec gh api --method DELETE {} \\;",
+                "gh api -X DELETE",
+            ),
+        ] {
+            let rules: Vec<String> = asked(&exec, command)
+                .into_iter()
+                .map(|row| row.rule)
+                .collect();
+            assert_eq!(rules, [rule], "`{command}`");
+        }
+        for command in [
+            "kubectl -n ns get pods",
+            "kubectl --context prod get pods",
+            "docker --context x ps",
+            "docker image ls",
+            "npm --prefix x run build",
+            "cargo +nightly build",
+            "pnpm --filter x test",
+            "yarn npm info x",
+            "gh -R o/r pr view 1",
+            "gh api repos/o/r",
+            "gh api -X GET repos/o/r",
+        ] {
+            assert!(!asks_first(&exec, command), "`{command}` must run");
+        }
     }
 
     #[test]
-    fn git_dash_c_suggestion_is_the_subcommand_not_the_value() {
+    fn a_row_lists_every_rule_it_matches() {
+        let exec = ask_first_config(&["git push", "rm", " git ", "git push"]);
+        let rules: Vec<String> = asked(&exec, "git push origin")
+            .into_iter()
+            .map(|row| row.rule)
+            .collect();
+        assert_eq!(rules, ["git push", "git"]);
+        // With every listed rule removed, the row runs: none is left to ask.
+        assert!(matches!(
+            evaluate_command_policy(&exec, "git push origin", &rules),
+            PolicyResult::Allow
+        ));
+        assert!(asks_first(&exec, "git status"), "`git` still asks");
+    }
+
+    #[test]
+    fn always_allow_stops_the_rules_asking_for_the_rest_of_this_run_only() {
+        let workspace = tempdir().unwrap();
+        let run = context_with_grants(workspace.path(), Vec::new());
+        let other_run = context_with_grants(workspace.path(), Vec::new());
+        let exec = ask_first_config(&["git push", "git"]);
+        let command = "git push origin main";
+        let asks_in = |context: &ToolExecutionContext| {
+            matches!(
+                evaluate_command_policy(&exec, command, &context.run_removed_ask_first_snapshot()),
+                PolicyResult::AskFirst(_)
+            )
+        };
+        let PolicyResult::AskFirst(rows) = evaluate_command_policy(&exec, command, &[]) else {
+            panic!("`{command}` must ask");
+        };
+        let rules = vec!["git push".to_string(), "git".to_string()];
+
+        apply_ask_first_decision(&run, &rows, &rules, AskFirstDecision::AllowOnce)
+            .expect("Allow once runs the command");
+        assert!(asks_in(&run), "Allow once keeps the rules");
+
+        apply_ask_first_decision(&run, &rows, &rules, AskFirstDecision::AlwaysAllow)
+            .expect("Always allow runs the command");
+        assert!(!asks_in(&run), "the same run asks no more");
+        assert!(asks_in(&other_run), "another run keeps its own snapshot");
+
+        let denied = apply_ask_first_decision(
+            &other_run,
+            &rows,
+            &rules,
+            AskFirstDecision::Deny {
+                reason: Some("no".to_string()),
+            },
+        );
+        assert_eq!(denied, Err(ask_first_denied_message(&rows, Some("no"))));
+        assert!(other_run.had_warnings() && !run.had_warnings());
+    }
+
+    #[test]
+    fn a_rule_removed_in_this_run_no_longer_asks() {
+        let exec = ask_first_config(&["git push", "rm"]);
+        let removed = vec!["git push".to_string()];
+        assert!(matches!(
+            evaluate_command_policy(&exec, "git push origin main", &removed),
+            PolicyResult::Allow
+        ));
+        // Only the removed rule: another rule still asks.
+        let PolicyResult::AskFirst(rows) =
+            evaluate_command_policy(&exec, "git push && rm -f x", &removed)
+        else {
+            panic!("rm must still ask");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rule, "rm");
+    }
+
+    #[test]
+    fn an_empty_ask_first_list_asks_nothing() {
+        let exec = ask_first_config(&[]);
+        assert!(!asks_first(&exec, "git push && rm -rf x"));
+    }
+
+    #[test]
+    fn denied_message_names_each_row_its_rule_and_the_reason() {
+        let rows = vec![
+            AskFirstRow {
+                text: "rm -f x".to_string(),
+                rule: "rm".to_string(),
+            },
+            AskFirstRow {
+                text: "git push".to_string(),
+                rule: "git push".to_string(),
+            },
+        ];
         assert_eq!(
-            crate::assistant::tools::prefix_detector::suggest_prefix("git -C repo status --short"),
-            "git status"
+            ask_first_denied_message(&rows, Some("  keep x  ")),
+            "User denied `rm -f x` (ask-first rule `rm`), `git push` (ask-first rule `git push`). \
+             Reason: keep x."
+        );
+        assert_eq!(
+            ask_first_denied_message(&rows[..1], Some(" ")),
+            "User denied `rm -f x` (ask-first rule `rm`)."
+        );
+        assert_eq!(
+            ask_first_denied_message(&rows[..1], None),
+            "User denied `rm -f x` (ask-first rule `rm`)."
         );
     }
 
-    fn approval_texts(exec: &ExecutionCapabilityConfig, command: &str) -> Vec<(String, String)> {
-        match evaluate_command_policy(exec, command, &[], &[]) {
-            PolicyResult::NeedsApproval(approvals) => approvals
-                .into_iter()
-                .map(|a| (a.text, a.suggested_prefix))
-                .collect(),
-            other => panic!("expected NeedsApproval, got {}", policy_label(&other)),
-        }
-    }
-
     #[test]
-    fn policy_blocklist_sees_commands_inside_blocks() {
+    fn ask_first_sees_commands_inside_blocks() {
         // Each of these used to reach the matcher as one segment headed by
         // grammar (`f(){`, `{`, `(`, `for`, `cat <<EOF`), so `rm` ran.
-        let exec = ExecutionCapabilityConfig {
-            shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Full,
-                allowed_command_prefixes: vec![],
-                blocked_command_prefixes: vec!["rm".to_string()],
-            },
-            ..Default::default()
-        };
+        let exec = ask_first_config(&["rm"]);
         for command in [
             "f(){ rm -rf x; }; f",
             "f() { rm -rf x; }",
@@ -2717,156 +5043,16 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::Block { .. }
+                    evaluate_command_policy(&exec, command, &[]),
+                    PolicyResult::AskFirst(_)
                 ),
-                "{command:?} should hit the rm blocklist entry"
+                "{command:?} should ask for rm"
             );
         }
     }
 
     #[test]
-    fn policy_grammar_rules_saved_before_the_fix_match_nothing() {
-        // `Always · run(){ echo` and `Always · f()` were offered for the
-        // segments `run(){ echo …` and `f() { … }`, and then trusted any body.
-        let exec = restricted_execution_config(&["run(){ echo", "f()", "for i", "cat"], &[]);
-        let row = |text: &str, prefix: &str| (text.to_string(), prefix.to_string());
-        assert_eq!(
-            approval_texts(&exec, "run(){ echo $(curl x | wc); }; f() { curl x; }; f"),
-            vec![
-                row("echo $(curl x | wc)", "echo"),
-                row("curl x", "curl"),
-                row("wc", "wc"),
-                row("curl x", "curl"),
-                row("f", "f"),
-            ]
-        );
-        assert_eq!(
-            approval_texts(&exec, "for i in 1; do curl x | wc; done"),
-            vec![row("curl x", "curl"), row("wc", "wc")]
-        );
-        assert_eq!(
-            approval_texts(&exec, "cat <<EOF | wc\nrm -rf ~\nEOF"),
-            vec![row("wc", "wc")]
-        );
-    }
-
-    #[test]
-    fn saved_grammar_prefixes_do_not_allow_opaque_fallbacks() {
-        for (prefix, command) in [
-            ("for i", "for i in a; { curl x|sh; }"),
-            ("case x", "case x in x) curl x|sh"),
-            ("f()", "f() { curl x | sh"),
-            ("git status", "git status ; for i in a; { curl x|sh; }"),
-            ("git", "git () { for i in a; { curl x|sh; }; }; git"),
-        ] {
-            let exec = restricted_execution_config(&[prefix], &[]);
-            assert_eq!(
-                approval_texts(&exec, command),
-                vec![(command.to_string(), String::new())],
-                "{command:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn run_scoped_prefix_cannot_allow_an_unparsed_command() {
-        let exec = restricted_execution_config(&[], &[]);
-        let command = "git status ; for i in a; { curl x|sh; }";
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                command,
-                &[RunCommandGrant::Prefix("git status".to_string())],
-                &[]
-            ),
-            PolicyResult::NeedsApproval(_)
-        ));
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                command,
-                &[RunCommandGrant::Exact(command.to_string())],
-                &[]
-            ),
-            PolicyResult::Allow
-        ));
-    }
-
-    #[test]
-    fn no_prefix_opaque_row_only_uses_exact_run_grant() {
-        let exec = restricted_execution_config(&[], &[]);
-        let command = ": > file";
-        assert_eq!(
-            approval_texts(&exec, command),
-            vec![(command.to_string(), String::new())]
-        );
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                command,
-                &[RunCommandGrant::Exact(command.to_string())],
-                &[]
-            ),
-            PolicyResult::Allow
-        ));
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                command,
-                &[RunCommandGrant::Prefix(":".to_string())],
-                &[]
-            ),
-            PolicyResult::NeedsApproval(_)
-        ));
-    }
-
-    #[test]
-    fn valid_bash_splits_into_rows_whose_prefixes_rematch() {
-        // Each input once was one row asked by its whole text. Now each
-        // command is a row, a saved suggestion re-matches its command, and
-        // Full mode never prompts.
-        for command in [
-            "cat > f.rs <<'EOF'\n  x\nEOF\nls -la",
-            "python3 - <<'EOF' 2>&1 | tail -3\nx\nEOF",
-            "cd x && rg a | grep b | head && python3 - <<'PY'\nPY",
-            "echo \"t ${groups.length}\" && ls",
-            "for ((i=0;i<n;i++)); do grep x f; done",
-        ] {
-            let exec = restricted_execution_config(&[], &[]);
-            let PolicyResult::NeedsApproval(rows) =
-                evaluate_command_policy(&exec, command, &[], &[])
-            else {
-                panic!("{command:?} must ask");
-            };
-            assert!(rows.len() > 1, "{command:?}");
-            let prefixes: Vec<&str> = rows
-                .iter()
-                .map(|row| row.suggested_prefix.as_str())
-                .filter(|prefix| !prefix.is_empty())
-                .collect();
-            let exact: Vec<RunCommandGrant> = rows
-                .iter()
-                .filter(|row| row.suggested_prefix.is_empty())
-                .map(|row| RunCommandGrant::Exact(row.text.clone()))
-                .collect();
-            let saved = restricted_execution_config(&prefixes, &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&saved, command, &exact, &[]),
-                    PolicyResult::Allow
-                ),
-                "{command:?}"
-            );
-            assert!(matches!(
-                evaluate_command_policy(&full_execution_config(&[]), command, &[], &[]),
-                PolicyResult::Allow
-            ));
-        }
-    }
-
-    #[test]
-    fn blocklist_reads_every_row_when_one_is_asked_by_exact_text() {
+    fn ask_first_reads_every_row_when_one_is_asked_by_exact_text() {
         // The value arithmetic evaluates, or the arguments a call passes to
         // `"$@"`, are written in another row.
         for command in [
@@ -2875,32 +5061,26 @@ mod tests {
             "f(){ \"$@\"; }; f rm -rf x",
             "ls\nrm -rf x <<'E'\nno end",
         ] {
-            for exec in [
-                full_execution_config(&["rm"]),
-                restricted_execution_config(&[], &["rm"]),
+            for (exec, asks) in [
+                (full_execution_config(&["rm"]), false),
+                (ask_first_config(&["rm"]), true),
             ] {
-                assert!(
-                    matches!(
-                        evaluate_command_policy(&exec, command, &[], &[]),
-                        PolicyResult::Block { .. }
-                    ),
-                    "{command:?}"
-                );
+                assert_eq!(asks_first(&exec, command), asks, "{command:?}");
             }
         }
     }
 
     #[test]
-    fn blocklist_word_scan_reads_paths_and_entries_of_several_words() {
-        for (blocked, command) in [
+    fn ask_first_word_scan_reads_paths_and_entries_of_several_words() {
+        for (rule, command) in [
             ("rm", "x='a[$(/bin/rm -rf y)]'; echo $((x))"),
             ("git push", "x='a[$(git push origin)]'; echo $((x))"),
         ] {
-            for exec in [
-                full_execution_config(&[blocked]),
-                restricted_execution_config(&[], &[blocked]),
+            for (exec, asks) in [
+                (full_execution_config(&[rule]), false),
+                (ask_first_config(&[rule]), true),
             ] {
-                assert!(is_block(&exec, command), "{blocked:?} {command:?}");
+                assert_eq!(asks_first(&exec, command), asks, "{rule:?} {command:?}");
             }
         }
     }
@@ -2916,61 +5096,21 @@ mod tests {
             "cat <(cat <<EOF\nhi\nEOF)\nrm -rf x\n: <<ls\nEOF\n)\nls",
             "echo $(cat <<EOF\nhi\nEOFX)\nrm -rf x\n: <<ls\nEOF\n)\nls",
         ] {
-            for exec in [
-                full_execution_config(&["rm"]),
-                restricted_execution_config(&[], &["rm"]),
+            for (exec, asks) in [
+                (full_execution_config(&["rm"]), false),
+                (ask_first_config(&["rm"]), true),
             ] {
-                assert!(is_block(&exec, command), "{command:?}");
+                assert_eq!(asks_first(&exec, command), asks, "{command:?}");
             }
-            let saved = restricted_execution_config(&["echo", "cat", "ls"], &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&saved, command, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "{command:?}"
-            );
         }
     }
 
     #[test]
-    fn saved_runner_prefix_does_not_cover_a_command_held_in_a_variable() {
-        let exec = restricted_execution_config(&["xargs", "exec"], &[]);
-        for command in ["xargs $t", "exec $t x"] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "{command:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn wrapper_without_a_command_offers_no_prefix() {
-        // A saved `env` would cover `env rm -rf x`.
-        let exec = restricted_execution_config(&[], &[]);
-        for command in ["env", "env --help", "timeout 60"] {
-            let PolicyResult::NeedsApproval(rows) =
-                evaluate_command_policy(&exec, command, &[], &[])
-            else {
-                panic!("{command:?} must ask");
-            };
-            assert!(
-                rows.iter().all(|row| row.suggested_prefix.is_empty()),
-                "{command:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unparsed_input_is_asked_in_restricted_but_not_in_full_mode() {
-        // bash runs the `touch PWN` in each; the splitter cannot find it,
-        // so it is in a row asked by its exact text: the whole input when no
-        // line of it splits. Restricted asks for that row even without a
-        // blocklist; Full mode never prompts. A blocked `touch` is denied in
-        // both, since the blocklist reads every word of such input.
+    fn ask_first_reads_every_word_of_unparsed_input() {
+        // bash runs the `touch PWN` in each; the splitter cannot find it, so
+        // the rules are read against every word of the input. A `touch`
+        // rule asks in Restricted, unless this run removed it; another rule
+        // does not; Full never asks.
         let commands = [
             "echo $(case a in a) echo;& b) echo;; esac); touch PWN",
             "cat <<EOF|touch PWN\nhi\nEOF",
@@ -3006,136 +5146,47 @@ mod tests {
             "((touch PWN) )",
             "echo $((echo a) ; touch PWN )",
         ];
-        for mode in [ShellAccessMode::Full, ShellAccessMode::Restricted] {
-            for (durable, run) in [("touch", ""), ("", "touch"), ("sudo", "")] {
-                let exec = ExecutionCapabilityConfig {
-                    shell: ShellCapabilityConfig {
-                        mode: mode.clone(),
-                        allowed_command_prefixes: vec!["echo".to_string(), "git".to_string()],
-                        blocked_command_prefixes: [durable]
-                            .into_iter()
-                            .filter(|p| !p.is_empty())
-                            .map(String::from)
-                            .collect(),
-                    },
-                    ..Default::default()
-                };
-                let run_blocked: Vec<String> = [run]
-                    .into_iter()
-                    .filter(|p| !p.is_empty())
-                    .map(String::from)
-                    .collect();
-                for command in commands {
-                    let result = evaluate_command_policy(&exec, command, &[], &run_blocked);
-                    let whole = matches!(
-                        crate::assistant::tools::command_splitter::split_command(command)
-                            .as_slice(),
-                        [crate::assistant::tools::command_splitter::Segment::Unparsed(_)]
-                    );
-                    let touch_blocked = durable == "touch" || run == "touch";
-                    match (mode.clone(), result) {
-                        (_, PolicyResult::Block { .. }) if touch_blocked => {}
-                        (mode, result) if touch_blocked => {
-                            panic!("{mode:?} {command:?} -> {}", policy_label(&result));
-                        }
-                        (ShellAccessMode::Restricted, PolicyResult::NeedsApproval(rows))
-                            if whole =>
-                        {
-                            let [row] = rows.as_slice() else {
-                                panic!("one row expected for {command:?}");
-                            };
-                            assert_eq!(row.text, command.trim());
-                            assert!(
-                                row.kind == SegmentKind::Opaque && row.suggested_prefix.is_empty()
-                            );
-                        }
-                        // A line that splits is a row of its own; the
-                        // `touch PWN` is still in a row the user is asked.
-                        (ShellAccessMode::Restricted, PolicyResult::NeedsApproval(rows)) => {
-                            assert!(
-                                rows.iter().any(|row| row.text.contains("touch PWN")),
-                                "{command:?}"
-                            );
-                        }
-                        (ShellAccessMode::Full, PolicyResult::Allow) => {}
-                        (mode, result) => {
-                            panic!(
-                                "{mode:?} {durable:?} {run:?} {command:?} -> {}",
-                                policy_label(&result)
-                            );
-                        }
-                    }
-                }
+        for (exec, removed, asks) in [
+            (ask_first_config(&["touch"]), &[][..], true),
+            (
+                ask_first_config(&["touch"]),
+                &["touch".to_string()][..],
+                false,
+            ),
+            (ask_first_config(&["sudo"]), &[][..], false),
+            (full_execution_config(&["touch"]), &[][..], false),
+        ] {
+            for command in commands {
+                let result = evaluate_command_policy(&exec, command, removed);
+                assert_eq!(
+                    matches!(result, PolicyResult::AskFirst(_)),
+                    asks,
+                    "{:?} {removed:?} {command:?} -> {result:?}",
+                    exec.shell.mode
+                );
             }
         }
     }
 
     #[test]
-    fn blocklist_sees_a_command_after_an_escaped_blank_and_hash() {
-        let exec = ExecutionCapabilityConfig {
-            shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Full,
-                allowed_command_prefixes: vec![],
-                blocked_command_prefixes: vec!["touch".to_string()],
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            evaluate_command_policy(&exec, "echo a\\ #; touch PWN", &[], &[]),
-            PolicyResult::Block { segment_text, .. } if segment_text == "touch PWN"
-        ));
+    fn ask_first_sees_a_command_after_an_escaped_blank_and_hash() {
+        let exec = ask_first_config(&["touch"]);
+        assert_eq!(
+            asked(&exec, "echo a\\ #; touch PWN"),
+            vec![AskFirstRow {
+                text: "touch PWN".to_string(),
+                rule: "touch".to_string(),
+            }]
+        );
         let continued = "echo a\\ \\\n#; touch PWN";
-        // The continued form is Unparsed: the blocklist reads its words.
-        assert!(is_block(&exec, continued));
-        assert!(is_block(
-            &restricted_execution_config(&[], &["touch"]),
-            continued
-        ));
-        assert_eq!(
-            approval_texts(&restricted_execution_config(&[], &[]), continued),
-            vec![(continued.to_string(), String::new())]
-        );
+        // The continued form is Unparsed: the rules are read against its words.
+        assert!(asks_first(&exec, continued));
+        assert!(!asks_first(&full_execution_config(&["touch"]), continued));
     }
 
     #[test]
-    fn unparsed_input_is_one_exact_row_in_restricted_mode() {
-        let command = "git --version ; for i in a; { touch PWN; }";
-        let mut full = ExecutionCapabilityConfig {
-            shell: ShellCapabilityConfig {
-                mode: ShellAccessMode::Full,
-                allowed_command_prefixes: vec![],
-                blocked_command_prefixes: vec![],
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            evaluate_command_policy(&full, command, &[], &[]),
-            PolicyResult::Allow
-        ));
-        // Full mode never prompts for Unparsed input, not even while
-        // blocklist entries are active (run-scoped or durable).
-        assert!(matches!(
-            evaluate_command_policy(&full, command, &[], &["sudo".to_string()]),
-            PolicyResult::Allow
-        ));
-        full.shell.blocked_command_prefixes = vec!["sudo".to_string()];
-        assert!(matches!(
-            evaluate_command_policy(&full, command, &[], &[]),
-            PolicyResult::Allow
-        ));
-        let exec = restricted_execution_config(&["git"], &[]);
-        assert_eq!(
-            approval_texts(&exec, command),
-            vec![(command.to_string(), String::new())]
-        );
-    }
-
-    #[test]
-    fn full_mode_with_default_blocklist_never_prompts() {
-        // Owner rule: Full mode never raises a command-approval prompt.
-        // The rows here span the kinds (a redirect pipeline, a named
-        // code-argument command, an unclosed quote) and none of them
-        // prompts; commands the blocklist does match are denied outright.
+    fn full_mode_with_the_default_list_never_asks() {
+        // Owner rule: Full mode never raises a card and refuses nothing.
         let exec = ExecutionCapabilityConfig {
             shell: ShellCapabilityConfig {
                 mode: ShellAccessMode::Full,
@@ -3143,40 +5194,29 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(!exec.shell.blocked_command_prefixes.is_empty());
+        assert!(!exec.shell.ask_first_command_prefixes.is_empty());
         for command in [
             "cd /x && SCRATCH=a bash tools/check-links.sh 2>&1 | tail -30",
             "bash -c 'echo hi'",
             "echo \"unclosed",
+            "rm -rf x",
+            "timeout 5 rm x",
+            "git push --force",
         ] {
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
+                    evaluate_command_policy(&exec, command, &[]),
                     PolicyResult::Allow
                 ),
-                "{command} must run without a prompt in Full mode"
+                "{command} must run without a card in Full mode"
             );
         }
-        for command in ["rm -rf x", "timeout 5 rm x"] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::Block { .. }
-                ),
-                "{command} must be denied outright in Full mode"
-            );
-        }
-        // A run-scoped DenyAlways denies the same way, without a prompt.
-        assert!(matches!(
-            evaluate_command_policy(&exec, "rm -rf x", &[], &["rm".to_string()]),
-            PolicyResult::Block { .. }
-        ));
     }
 
     #[test]
     fn full_mode_heredoc_commands_run_without_a_prompt() {
         // Hotfix regression cases: heredoc-fed scripts must run in Full
-        // mode without an approval prompt while the default blocklist is
+        // mode without an approval prompt while the default ask-first list is
         // active. The quoted-delimiter form is Opaque, the unquoted one
         // also yields the command inside its `$(...)`, and the
         // write-then-run form is Unparsed — none of them may prompt.
@@ -3195,7 +5235,7 @@ mod tests {
         for command in commands {
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
+                    evaluate_command_policy(&exec, command, &[]),
                     PolicyResult::Allow
                 ),
                 "{command} must run without a prompt in Full mode"
@@ -3225,7 +5265,7 @@ mod tests {
         );
         // An unquoted delimiter expands its body, so the splitter reports
         // the command inside the `$(...)` as a segment of its own — the
-        // blocklist still applies to it.
+        // ask-first list still applies to it.
         assert_eq!(
             kinds("python3 - <<EOF\nprint(\"x $(touch PWN)\")\nEOF"),
             ["Opaque", "Simple"]
@@ -3234,417 +5274,6 @@ mod tests {
             kinds("cat > f.py <<'EOF'\nprint(1)\nEOF && python3 f.py"),
             ["Unparsed"]
         );
-    }
-
-    #[test]
-    fn restricted_mode_names_commands_whose_argument_is_code() {
-        // Commands whose argument is code are named by their written words, so
-        // every approval row carries a prefix the user can save. The
-        // heredoc forms keep one row for the script and name the command
-        // an unquoted body substitutes.
-        let exec = restricted_execution_config(&[], &[]);
-        assert_eq!(
-            approval_texts(
-                &exec,
-                "cd /x && SCRATCH=a bash tools/check-links.sh 2>&1 | tail -30"
-            ),
-            vec![
-                ("cd /x".to_string(), "cd".to_string()),
-                (
-                    "SCRATCH=a bash tools/check-links.sh 2>&1".to_string(),
-                    "bash tools/check-links.sh".to_string()
-                ),
-                ("tail -30".to_string(), "tail".to_string()),
-            ]
-        );
-        assert_eq!(
-            approval_texts(&exec, "bash -c 'echo hi'"),
-            vec![("bash -c 'echo hi'".to_string(), "bash".to_string())]
-        );
-        assert_eq!(
-            approval_texts(&exec, "find . | xargs grep foo"),
-            vec![
-                ("find .".to_string(), "find".to_string()),
-                ("xargs grep foo".to_string(), "xargs grep".to_string()),
-            ]
-        );
-        assert_eq!(
-            approval_texts(&exec, "python3 -m pytest -q"),
-            vec![(
-                "python3 -m pytest -q".to_string(),
-                "python3 -m pytest".to_string()
-            )]
-        );
-        assert_eq!(
-            approval_texts(&exec, "python3 - <<'EOF'\nprint(1)\nEOF"),
-            vec![(
-                "python3 - <<'EOF'\nprint(1)\nEOF".to_string(),
-                "python3".to_string()
-            )]
-        );
-        assert_eq!(
-            approval_texts(&exec, "python3 - <<EOF\nprint(\"x $(touch PWN)\")\nEOF"),
-            vec![
-                (
-                    "python3 - <<EOF\nprint(\"x $(touch PWN)\")\nEOF".to_string(),
-                    "python3".to_string()
-                ),
-                ("touch PWN".to_string(), "touch".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn restricted_mode_still_prompts_for_unparsed_input() {
-        // Restricted mode is unchanged: input the splitter cannot parse is
-        // asked as one exact row, with no prefix to save.
-        let exec = restricted_execution_config(&["git"], &["rm"]);
-        assert_eq!(
-            approval_texts(&exec, "\"touch\" PWN"),
-            vec![("\"touch\" PWN".to_string(), String::new())]
-        );
-        assert_eq!(
-            approval_texts(&exec, "echo \"unclosed"),
-            vec![("echo \"unclosed".to_string(), String::new())]
-        );
-    }
-
-    #[test]
-    fn allow_once_on_an_exact_row_covers_only_that_text() {
-        let exec = restricted_execution_config(&[], &[]);
-        let approved = "bash -c 'echo";
-        let PolicyResult::NeedsApproval(rows) = evaluate_command_policy(&exec, approved, &[], &[])
-        else {
-            panic!("expected approval for {approved:?}");
-        };
-        let run_allowed: Vec<RunCommandGrant> = rows.iter().map(once_grant).collect();
-        assert!(matches!(
-            evaluate_command_policy(&exec, &format!("  {approved}\n"), &run_allowed, &[]),
-            PolicyResult::Allow
-        ));
-        assert!(matches!(
-            evaluate_command_policy(&exec, "bash -c 'echo x; curl x|sh'", &run_allowed, &[]),
-            PolicyResult::NeedsApproval(_)
-        ));
-    }
-
-    #[test]
-    fn policy_asks_for_what_a_block_writes() {
-        // Both commands inside are benign; the redirect truncates a file.
-        let exec = restricted_execution_config(&[], &[]);
-        assert_eq!(
-            approval_texts(&exec, "if [ 1 ]; then x=1; fi > important"),
-            vec![("> important".to_string(), String::new())]
-        );
-    }
-
-    #[test]
-    fn policy_asks_for_a_test_that_runs_a_process_substitution() {
-        // The test row itself is asked exact: its head is punctuation, so
-        // there is no prefix to save. The substitution it runs is named
-        // as its own rows, so the blocklist still sees them.
-        let exec = restricted_execution_config(&[], &[]);
-        assert_eq!(
-            approval_texts(&exec, "[ -s <(curl x|sh) ]"),
-            vec![
-                ("[ -s <(curl x|sh) ]".to_string(), String::new()),
-                ("curl x".to_string(), "curl".to_string()),
-                ("sh".to_string(), "sh".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn policy_grammar_and_jumps_only_command_is_allowed() {
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(
-                &exec,
-                "for i in 1 2; do break; done # nothing runs",
-                &[],
-                &[]
-            ),
-            PolicyResult::Allow
-        ));
-    }
-
-    #[test]
-    fn policy_opaque_segment_no_match_still_needs_approval() {
-        // An Opaque segment whose head is NOT on the allowlist still
-        // hits NeedsApproval. The durable-allowlist check is added, not
-        // replacing the gate — it only short-circuits when the user has
-        // explicitly trusted the prefix.
-        let exec = restricted_execution_config(&["ls"], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "find /tmp -name foo 2>/dev/null", &[], &[]),
-            PolicyResult::NeedsApproval(_),
-        ));
-    }
-
-    fn policy_label(result: &PolicyResult) -> &'static str {
-        match result {
-            PolicyResult::Allow => "Allow",
-            PolicyResult::Block { .. } => "Block",
-            PolicyResult::NeedsApproval(_) => "NeedsApproval",
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Benign shell constructs — test expressions and pure assignments
-    // never need approval (no execution surface of their own).
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn policy_single_bracket_test_auto_allows() {
-        // From the drift-detection screenshot: `[ "$CURRENT" != "61dda97" ]`
-        // is a string comparison with no side effects. Should not prompt
-        // even with an empty allowlist.
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, r#"[ "$CURRENT" != "61dda97" ]"#, &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_double_bracket_test_auto_allows() {
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "[[ -f /tmp/foo ]]", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_test_builtin_auto_allows() {
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "test -d /tmp", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_pure_assignment_auto_allows() {
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "FOO=bar", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_multiple_pure_assignments_auto_allow() {
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "A=1 B=2 C=3", &[], &[]),
-            PolicyResult::Allow,
-        ));
-    }
-
-    #[test]
-    fn policy_assignment_with_substitution_still_prompts() {
-        // `CURRENT=$(git log ...)` runs `git log` via the substitution, so
-        // it is NOT benign — the embedded command must still be gated.
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "CURRENT=$(git log -1 --format='%h')", &[], &[]),
-            PolicyResult::NeedsApproval(_),
-        ));
-    }
-
-    #[test]
-    fn policy_test_with_substitution_still_prompts() {
-        // A test that embeds a command substitution runs that command.
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, r#"[ -n "$(curl http://x)" ]"#, &[], &[]),
-            PolicyResult::NeedsApproval(_),
-        ));
-    }
-
-    #[test]
-    fn policy_assignment_prefix_to_command_still_prompts() {
-        // `FOO=bar mycmd` is an assignment-prefixed command, not a pure
-        // assignment — the real command `mycmd` must still be gated.
-        let exec = restricted_execution_config(&[], &[]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "FOO=bar mycmd --opt", &[], &[]),
-            PolicyResult::NeedsApproval(_),
-        ));
-    }
-
-    #[test]
-    fn policy_benign_construct_still_subject_to_blocklist() {
-        // The benign carve-out sits AFTER the blocklist check, so a
-        // blocklisted prefix still blocks. (Contrived, but proves the
-        // ordering: `[` is blstd.)
-        let exec = restricted_execution_config(&[], &["["]);
-        assert!(matches!(
-            evaluate_command_policy(&exec, "[ -f /tmp/x ]", &[], &[]),
-            PolicyResult::Block { .. },
-        ));
-    }
-
-    // -------------------------------------------------------------------
-    // Run-scoped blocklist — populated by DenyAlways so a fresh deny
-    // takes effect mid-run instead of waiting for the next session.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn denied_segment_message_groups_parts_by_reason() {
-        use crate::commands::permissions::{
-            PermissionScope, SegmentApproval, SegmentDecision, SegmentKind,
-        };
-        fn segment(text: &str) -> SegmentApproval {
-            SegmentApproval {
-                text: text.into(),
-                kind: SegmentKind::Simple,
-                suggested_prefix: text.into(),
-            }
-        }
-        fn deny_once(reason: Option<&str>) -> SegmentDecision {
-            SegmentDecision::DenyOnce {
-                reason: reason.map(str::to_string),
-            }
-        }
-
-        let segments = vec![
-            segment("git status"),
-            segment("./deploy --now"),
-            segment("curl x"),
-        ];
-
-        // One reason shared by three parts is stated once, with the parts it
-        // covers.
-        let message = denied_segments_message(
-            &segments,
-            &[
-                deny_once(Some("no network")),
-                deny_once(Some("no network")),
-                deny_once(Some("no network")),
-            ],
-        );
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `git status`, `./deploy --now`, `curl x`. \
-             Reason: no network."
-        );
-        assert_eq!(message.matches("no network").count(), 1);
-        assert_eq!(message.matches("Denied parts:").count(), 1);
-
-        // Two reasons: each is stated once, with its own parts.
-        let message = denied_segments_message(
-            &segments,
-            &[
-                deny_once(Some("no network")),
-                deny_once(Some("file locked")),
-                deny_once(Some("file locked")),
-            ],
-        );
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `git status`, `./deploy --now`, `curl x`. \
-             Reason: no network for `git status`. \
-             Reason: file locked for `./deploy --now`, `curl x`."
-        );
-        assert_eq!(message.matches("no network").count(), 1);
-        assert_eq!(message.matches("file locked").count(), 1);
-        assert_eq!(message.matches("Denied parts:").count(), 1);
-
-        // No reason: the denied parts are still listed, with no reason clause.
-        let message = denied_segments_message(
-            &segments,
-            &[deny_once(None), deny_once(None), deny_once(None)],
-        );
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `git status`, `./deploy --now`, `curl x`."
-        );
-        assert!(!message.contains("Reason:"));
-
-        // A reason on one part and none on another: one list of denied parts,
-        // and the reason names the part it belongs to.
-        let message = denied_segments_message(
-            &segments[..2],
-            &[deny_once(Some("no network")), deny_once(None)],
-        );
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `git status`, `./deploy --now`. \
-             Reason: no network for `git status`."
-        );
-        assert_eq!(message.matches("Denied parts:").count(), 1);
-        assert_eq!(message.matches("no network").count(), 1);
-
-        // An always-denial carries its reason the same way.
-        let always = SegmentDecision::DenyAlways {
-            scope: PermissionScope::Agent,
-            prefix: "curl".into(),
-            reason: Some("no network".into()),
-        };
-        let message = denied_segments_message(&segments[..1], &[always]);
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `git status`. Reason: no network."
-        );
-
-        // An allowed part was not denied, so it stays out of the error.
-        let message = denied_segments_message(
-            &segments,
-            &[
-                SegmentDecision::AllowOnce,
-                deny_once(Some("no network")),
-                SegmentDecision::AllowOnce,
-            ],
-        );
-        assert_eq!(
-            message,
-            "User denied one or more command segments. \
-             Denied parts: `./deploy --now`. Reason: no network."
-        );
-    }
-
-    #[test]
-    fn policy_run_scoped_blocklist_blocks_simple_segment() {
-        // No durable blocklist, but a run-scoped DenyAlways for `rm -rf`.
-        // A fresh `rm -rf /tmp/foo` should hit Block without prompting.
-        let exec = restricted_execution_config(&["rm"], &[]);
-        let run_blocked = vec!["rm -rf".to_string()];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "rm -rf /tmp/foo", &[], &run_blocked),
-            PolicyResult::Block { .. },
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_blocklist_takes_priority_over_run_scoped_allowlist() {
-        // Blocklist wins over allowlist — matches the durable-list
-        // precedence rule.
-        let exec = restricted_execution_config(&[], &[]);
-        let run_allowed = vec![RunCommandGrant::Prefix("rm".to_string())];
-        let run_blocked = vec!["rm -rf".to_string()];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "rm -rf /tmp/foo", &run_allowed, &run_blocked),
-            PolicyResult::Block { .. },
-        ));
-    }
-
-    #[test]
-    fn policy_run_scoped_blocklist_does_not_cover_unrelated_command() {
-        // `rm file.txt` doesn't match the `rm -rf` prefix, so the
-        // durable allowlist for `rm` still lets it through.
-        let exec = restricted_execution_config(&["rm"], &[]);
-        let run_blocked = vec!["rm -rf".to_string()];
-        assert!(matches!(
-            evaluate_command_policy(&exec, "rm file.txt", &[], &run_blocked),
-            PolicyResult::Allow,
-        ));
     }
 
     #[test]
@@ -3685,18 +5314,11 @@ mod tests {
     // Commands that run their arguments, heredoc bodies, lookups
     // ------------------------------------------------------------------
 
-    fn is_block(exec: &ExecutionCapabilityConfig, command: &str) -> bool {
-        matches!(
-            evaluate_command_policy(exec, command, &[], &[]),
-            PolicyResult::Block { .. }
-        )
-    }
-
     #[test]
-    fn blocklist_sees_the_command_an_argument_runner_runs() {
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
+    fn ask_first_sees_the_command_an_argument_runner_runs() {
+        for (exec, asks) in [
+            (full_execution_config(&["rm"]), false),
+            (ask_first_config(&["rm"]), true),
         ] {
             for command in [
                 "find . | xargs rm -f",
@@ -3712,42 +5334,34 @@ mod tests {
                 "xargs rm",
                 "timeout 5 rm x",
             ] {
-                assert!(is_block(&exec, command), "{command} must be blocked");
+                assert_eq!(asks_first(&exec, command), asks, "{command} must ask first");
             }
         }
     }
 
     #[test]
-    fn argument_runners_without_a_blocked_command_stay_named() {
+    fn argument_runners_without_a_listed_command_run() {
         let exec = full_execution_config(&["rm"]);
         for command in ["exec >log 2>&1", "xargs grep foo", "watch -n 2 ls"] {
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
+                    evaluate_command_policy(&exec, command, &[]),
                     PolicyResult::Allow
                 ),
                 "{command}"
             );
         }
-        let exec = restricted_execution_config(&[], &["rm"]);
-        for (command, prefix) in [
-            ("exec >log 2>&1", ""),
-            ("xargs grep foo", "xargs grep"),
-            ("watch -n 2 ls", "watch"),
-        ] {
-            assert_eq!(
-                approval_texts(&exec, command),
-                vec![(command.to_string(), prefix.to_string())],
-                "{command}"
-            );
+        let exec = ask_first_config(&["rm"]);
+        for command in ["exec >log 2>&1", "xargs grep foo", "watch -n 2 ls"] {
+            assert!(!asks_first(&exec, command), "{command}");
         }
     }
 
     #[test]
-    fn blocklist_sees_commands_an_unquoted_heredoc_body_runs() {
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
+    fn ask_first_sees_commands_an_unquoted_heredoc_body_runs() {
+        for (exec, asks) in [
+            (full_execution_config(&["rm"]), false),
+            (ask_first_config(&["rm"]), true),
         ] {
             for command in [
                 "cat <<EOF\n${x:-$(rm -rf ~)}\nEOF",
@@ -3756,180 +5370,34 @@ mod tests {
                 "cat <<EOF\n$(echo `rm a`)\nEOF",
                 "cat <<EOF\n`echo \\`rm a\\``\nEOF",
             ] {
-                assert!(is_block(&exec, command), "{command:?} must be blocked");
+                assert_eq!(
+                    asks_first(&exec, command),
+                    asks,
+                    "{command:?} must ask first"
+                );
             }
         }
     }
 
     #[test]
-    fn quoted_heredoc_body_runs_nothing_the_blocklist_sees() {
+    fn quoted_heredoc_body_runs_nothing_ask_first_sees() {
         let command = "cat <<'EOF'\n`rm x` $(rm y)\nEOF";
-        assert!(!is_block(&full_execution_config(&["rm"]), command));
-        let exec = restricted_execution_config(&[], &["rm"]);
-        assert_eq!(
-            approval_texts(&exec, command),
-            vec![(command.to_string(), "cat".to_string())]
-        );
+        assert!(!asks_first(&full_execution_config(&["rm"]), command));
+        assert!(!asks_first(&ask_first_config(&["rm"]), command));
     }
 
     #[test]
     fn command_lookup_is_not_the_command_it_names() {
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
+        for (exec, asks) in [
+            (full_execution_config(&["rm"]), false),
+            (ask_first_config(&["rm"]), true),
         ] {
             for command in ["command -v rm", "command -V rm", "command -pv rm"] {
-                assert!(!is_block(&exec, command), "{command} only looks rm up");
+                assert!(!asks_first(&exec, command), "{command} only looks rm up");
             }
             for command in ["command rm x", "command -p rm x"] {
-                assert!(is_block(&exec, command), "{command} runs rm");
+                assert_eq!(asks_first(&exec, command), asks, "{command} runs rm");
             }
-        }
-    }
-
-    #[test]
-    fn every_suggested_prefix_covers_the_row_it_came_from() {
-        // Saving the suggested prefix must allow the command it was
-        // suggested for, or the user is asked again for the same row.
-        for command in [
-            "bash -lc 'echo hi'",
-            "bash -ec 'echo hi'",
-            "perl -ne 'print'",
-            "python3 -W ignore x.py",
-            "python3 -X dev x.py",
-            "bash -o pipefail s.sh",
-            "python3 -W ignore -m pytest -q",
-            "python3 -m pytest -q",
-            "bash tools/check-links.sh",
-            ". ./setup.sh",
-            "source ./setup.sh",
-            "command -v rm",
-            "xargs grep foo",
-            "xargs -n 1 grep foo",
-            "xargs -I {} grep foo {}",
-            "xargs git -C x push",
-            "watch -n 2 ls",
-            "exec cargo test",
-            "FOO=1 command -v rm",
-            "timeout 5 command -v rm",
-            "env -i command -v rm",
-            "command -p -v rm",
-            "xargs -0 command -v",
-            "xargs -0I grep echo RAN",
-            "xargs -rI grep echo RAN",
-            "xargs -0n 1 grep foo",
-            "exec -la grep echo RAN",
-            "env -iu FOO cargo build",
-            "cat <<EOF > notes.md\nuse `ls` here\nEOF",
-            "xargs --max-lines grep foo",
-            "xargs --max-lines=2 -E x grep foo",
-            "xargs -I {} git push {}",
-            "xargs -i git push {}",
-            "xargs --replace=% git push origin %",
-            "xargs -I % sh -c 'echo %'",
-            "taskset 1 grep x",
-            "taskset -c 0,1 grep x",
-            "chrt -f 10 grep x",
-            "chrt -o grep x",
-            "chrt 10 -- grep x",
-        ] {
-            let rows = approval_texts(&restricted_execution_config(&[], &[]), command);
-            let prefixes: Vec<&str> = rows.iter().map(|(_, p)| p.as_str()).collect();
-            assert!(
-                prefixes.iter().all(|p| !p.is_empty()),
-                "{command:?}: {rows:?}"
-            );
-            let exec = restricted_execution_config(&prefixes, &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::Allow
-                ),
-                "{command:?} is asked again after saving {prefixes:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn argument_runner_rows_suggest_the_runner_and_the_command_it_runs() {
-        // `xargs` and `exec` name the command they run, without their own
-        // options; `eval` and `watch` run code, so only the runner is named.
-        for (command, expected) in [
-            ("xargs -n 1 grep foo", "xargs grep"),
-            ("xargs -I {} grep foo {}", "xargs grep"),
-            ("xargs grep foo", "xargs grep"),
-            ("xargs git push", "xargs git push"),
-            ("xargs git -C x push", "xargs git push"),
-            ("xargs -0I grep echo RAN", "xargs echo"),
-            ("xargs -0n 1 grep foo", "xargs grep"),
-            ("exec -la grep echo RAN", "exec echo"),
-            ("exec cargo test", "exec cargo test"),
-            ("watch -n 2 ls", "watch"),
-            ("eval ls", "eval"),
-        ] {
-            assert_eq!(
-                approval_texts(&restricted_execution_config(&[], &[]), command),
-                vec![(command.to_string(), expected.to_string())],
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn saved_argument_runner_prefix_covers_only_the_command_it_names() {
-        let exec = restricted_execution_config(&["xargs grep"], &[]);
-        for command in ["xargs -n 1 grep foo", "xargs -I {} grep foo {}"] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::Allow
-                ),
-                "{command} runs grep"
-            );
-        }
-        for command in ["xargs sh -c 'x'", "xargs cat", "xargs -n 1 cat"] {
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "{command} does not run grep"
-            );
-        }
-    }
-    #[test]
-    fn runner_without_a_command_offers_only_its_exact_text() {
-        // A saved `xargs` or `exec` would allow every command after it.
-        let exec = restricted_execution_config(&[], &[]);
-        for command in [
-            "xargs",
-            "exec >log 2>&1",
-            "exec 3>&1",
-            "xargs -0",
-            "exec -a name",
-        ] {
-            let PolicyResult::NeedsApproval(rows) =
-                evaluate_command_policy(&exec, command, &[], &[])
-            else {
-                panic!("expected approval for {command:?}");
-            };
-            assert_eq!(rows.len(), 1, "{command:?}");
-            assert_eq!(rows[0].suggested_prefix, "", "{command:?}");
-            let once: Vec<RunCommandGrant> = rows.iter().map(once_grant).collect();
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &once, &[]),
-                    PolicyResult::Allow
-                ),
-                "{command:?}"
-            );
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, &format!("{command} rm -rf x"), &once, &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "allowing {command:?} once must not allow running rm through it"
-            );
         }
     }
 
@@ -3938,33 +5406,9 @@ mod tests {
         // `xargs -0I grep echo RAN` runs `echo` with `grep` as the replace
         // string, `exec -la grep echo RAN` runs `echo` named `grep`, and
         // `xargs --process grep` abbreviates `--process-slot-var grep`.
-        for (grant, command) in [
-            ("xargs grep", "xargs -0I grep sh -c evil"),
-            ("xargs grep", "xargs -rI grep sh -c evil"),
-            ("xargs grep", "xargs --process grep sh -c evil"),
-            ("xargs grep", "xargs -J % sh -c evil"),
-            ("exec grep", "exec -la grep sh -c evil"),
-            ("FOO", "env -iu FOO sh -c evil"),
-        ] {
-            let exec = restricted_execution_config(&[grant], &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "a saved {grant:?} must not allow {command:?}"
-            );
-        }
-        // An option the table does not list as written may take the next
-        // word, so no prefix names the command after it.
-        let exec = restricted_execution_config(&[], &[]);
-        assert_eq!(
-            approval_texts(&exec, "xargs --process grep echo RAN"),
-            vec![("xargs --process grep echo RAN".to_string(), String::new())]
-        );
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
+        for (exec, asks) in [
+            (full_execution_config(&["rm"]), false),
+            (ask_first_config(&["rm"]), true),
         ] {
             for command in [
                 "xargs -0n 1 rm -rf x",
@@ -3979,98 +5423,16 @@ mod tests {
                 "timeout -sKILL 5 rm -rf x",
                 "timeout --pres 5 rm -rf x",
             ] {
-                assert!(is_block(&exec, command), "{command} must be blocked");
+                assert_eq!(asks_first(&exec, command), asks, "{command} must ask first");
             }
         }
     }
 
     #[test]
-    fn saved_grant_never_covers_a_command_an_option_hides() {
-        // GNU `xargs --max-lines[=N]` takes a value only after `=`, xargs
-        // writes its input over a replace string wherever it occurs in the
-        // command, and `env -S` splits its value into the command's start.
-        for (grant, command) in [
-            ("xargs grep", "xargs --max-lines -I grep sh -c evil"),
-            ("xargs grep", "xargs --max-lines -E grep sh -c evil"),
-            ("xargs git push", "xargs -I push git push --hard"),
-            ("xargs git push", "xargs -Ipush git push --hard"),
-            ("xargs git push", "xargs -ipush git push --hard"),
-            ("xargs git push", "xargs --replace=push git push --hard"),
-            ("xargs git push", "xargs -I 'push' git push --hard"),
-            ("xargs git push", "xargs -I u git pu''sh --hard"),
-            ("xargs git push", "xargs -i git -C {} push --hard"),
-            ("grep", "env -S'sh -c evil' grep x"),
-            ("grep", "env -Ssh grep x"),
-            ("grep", "env -S 'sh -c evil' grep x"),
-            ("grep", "env -iS'sh -c evil' grep x"),
-            ("grep", "env --split-string='sh -c evil' grep x"),
-            ("grep", "env --sp='sh -c evil' grep x"),
-            ("grep", "taskset 1 sh -c evil"),
-        ] {
-            let exec = restricted_execution_config(&[grant], &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::NeedsApproval(_)
-                ),
-                "a saved {grant:?} must not allow {command:?}"
-            );
-        }
-        for (grant, command) in [
-            ("xargs git push", "xargs -I {} git push {}"),
-            ("xargs git push", "xargs --replace git push origin {}"),
-            ("xargs grep", "xargs --max-lines grep foo"),
-            ("grep", "taskset 1 grep x"),
-            ("grep", "taskset 0x3 grep x"),
-            ("grep", "chrt -f 10 grep x"),
-            ("grep", "chrt 10 -- grep x"),
-        ] {
-            let exec = restricted_execution_config(&[grant], &[]);
-            assert!(
-                matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
-                    PolicyResult::Allow
-                ),
-                "a saved {grant:?} allows {command:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn options_that_hide_the_command_suggest_no_prefix() {
-        let exec = restricted_execution_config(&[], &[]);
-        for (command, prefix) in [
-            ("xargs -I push git push --hard", ""),
-            ("xargs -I {} git {} --hard", ""),
-            ("xargs -I 'grep' grep x", ""),
-            ("xargs -I '' grep x", ""),
-            ("xargs -I {} grep x {}", "xargs grep"),
-            ("env -S'grep x' y", ""),
-            ("env --split-string=grep y", ""),
-            ("env -iSgrep y", ""),
-            ("xargs --frob grep x", ""),
-            ("xargs --frob=1 grep x", ""),
-            ("xargs --max-l grep x", ""),
-            ("xargs -Z grep x", ""),
-            ("env --sp=x grep", ""),
-            ("xargs --max-lines grep foo", "xargs grep"),
-            ("taskset 1 grep x", "grep"),
-            ("chrt -f 10 grep x", "grep"),
-            ("chrt -o grep x", "grep"),
-        ] {
-            assert_eq!(
-                approval_texts(&exec, command),
-                vec![(command.to_string(), prefix.to_string())],
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn blocklist_sees_a_command_under_every_reading_of_runner_options() {
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
+    fn ask_first_sees_a_command_under_every_reading_of_runner_options() {
+        for (exec, asks) in [
+            (full_execution_config(&["rm"]), false),
+            (ask_first_config(&["rm"]), true),
         ] {
             for command in [
                 "xargs --max-lines rm -rf x",
@@ -4100,11 +5462,11 @@ mod tests {
                 "chrt -o rm x",
                 "chrt 10 -- rm x",
             ] {
-                assert!(is_block(&exec, command), "{command} must be blocked");
+                assert_eq!(asks_first(&exec, command), asks, "{command} must ask first");
             }
         }
         // Only a word an option may take is read as the command.
-        let exec = full_execution_config(&["rm"]);
+        let exec = ask_first_config(&["rm"]);
         for command in [
             "xargs -0 git rm x",
             "xargs -n 1 git rm",
@@ -4116,7 +5478,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    evaluate_command_policy(&exec, command, &[], &[]),
+                    evaluate_command_policy(&exec, command, &[]),
                     PolicyResult::Allow
                 ),
                 "{command} runs no rm"
@@ -4125,13 +5487,13 @@ mod tests {
     }
 
     #[test]
-    fn blocklist_sees_a_blocked_subcommand_under_every_reading() {
-        for exec in [
-            full_execution_config(&["git push"]),
-            restricted_execution_config(&[], &["git push"]),
+    fn ask_first_sees_a_listed_subcommand_under_every_reading() {
+        for (exec, asks) in [
+            (full_execution_config(&["git push"]), false),
+            (ask_first_config(&["git push"]), true),
         ] {
             for command in ["xargs -0I git push origin", "env -S'\\_git push'"] {
-                assert!(is_block(&exec, command), "{command} must be blocked");
+                assert_eq!(asks_first(&exec, command), asks, "{command} must ask first");
             }
         }
     }
@@ -4140,28 +5502,26 @@ mod tests {
     fn many_replace_strings_take_linear_time() {
         let command = format!("xargs {}git {}", "-I zq ".repeat(5_000), "w ".repeat(5_000));
         let started = std::time::Instant::now();
-        for exec in [
-            full_execution_config(&["rm"]),
-            restricted_execution_config(&[], &["rm"]),
-        ] {
-            evaluate_command_policy(&exec, &command, &[], &[]);
+        for exec in [full_execution_config(&["rm"]), ask_first_config(&["rm"])] {
+            evaluate_command_policy(&exec, &command, &[]);
         }
         assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]
     fn deeply_nested_runners_do_not_overflow_the_stack() {
-        use crate::assistant::tools::prefix_detector::{canonicalize_for_allow, suggest_prefix};
         let handle = std::thread::Builder::new()
             .stack_size(2 << 20)
             .spawn(|| {
                 for runner in ["exec ", "nohup "] {
                     let command = format!("{}grep x", runner.repeat(20_000));
-                    assert!(!suggest_prefix(&command).is_empty(), "{runner}");
-                    assert!(canonicalize_for_allow(&command).is_some(), "{runner}");
+                    assert!(
+                        !asks_first(&ask_first_config(&["rm"]), &command),
+                        "{runner}"
+                    );
                 }
                 let command = format!("{}rm x", "exec ".repeat(20_000));
-                assert!(is_block(&full_execution_config(&["rm"]), &command));
+                assert!(asks_first(&ask_first_config(&["rm"]), &command));
             })
             .expect("spawn");
         handle.join().expect("nested runners must not overflow");

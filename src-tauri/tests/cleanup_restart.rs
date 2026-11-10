@@ -81,16 +81,9 @@ fn cleanup_process_kill_after_exit_repeats_bound_cleanup_on_restart() {
         0,
         "main".into(),
     );
-    workspace.main_agent.as_mut().unwrap().execution.shell.mode =
-        serde_json::from_str("\"full\"").unwrap();
-    workspace
-        .main_agent
-        .as_mut()
-        .unwrap()
-        .execution
-        .shell
-        .blocked_command_prefixes
-        .clear();
+    let execution = &mut workspace.main_agent.as_mut().unwrap().execution;
+    execution.shell.mode = serde_json::from_str("\"full\"").unwrap();
+    execution.sandbox.network_access.mode = serde_json::from_str("\"off\"").unwrap();
     workspace.schedule.enabled = false;
     workspace_config::save(root, &workspace).unwrap();
     let state = state(root);

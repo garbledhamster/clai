@@ -95,7 +95,7 @@ const askEvent = (pendingId: string, at: number) =>
   env({ type: 'ask_user_requested', payload: { pending_id: pendingId, question: 'Ship it?', options: null, multi_select: false } } as AssistantUiEvent, at);
 
 const approval = (requestId: string) =>
-  ({ requestId, workspaceId: WS, agentId: null, agentName: 'Main', command: 'ls', segments: [] }) as never;
+  ({ requestId, workspaceId: WS, agentId: null, agentName: null, command: 'ls', rows: [] }) as never;
 
 const apply = (state: FleetState, ...envelopes: AssistantEventEnvelope[]) =>
   envelopes.reduce(applyAssistantEvent, state);
@@ -269,7 +269,7 @@ describe('fleet reducer', () => {
     expect(cardPhase(asking, { runs: { [WS]: ['r'] }, tasks: {} })).toBe('waiting');
   });
 
-  it('says a request through whoever asked: a subtask\'s agent, a roster agent by name, or Main', () => {
+  it('says a request through whoever asked: a subtask\'s agent, a roster agent by id, or Main', () => {
     expect(requestScene(emptyCard(WS), NO_LIVE)).toBeNull();
     const live = withTasks(task('sub', 'running', NOW, { sessionId: 'sub-session', assignedAgentDisplayName: 'Writer', assignedAgentDefinitionId: 'def-w' }));
     let s = apply(EMPTY_FLEET, askEvent('q1', NOW - 120_000));
@@ -277,11 +277,17 @@ describe('fleet reducer', () => {
     s = apply(s, env({ type: 'ask_user_requested', payload: { pending_id: 'q2', question: 'Which?', options: null, multi_select: false } } as AssistantUiEvent, NOW - 200_000, 'sub-session'));
     expect(requestScene(card(s), live)).toMatchObject({ count: 2, asker: { name: 'Writer', seed: 'def-w' }, request: { text: 'Which?' } });
     const roster = seedFleet(EMPTY_FLEET, [{ ...snapshotOf(), agents: [MANAGER, WRITER] }]);
-    const by = (agentName: string) =>
-      requestScene(card(applyRequest(roster, { kind: 'approval', request: { ...(approval('a1') as object), agentName } as never }, 5)), NO_LIVE)?.asker;
+    const by = (agentId: string | null, live = NO_LIVE) =>
+      requestScene(card(applyRequest(roster, { kind: 'approval', request: { ...(approval('a1') as object), agentId } as never }, 5)), live)?.asker;
     // The same face as the crew strip draws for it.
-    expect(by('Writer')).toEqual({ name: 'Writer', seed: 'def-w' });
-    expect(by('Manager')).toBeNull();
+    expect(by('wa-w')).toEqual({ id: 'wa-w', name: 'Writer', seed: 'def-w' });
+    expect(by('wa-main')).toBeNull();
+    expect(by(null)).toBeNull();
+    // An agent that left the roster mid-task is still found on its task.
+    const gone = withTasks(task('g', 'running', NOW, { assignedToWorkspaceAgentId: 'wa-gone', assignedAgentDefinitionId: 'def-gone', assignedAgentDisplayName: 'Gone' }));
+    expect(by('wa-gone', gone)).toEqual({ id: 'wa-gone', name: 'Gone', seed: 'def-gone' });
+    // A name alone, with no id, is nobody's: the backend never fills it in.
+    expect(requestScene(card(applyRequest(roster, { kind: 'approval', request: { ...(approval('a1') as object), agentName: 'Writer' } as never }, 5)), NO_LIVE)?.asker).toBeNull();
   });
 
 });
@@ -328,6 +334,7 @@ describe('the highlight feed', () => {
         tasks: [],
         pendingPermissions: [],
         pendingPathGrants: [],
+        pendingNetworkRequests: [],
         pendingAsks: [],
         lastAssistantMessage: null,
         recentMessages: [
@@ -581,6 +588,7 @@ const snapshotOf = (patch: Partial<FleetWorkspace> = {}): FleetWorkspace => ({
   tasks: [],
   pendingPermissions: [],
   pendingPathGrants: [],
+  pendingNetworkRequests: [],
   pendingAsks: [],
   lastAssistantMessage: null,
   recentMessages: [],
@@ -609,6 +617,27 @@ describe('snapshot', () => {
     expect(c.requests['ask:new']).toMatchObject({ kind: 'ask', ask: { pendingId: 'new', sessionId: MAIN }, text: '?', at: 7 });
     // A request has no timestamp of its own: it takes the workspace's activity.
     expect(c.requests['grant:g1']).toMatchObject({ at: 10 });
+  });
+
+  it('takes the network access requests of the snapshot, counted with the access requests', () => {
+    const network = { requestId: 'n1', workspaceId: WS, agentId: null, host: 'mirror.example.org', port: 443 } as never;
+    let s = seedFleet(EMPTY_FLEET, [snapshotOf({ pendingNetworkRequests: [network] })]);
+    expect(card(s).requests['network:n1']).toMatchObject({ kind: 'network', text: 'Reach mirror.example.org:443', at: 10 });
+    expect(cardAttention(card(s))).toMatchObject({ grants: 1, total: 1 });
+    s = applyRequestResolved(s, 'network', 'n1');
+    expect(cardAttention(card(s)).total).toBe(0);
+  });
+
+  it('names the host of a network request in Unicode, as the card and the toast do', () => {
+    const network = { requestId: 'n2', workspaceId: WS, agentId: null, host: 'xn--bcher-kva.example', port: null } as never;
+    const s = seedFleet(EMPTY_FLEET, [snapshotOf({ pendingNetworkRequests: [network] })]);
+    expect(card(s).requests['network:n2']).toMatchObject({ text: 'Reach bücher.example' });
+  });
+
+  it('names a port of this computer as such, with its port', () => {
+    const network = { requestId: 'n3', workspaceId: WS, agentId: null, host: 'localhost', port: 5432 } as never;
+    const s = seedFleet(EMPTY_FLEET, [snapshotOf({ pendingNetworkRequests: [network] })]);
+    expect(card(s).requests['network:n3']).toMatchObject({ text: 'Reach port 5432 on this computer' });
   });
 
   it('removes cards missing from the snapshot, e.g. deleted workspaces', () => {
@@ -745,7 +774,6 @@ describe('card picking', () => {
           kind: 'ask',
           ask: { pendingId: 'q', question: '?', options: null, extraContext: null, sessionId: MAIN },
           text: '?',
-          agentName: null,
           at: since,
         },
       },
@@ -829,11 +857,11 @@ describe('the crew strip', () => {
     expect(crew.map((m) => [m.status, m.doing])).toEqual([['running', 'Answering: Ship the notes.']]);
   });
 
-  it('marks who needs you: a task asking, an approval by name, Main for the rest', () => {
+  it('marks who needs you: a task asking, an approval by its agent, Main for the rest', () => {
     const t = task('r1', 'running', NOW, { sessionId: 'task-r' });
     let s = seedFleet(EMPTY_FLEET, [{ ...snapshotOf(), agents: [MANAGER, WRITER, RESEARCHER] }]);
     s = apply(s, env({ type: 'ask_user_requested', payload: { pending_id: 'p1', question: 'Which feeds?', options: null, multi_select: false } } as AssistantUiEvent, NOW, 'task-r'));
-    s = applyRequest(s, { kind: 'approval', request: { ...(approval('a1') as object), agentName: 'Writer' } as never }, NOW);
+    s = applyRequest(s, { kind: 'approval', request: { ...(approval('a1') as object), agentId: 'wa-w' } as never }, NOW);
     s = applyRequest(s, { kind: 'approval', request: approval('a2') }, NOW);
     expect(strip(card(s), live([t]))).toEqual(['Main:needs', 'Writer:needs', 'Researcher:needs']);
   });

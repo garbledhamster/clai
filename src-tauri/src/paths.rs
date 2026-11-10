@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -39,19 +38,6 @@ pub fn clai_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".clai"))
 }
 
-/// Ephemeral MCP files share the explicit profile override. Without an
-/// override, preserve the legacy location used by installed CLAI builds.
-pub fn runtime_tmp_dir() -> Option<PathBuf> {
-    runtime_tmp_dir_for(std::env::var_os("CLAI_HOME").as_deref(), dirs::config_dir())
-}
-
-fn runtime_tmp_dir_for(home: Option<&OsStr>, config_dir: Option<PathBuf>) -> Option<PathBuf> {
-    match home.filter(|value| !value.is_empty()) {
-        Some(home) => Some(PathBuf::from(home).join("tmp")),
-        None => config_dir.map(|dir| dir.join("clai").join("tmp")),
-    }
-}
-
 pub fn clai_skills_root() -> PathBuf {
     clai_home().join("skills")
 }
@@ -84,26 +70,6 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn runtime_temp_preserves_legacy_path_without_nonempty_override() {
-        let config = PathBuf::from("/legacy/config");
-        let expected = Some(config.join("clai/tmp"));
-        assert_eq!(runtime_tmp_dir_for(None, Some(config.clone())), expected);
-        assert_eq!(
-            runtime_tmp_dir_for(Some(OsStr::new("")), Some(config)),
-            expected
-        );
-        assert_eq!(runtime_tmp_dir_for(None, None), None);
-    }
-
-    #[test]
-    fn runtime_temp_uses_explicit_profile_even_without_platform_config() {
-        assert_eq!(
-            runtime_tmp_dir_for(Some(OsStr::new("/preview")), None),
-            Some(PathBuf::from("/preview/tmp"))
-        );
-    }
 
     #[test]
     fn expand_tilde_passes_absolute_and_relative_through() {

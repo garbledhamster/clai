@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { PermissionRequest } from '../../generated/bindings';
+import type { NetworkAccessRequest, PermissionRequest } from '../../generated/bindings';
 import type { PendingAskUser } from '../../assistant/sessionStore';
 
 const mockInvoke = vi.hoisted(() => vi.fn());
@@ -30,12 +30,12 @@ const approval = {
   agentName: null,
   persistsToSharedAgent: false,
   alsoAffectsWorkspaces: [],
-  command: 'cd /srv/app && cargo test',
-  segments: [
-    { text: 'cd /srv/app', kind: 'simple', suggestedPrefix: 'cd' },
-    { text: 'cargo test', kind: 'simple', suggestedPrefix: 'cargo test' },
-  ],
+  command: 'cd /srv/app && git push',
+  rows: [{ text: 'git push', rule: 'git push' }],
 } as unknown as PermissionRequest;
+
+const submittedPermissions = () =>
+  mockInvoke.mock.calls.filter(([cmd]) => cmd === 'submit_permission_decision').map(([, args]) => args);
 
 beforeEach(() => {
   mockInvoke.mockReset();
@@ -45,13 +45,11 @@ beforeEach(() => {
 describe('FleetRequestPanel', () => {
   it('keeps a long, many-line command out of its decisions; the bubble has it whole', () => {
     const note = '"Loki 8f42532a DONE: errors 348/338/133.\nConfirms alert-config blocker (model switch 10-21 14:11— 18:02) → 10 eval"';
-    const long = { ...approval, command: note, segments: [{ text: note, kind: 'simple', suggestedPrefix: note }] } as PermissionRequest;
+    const long = { ...approval, command: note, rows: [{ text: note, rule: 'git push' }] } as PermissionRequest;
     const card = { ...emptyCard('ws-1'), requests: { 'approval:perm-1': { kind: 'approval', request: long, at: 1 } as unknown as FleetRequest } };
     render(<FleetRequestPanel scene={requestScene(card, { runs: {}, tasks: {} })!} faces={castFor({}, null)} loud={false} now={10} />);
     const buttons = screen.getAllByRole('button');
-    // A chip names the prefix it saves by its first words; the tooltip has it whole.
-    expect(buttons.map((b) => b.textContent)).toEqual(['Once', 'Always · "Loki 8f42532a …', 'Never · "Loki 8f42532a …', 'Deny']);
-    expect(buttons[1]!.title).toContain('Confirms alert-config blocker');
+    expect(buttons.map((b) => b.textContent)).toEqual(['Once', 'Always', 'Deny']);
     expect(screen.getByLabelText('Command').textContent).toBe(note);
   });
 
@@ -82,35 +80,73 @@ describe('FleetRequestPanel', () => {
   });
 
   it('says a command in monospace in the bubble, without the approval card\'s tag, and still decides it', async () => {
-    const request = { kind: 'approval', request: { ...approval, agentName: 'Committer' }, agentName: 'Committer', text: approval.command } as unknown as FleetRequest;
-    const card = { ...emptyCard('ws-1'), agents: [{ name: 'Committer', seed: 'def-c' }], requests: { 'approval:perm-1': { ...request, at: 1 } } };
+    const request = { kind: 'approval', request: { ...approval, agentId: 'wa-c' }, text: approval.command } as unknown as FleetRequest;
+    const card = { ...emptyCard('ws-1'), agents: [{ id: 'wa-c', name: 'Committer', seed: 'def-c' }], requests: { 'approval:perm-1': { ...request, at: 1 } } };
     render(<FleetRequestPanel scene={requestScene(card, { runs: {}, tasks: {} })!} faces={castFor({}, null)} loud={false} now={10} />);
     const section = screen.getByRole('region', { name: 'Committer needs you' });
     expect(within(section).getByLabelText('Command').tagName).toBe('PRE');
-    expect(within(section).getByLabelText('Command')).toHaveTextContent('cd /srv/app && cargo test');
+    expect(within(section).getByLabelText('Command')).toHaveTextContent('cd /srv/app && git push');
     expect(within(section).queryByText('Permission requested')).not.toBeInTheDocument();
-    // The chip only opens the denial: the decision waits for the confirm.
-    await userEvent.click(within(section).getByRole('button', { name: /Deny all/ }));
-    expect(mockInvoke).not.toHaveBeenCalledWith('submit_permission_decision', expect.anything());
-    // One reason field for the whole command.
-    expect(within(section).getAllByRole('textbox', { name: /reason for denying/i })).toHaveLength(1);
-    await userEvent.click(within(section).getByRole('button', { name: 'Submit decisions' }));
-    // No reason typed, so none is sent.
-    expect(mockInvoke).toHaveBeenCalledWith('submit_permission_decision', { requestId: 'perm-1', decisions: [{ kind: 'denyOnce' }, { kind: 'denyOnce' }] });
+    // The Fleet card has no room for a reason: its Deny chip answers in one click, with none.
+    expect(within(section).queryByRole('textbox')).not.toBeInTheDocument();
+    await userEvent.click(within(section).getByRole('button', { name: 'Deny' }));
+    expect(submittedPermissions()).toEqual([{ requestId: 'perm-1', decision: { kind: 'deny' } }]);
   });
 
-  it('sends one reason for the whole command when the Fleet user types one', async () => {
-    const request = { kind: 'approval', request: { ...approval, agentName: 'Committer' }, agentName: 'Committer', text: approval.command } as unknown as FleetRequest;
-    const card = { ...emptyCard('ws-1'), agents: [{ name: 'Committer', seed: 'def-c' }], requests: { 'approval:perm-1': { ...request, at: 1 } } };
-    render(<FleetRequestPanel scene={requestScene(card, { runs: {}, tasks: {} })!} faces={castFor({}, null)} loud={false} now={10} />);
+  it('answers a network request with the network card, naming the workspace', async () => {
+    const network: NetworkAccessRequest = {
+      requestId: 'net-1',
+      workspaceId: 'ws-1',
+      agentId: 'wa-c',
+      agentName: null,
+      host: 'mirror.example.org',
+      port: 443,
+      reason: 'Download a fixture',
+      runHosts: [],
+      suggestedWildcard: '*.example.org',
+      persistsToSharedAgent: false,
+      alsoAffectsWorkspaces: [],
+    };
+    const card = {
+      ...emptyCard('ws-1'),
+      agents: [{ id: 'wa-c', name: 'Committer', seed: 'def-c' }],
+      requests: { 'network:net-1': { kind: 'network', request: network, at: 1 } as unknown as FleetRequest },
+    };
+    render(
+      <FleetRequestPanel
+        scene={requestScene(card, { runs: {}, tasks: {} })!}
+        faces={castFor({}, null)}
+        loud={false}
+        now={10}
+        workspaceTitle="Alpha"
+      />,
+    );
     const section = screen.getByRole('region', { name: 'Committer needs you' });
-    await userEvent.click(within(section).getByRole('button', { name: /Deny all/ }));
-    await userEvent.type(within(section).getByRole('textbox', { name: /reason for denying/i }), 'Wrong target');
-    await userEvent.click(within(section).getByRole('button', { name: 'Submit decisions' }));
-
-    expect(mockInvoke).toHaveBeenCalledWith('submit_permission_decision', {
-      requestId: 'perm-1',
-      decisions: [{ kind: 'denyOnce', reason: 'Wrong target' }, { kind: 'denyOnce', reason: 'Wrong target' }],
+    expect(within(section).getByText('mirror.example.org:443')).toBeInTheDocument();
+    expect(within(section).getByText(/add their entry/)).toHaveTextContent(/allowed hosts in “Alpha” only\.$/);
+    expect(within(section).getAllByRole('button').map((b) => b.textContent)).toEqual(['This run', 'Always', '*.example.org', 'Deny']);
+    await userEvent.click(within(section).getByRole('button', { name: 'This run' }));
+    expect(mockInvoke).toHaveBeenCalledWith('submit_network_access_decision', {
+      requestId: 'net-1',
+      decision: { kind: 'allowRun' },
     });
   });
+
+  it('names the workspace in the Always allow line', () => {
+    const request = { kind: 'approval', request: { ...approval, agentId: 'wa-c' }, text: approval.command } as unknown as FleetRequest;
+    const card = { ...emptyCard('ws-1'), agents: [{ id: 'wa-c', name: 'Committer', seed: 'def-c' }], requests: { 'approval:perm-1': { ...request, at: 1 } } };
+    render(
+      <FleetRequestPanel
+        scene={requestScene(card, { runs: {}, tasks: {} })!}
+        faces={castFor({}, null)}
+        loud={false}
+        now={10}
+        workspaceTitle="Alpha"
+      />
+    );
+    expect(screen.getByText(/^Always allow removes/)).toHaveTextContent(
+      /^Always allow removes git push from this agent's ask-first list in “Alpha” only\.$/
+    );
+  });
+
 });

@@ -19,9 +19,12 @@ import {
   workspaceGetAgent,
   workspaceUpdateAgent,
 } from '../../api/client';
+
 import type {
   ExecutionCapabilityConfig,
+  ExecutionSandboxConfig,
   FilesystemPathGrant,
+  SandboxSessionBusConfig,
   ProviderConnection,
 } from '../../generated/bindings';
 import { openGlobalSettings } from '../../utils/globalSettings';
@@ -29,6 +32,7 @@ import { useReportDirty, type SectionHandle } from './sectionHandle';
 import McpServerSelect from './McpServerSelect';
 import { NoSkills, SkillSearch, SkillSources, SkillSourceView, groupSkills } from './SkillPicker';
 import { AccessView, accessSummary, type AccessDraft } from './AgentAccess';
+import { useSandboxStatus } from '../../hooks/useSandboxStatus';
 import { Switch } from './ListEditors';
 import form from './SettingsForm.module.css';
 import styles from './AgentBehaviorForm.module.css';
@@ -67,6 +71,8 @@ export interface AgentDetail {
   selectedMcpServerIds?: string[];
   providerConnectionIds?: string[];
   execution?: Partial<ExecutionCapabilityConfig>;
+  /** Saving the Main sends it back, so a write since the load is not reverted. */
+  updatedAt?: number | bigint;
 }
 
 export interface AgentFormDeps {
@@ -80,9 +86,29 @@ type View = { kind: 'overview' } | { kind: 'source'; key: string } | { kind: 'ac
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-const DEFAULT_BLOCKED = ['rm', 'sudo', 'chmod', 'chown', 'dd', 'mkfs', 'mount', 'umount', 'shutdown', 'reboot'];
+// The backend's default ask-first list (config/types.rs), for an agent drafted
+// without the backend's defaults. A test there keeps the two lists equal.
+const DEFAULT_ASK_FIRST = [
+  'git push', 'gh pr merge', 'gh release', 'gh repo delete', 'gh api -X DELETE',
+  'npm publish', 'pnpm publish', 'yarn publish', 'yarn npm publish', 'cargo publish', 'twine upload',
+  'docker push', 'docker image push',
+  'kubectl delete', 'terraform destroy',
+  'rm', 'sudo', 'chmod', 'chown', 'dd', 'mkfs', 'mount', 'umount', 'shutdown', 'reboot',
+];
 
 const clean = (items: string[] = []): string[] => items.map((item) => item.trim()).filter(Boolean);
+
+// The bus mode as the backend reads a stored agent (`ExecutionSandboxConfig`
+// deserialize, config/types.rs): one saved before the modes has only the
+// legacy `sessionBus` switch and gets keyring only unless that was off. A
+// draft without the backend defaults has no sandbox at all: no bus.
+const storedBusMode = (
+  sandbox: (Partial<ExecutionSandboxConfig> & { sessionBus?: string }) | undefined,
+): SandboxSessionBusConfig => {
+  if (!sandbox) return 'deny';
+  if (sandbox.sessionBusMode) return sandbox.sessionBusMode;
+  return sandbox.sessionBus === 'deny' ? 'deny' : 'keyring_only';
+};
 
 const accessFrom = (execution: Partial<ExecutionCapabilityConfig> = {}): AccessDraft => ({
   grants: (execution.filesystem?.extraPaths || [])
@@ -93,22 +119,31 @@ const accessFrom = (execution: Partial<ExecutionCapabilityConfig> = {}): AccessD
     }))
     .filter((grant) => grant.path),
   shellMode: execution.shell?.mode || 'off',
-  allowed: clean(execution.shell?.allowedCommandPrefixes || []),
-  blocked: clean(execution.shell?.blockedCommandPrefixes || DEFAULT_BLOCKED),
+  askFirst: clean(execution.shell?.askFirstCommandPrefixes || DEFAULT_ASK_FIRST),
   web: execution.web?.enabled || false,
-  sessionBus: (execution.sandbox?.sessionBus || 'allow') === 'allow',
+  sessionBusMode: storedBusMode(execution.sandbox),
+  networkAccess: execution.sandbox?.networkAccess ?? null,
 });
 
-const executionFrom = (access: AccessDraft): ExecutionCapabilityConfig => ({
-  sandbox: { network: 'enabled', sessionBus: access.sessionBus ? 'allow' : 'deny' },
-  filesystem: { extraPaths: access.grants },
-  shell: {
-    mode: access.shellMode,
-    allowedCommandPrefixes: access.allowed,
-    blockedCommandPrefixes: access.blocked,
-  },
-  web: { enabled: access.web },
-});
+// Without a policy the backend applies this PC's default, so only
+// `networkAccess` may be missing.
+type SandboxDraft = Omit<ExecutionSandboxConfig, 'networkAccess'> & Partial<Pick<ExecutionSandboxConfig, 'networkAccess'>>;
+
+const executionFrom = (access: AccessDraft): ExecutionCapabilityConfig => {
+  const sandbox: SandboxDraft = {
+    sessionBusMode: access.sessionBusMode,
+    ...(access.networkAccess ? { networkAccess: access.networkAccess } : {}),
+  };
+  return {
+    sandbox: sandbox as ExecutionSandboxConfig,
+    filesystem: { extraPaths: access.grants },
+    shell: {
+      mode: access.shellMode,
+      askFirstCommandPrefixes: access.askFirst,
+    },
+    web: { enabled: access.web },
+  };
+};
 
 interface Draft {
   name: string;
@@ -154,7 +189,9 @@ const blankAgent = (execution?: Partial<ExecutionCapabilityConfig>): AgentDetail
   selectedSkillIds: [],
   selectedMcpServerIds: [],
   providerConnectionIds: [],
-  execution: execution || { shell: { mode: 'off', allowedCommandPrefixes: [], blockedCommandPrefixes: DEFAULT_BLOCKED } },
+  execution: execution || {
+    shell: { mode: 'off', askFirstCommandPrefixes: DEFAULT_ASK_FIRST },
+  },
   enabled: true,
 });
 
@@ -194,6 +231,7 @@ export const AgentBehaviorForm = ({
   const [baseline, setBaseline] = useState<string | null>(null);
   const [view, setView] = useState<View>({ kind: 'overview' });
   const [skillQuery, setSkillQuery] = useState('');
+  const sandbox = useSandboxStatus();
 
   const isManager = agent?.isDefault === true;
   const canDelete = !saveBehavior && !isCreate && !isManager;
@@ -203,6 +241,8 @@ export const AgentBehaviorForm = ({
   // The overview control that opened the current view; focus returns to it.
   const opener = useRef<string | null>(null);
   const lastFetchedId = useRef<string | null>(null);
+  // The stored agent's `updatedAt` this form's values are based on.
+  const loadedAt = useRef(0);
   const ids = useId();
 
   useEffect(() => {
@@ -240,6 +280,7 @@ export const AgentBehaviorForm = ({
 
   useEffect(() => {
     if (!agent) return;
+    loadedAt.current = Number(agent.updatedAt ?? 0);
     const next = draftFrom(agent);
     // eslint-disable-next-line react-hooks/set-state-in-effect -- the draft and its baseline are rebuilt together whenever the source agent changes.
     setDraft(next);
@@ -316,7 +357,7 @@ export const AgentBehaviorForm = ({
           // The host moves to the new agent's own page.
           return { ok: true, createdId: created.id };
         } else {
-          await workspaceUpdateAgent({
+          const saved = await workspaceUpdateAgent({
             workspaceId,
             agentId: agent?.id || '',
             ...payload,
@@ -324,7 +365,9 @@ export const AgentBehaviorForm = ({
             // below is the form's own serialisation, so this never dirties it.
             name: isManager ? (agent?.name || 'Manager') : payload.name,
             enabled: isManager ? true : draft.enabled,
+            expectedUpdatedAt: loadedAt.current,
           });
+          if (saved?.updatedAt !== undefined) loadedAt.current = Number(saved.updatedAt);
         }
         setBaseline(serialize(draft));
         setError(null);
@@ -405,6 +448,7 @@ export const AgentBehaviorForm = ({
       <div className={form.page} ref={rootRef}>
         <AccessView
           draft={draft.access}
+          sandbox={sandbox}
           onChange={(change) => patch({ access: { ...draft.access, ...change } })}
           disabled={busy}
           headingRef={viewHeading}
@@ -582,7 +626,7 @@ export const AgentBehaviorForm = ({
             </header>
             <div className={form.panelBody}>
               <ul className={styles.summary}>
-                {accessSummary(draft.access).map((line) => <li key={line}>{line}</li>)}
+                {accessSummary(draft.access, sandbox.status).map((line) => <li key={line}>{line}</li>)}
               </ul>
             </div>
           </section>

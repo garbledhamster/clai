@@ -28,7 +28,6 @@
 //! - **scheduler** - Manages when agents should run (one at a time)
 //! - **runner** - Background loop that checks scheduler and runs agents
 //! - **init** - Scheduler initialization and instance management
-//! - **tmp** - Startup cleanup for ephemeral runtime files
 
 pub mod cleanup_recovery;
 pub mod hooks;
@@ -37,7 +36,6 @@ pub mod runner;
 pub mod schedule;
 pub mod scheduler;
 pub mod scripts;
-pub mod tmp;
 pub mod types;
 pub mod wake_monitor;
 pub mod weekly_blocks;
@@ -50,6 +48,3 @@ pub use scheduler::{create_shared_scheduler, SchedulerState, SharedScheduler};
 
 // Runner export (used by lib.rs)
 pub use runner::start_agent_runner;
-
-// Startup cleanup helpers
-pub use tmp::clear_tmp_dir;

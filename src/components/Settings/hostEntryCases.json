@@ -1,0 +1,200 @@
+{
+  "accepted": [
+    {
+      "entry": "github.com",
+      "matched": "github.com"
+    },
+    {
+      "entry": " GitHub.COM. ",
+      "matched": "github.com"
+    },
+    {
+      "entry": "*.github.com",
+      "matched": "*.github.com"
+    },
+    {
+      "entry": "s3.*.amazonaws.com",
+      "matched": "s3.*.amazonaws.com"
+    },
+    {
+      "entry": "*.com",
+      "matched": "*.com"
+    },
+    {
+      "entry": "_dmarc.example.com",
+      "matched": "_dmarc.example.com"
+    },
+    {
+      "entry": "bücher.example",
+      "matched": "xn--bcher-kva.example"
+    },
+    {
+      "entry": "10.0.0.5",
+      "matched": "10.0.0.5"
+    },
+    {
+      "entry": "[2001:db8::1]",
+      "matched": "2001:db8::1"
+    },
+    {
+      "entry": "2001:0db8:0:0::1",
+      "matched": "2001:db8::1"
+    },
+    {
+      "entry": "github。com",
+      "matched": "github.com"
+    },
+    {
+      "entry": "*。com",
+      "matched": "*.com"
+    },
+    {
+      "entry": "localhost.example.com",
+      "matched": "localhost.example.com"
+    },
+    {
+      "entry": "127.0.0.1.nip.io",
+      "matched": "127.0.0.1.nip.io"
+    }
+  ],
+  "rejected": [
+    "",
+    "*",
+    "*.*",
+    "*.*.*",
+    "github.com:443",
+    "ab:443",
+    "abc:def:1",
+    "[foo]",
+    "[::1]:443",
+    "git@github.com",
+    "github.com?x",
+    "github.com#x",
+    "a|b.com",
+    "a^b.com",
+    "a!b.com",
+    "%2a.github.com",
+    "%41bc.com",
+    "a\\b.com",
+    "10。0。0。5",
+    "１.２.３.４",
+    "999.1.1.1",
+    "example.123",
+    "example.0x1",
+    "2130706433",
+    "010.0.0.5",
+    "*.0.0.5",
+    "https://github.com",
+    "github.com/x",
+    "git hub.com",
+    "a..com",
+    "gi*thub.com"
+  ],
+  "localPorts": {
+    "accepted": [
+      {
+        "entry": "localhost:5432",
+        "port": 5432
+      },
+      {
+        "entry": " LocalHost:22 ",
+        "port": 22
+      },
+      {
+        "entry": "localhost:1",
+        "port": 1
+      },
+      {
+        "entry": "localhost:65535",
+        "port": 65535
+      },
+      {
+        "entry": "127.0.0.1:8080",
+        "port": 8080
+      },
+      {
+        "entry": "[::1]:5432",
+        "port": 5432
+      },
+      {
+        "entry": "[::1]:443",
+        "port": 443
+      }
+    ],
+    "rejected": [
+      "localhost",
+      "localhost:",
+      "localhost:0",
+      "localhost:65536",
+      "localhost:99999999999",
+      "localhost:05432",
+      "localhost:+80",
+      "localhost: 80",
+      "localhost:80:81",
+      "localhost:*",
+      "localhost:1-9",
+      "localhost:80,443",
+      "127.0.0.1",
+      "127.0.0.1:",
+      "127.0.0.1:0",
+      "::1",
+      "[::1]",
+      "[::1]:",
+      "[::1]:0",
+      "::1:5432",
+      "64:ff9b::7f00:1:80",
+      "127.0.0.2:80",
+      "127.1.2.3",
+      "0.0.0.0:80",
+      "[::]:80",
+      "[::ffff:127.0.0.1]:80",
+      "[localhost]:80",
+      "[127.0.0.1]:80",
+      "*.localhost:80",
+      "app.localhost:3000",
+      "localhost.:80",
+      "127.0.0.1.",
+      "127.0.0.2.",
+      "127.0.0.1.:80",
+      "[::1].",
+      "::1.",
+      "::.",
+      "::ffff:127.0.0.1.",
+      "64:ff9b::7f00:1.",
+      "0:0:0:0:0:0:0:1.",
+      "ｌｏｃａｌｈｏｓｔ",
+      "localhoſt",
+      "app。localhost",
+      "[0:0:0:0:0:0:0:1]:80",
+      "[64:ff9b::7f00:1]:80"
+    ],
+    "notLocal": [
+      "github.com",
+      "github.com:443",
+      "10.0.0.5:80",
+      "[2001:db8::1]:443",
+      "mylocalhost:80",
+      "localhost.example.com:80",
+      "127.0.0.1.nip.io:80"
+    ]
+  },
+  "allowOnlyRejected": [
+    "localhost",
+    " LocalHost. ",
+    "*.localhost",
+    "app.localhost",
+    "app。localhost",
+    "127.0.0.1",
+    "127.1.2.3",
+    "0.0.0.0",
+    "::1",
+    "[::1]",
+    "0:0:0:0:0:0:0:1",
+    "::",
+    "::ffff:127.0.0.1",
+    "64:ff9b::7f00:1",
+    "::ffff:127.1.2.3",
+    "::ffff:0.0.0.0",
+    "64:ff9b::0.0.0.0"
+  ]
+}

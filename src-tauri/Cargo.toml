@@ -1,9 +1,12 @@
 [package]
 name = "clai"
-version = "26.11.1"
+version = "26.11.8"
 description = "Desktop multi-agent orchestration app with MCP-native tools"
 authors = ["juacker"]
 edition = "2021"
+# src/bin/clai-sandbox-helper.rs is a second binary; `cargo run` and
+# `tauri dev` start the app.
+default-run = "clai"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -72,6 +75,7 @@ tauri-plugin-clipboard-manager = "2.3.3"
 tauri-plugin-dialog = "2.7.3"
 tauri-plugin-opener = "2.5.5"
 tauri-plugin-os = "2.3.2"
+tauri-plugin-single-instance = "2.5.5"
 tauri-plugin-updater = "2.14.1"
 
 # Serialization
@@ -86,6 +90,8 @@ tree-sitter-bash = "=0.25.1"
 # Features: json (automatic JSON parsing), stream (for SSE), gzip (compression)
 reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
 http = "1"  # HeaderName/HeaderValue for MCP custom headers (shared 1.x in tree)
+url = "2"  # host normalisation (IDNA, IP literals) for the network allowlist
+psl = "2"  # public suffix list: no network wildcard over a public suffix
 
 # Async runtime - required by reqwest
 # The "full" feature enables all async utilities

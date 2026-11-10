@@ -11,11 +11,11 @@ use ts_rs::TS;
 use crate::assistant::sandbox::filesystem::EffectiveFilesystemPolicy;
 use crate::assistant::sandbox::{
     SandboxCommand, SandboxEnv, SandboxNetworkMode, SandboxProfile, SandboxSessionBusMode,
+    SocketPolicy,
 };
 use crate::assistant::tools::local::{evaluate_command_policy, PolicyResult};
-use crate::assistant::tools::RunCommandGrant;
 use crate::config::{
-    ExecutionCapabilityConfig, SandboxNetworkConfig, SandboxSessionBusConfig, ShellAccessMode,
+    ExecutionCapabilityConfig, NetworkMode, SandboxSessionBusConfig, ShellAccessMode,
 };
 use crate::AppState;
 
@@ -170,7 +170,6 @@ pub(crate) struct CapturedScript {
     pub interpreter: PathBuf,
     pub access: String,
     identity: String,
-    invocation: String,
     profile: SandboxProfile,
     start_lease: Option<super::scheduler::DispatchLease>,
 }
@@ -335,36 +334,52 @@ fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\"'\"'"))
 }
 
-pub(crate) fn invocation_policy(
+fn invocation_ask_first_rules(
     execution: &ExecutionCapabilityConfig,
     invocation: &str,
-    approved: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if execution.shell.mode == ShellAccessMode::Off {
         return Err("Shell access is disabled for the Main agent.".into());
     }
-    match evaluate_command_policy(execution, invocation, &[], &[]) {
-        PolicyResult::Block {
-            segment_text,
-            matched_prefix,
-        } => Err(format!(
-            "Script invocation `{segment_text}` is blocked by `{matched_prefix}`."
-        )),
-        PolicyResult::NeedsApproval(rows) if approved => {
-            let grants: Vec<_> = rows
-                .into_iter()
-                .map(|row| RunCommandGrant::Exact(row.text))
-                .collect();
-            match evaluate_command_policy(execution, invocation, &grants, &[]) {
-                PolicyResult::Allow => Ok(()),
-                _ => Err(
-                    "The script invocation is not permitted by the Main agent's current policy."
-                        .into(),
-                ),
-            }
-        }
-        _ => Ok(()), // A captured request will obtain explicit consent before execution.
+    let PolicyResult::AskFirst(rows) = evaluate_command_policy(execution, invocation, &[]) else {
+        return Ok(Vec::new());
+    };
+    let mut rules: Vec<_> = rows.into_iter().map(|row| row.rule).collect();
+    rules.sort_unstable();
+    rules.dedup();
+    Ok(rules)
+}
+
+#[cfg(target_os = "linux")]
+fn script_socket_policy(
+    execution: &ExecutionCapabilityConfig,
+    filesystem: &EffectiveFilesystemPolicy,
+) -> SocketPolicy {
+    use crate::assistant::sandbox::filesystem::resolve_configured_path;
+    use crate::assistant::sandbox::{granted_sockets, socket_policy};
+
+    let grants: Vec<_> = execution
+        .filesystem
+        .extra_paths
+        .iter()
+        .filter_map(|grant| resolve_configured_path(&grant.path).ok())
+        .collect();
+    let (allowed, skipped) = granted_sockets(&grants, &|path| {
+        filesystem.covers(path, crate::config::FilesystemPathAccess::ReadWrite)
+    });
+    SocketPolicy {
+        allowed,
+        skipped,
+        ..socket_policy()
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn script_socket_policy(
+    _execution: &ExecutionCapabilityConfig,
+    _filesystem: &EffectiveFilesystemPolicy,
+) -> SocketPolicy {
+    SocketPolicy::default()
 }
 
 pub(crate) fn capture(
@@ -478,19 +493,26 @@ fn capture_with_execution(
         flag,
         quote(&content)
     );
-    invocation_policy(execution, &invocation, false)?;
+    let ask_first = invocation_ask_first_rules(execution, &invocation)?;
     let filesystem = EffectiveFilesystemPolicy::from_config(
         root,
         &execution.filesystem.extra_paths,
         crate::paths::real_home().as_deref(),
     )?;
-    let session_bus = match execution.sandbox.session_bus {
-        SandboxSessionBusConfig::Deny => SandboxSessionBusMode::Deny,
-        SandboxSessionBusConfig::Allow => SandboxSessionBusMode::Allow,
+    let (session_bus, session_bus_unavailable) = match execution.sandbox.session_bus {
+        SandboxSessionBusConfig::Deny => (SandboxSessionBusMode::Deny, None),
+        SandboxSessionBusConfig::Full => (SandboxSessionBusMode::Allow, None),
+        SandboxSessionBusConfig::KeyringOnly => (
+            SandboxSessionBusMode::Deny,
+            Some("Schedule scripts do not start a keyring-only session bus proxy.".to_string()),
+        ),
     };
-    let network = match execution.sandbox.network {
-        SandboxNetworkConfig::Enabled => SandboxNetworkMode::Host,
-        SandboxNetworkConfig::Disabled => SandboxNetworkMode::Disabled,
+    let network = match execution.sandbox.network_access.mode {
+        NetworkMode::Off => SandboxNetworkMode::Disabled,
+        NetworkMode::HostNetwork => SandboxNetworkMode::Host,
+        NetworkMode::Allowlist => {
+            return Err("Schedule scripts cannot use Allowlist network mode. Choose Off or Host network in the Main agent's Local access settings.".into());
+        }
     };
     let env_home = filesystem
         .home
@@ -499,9 +521,12 @@ fn capture_with_execution(
     let profile = SandboxProfile {
         env: SandboxEnv::filtered_from_current(env_home, session_bus),
         scratch_tmp: None,
+        sockets: script_socket_policy(execution, &filesystem),
         filesystem,
         network,
         session_bus,
+        session_bus_proxy: None,
+        session_bus_unavailable,
     };
     let extra_paths = profile
         .filesystem
@@ -516,11 +541,21 @@ fn capture_with_execution(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let socket_paths: Vec<_> = profile
+        .sockets
+        .allowed
+        .iter()
+        .map(|socket| (&socket.path, &socket.host))
+        .collect();
+    let bus_note = profile
+        .session_bus_unavailable
+        .as_ref()
+        .map_or(String::new(), |reason| format!(" {reason}"));
     let access = format!(
-        "Main shell: {:?}\nWorkspace (read/write): {}\nHome (read only): {}\nAdditional paths:\n{}\nNetwork: {:?}\nSession bus: {:?}\nAllowed invocation prefixes: {:?}\nBlocked invocation prefixes: {:?}\nSibling workspaces remain isolated.\nThe existing invocation checks do not inspect every command reached inside an arbitrary interpreter. Full shell mode permits broader invocations; the filesystem and network sandbox still applies. Scripts can read changing files and services.",
+        "Main shell: {:?}\nWorkspace (read/write): {}\nHome (read only): {}\nAdditional paths:\n{}\nNetwork: {:?}\nSession bus: {:?}.{bus_note}\nAllowed Unix sockets: {socket_paths:?}\nAsk-first rules matched by the invocation: {ask_first:?}\nSibling workspaces remain isolated.\nThe invocation check does not inspect every command reached inside an arbitrary interpreter. The filesystem and network sandbox still applies. Scripts can read changing files and services.",
         execution.shell.mode, profile.filesystem.workspace_root.display(), env_home_display(&profile),
-        if extra_paths.is_empty() { "None" } else { &extra_paths }, execution.sandbox.network, execution.sandbox.session_bus,
-        execution.shell.allowed_command_prefixes, execution.shell.blocked_command_prefixes
+        if extra_paths.is_empty() { "None" } else { &extra_paths },
+        execution.sandbox.network_access.mode, profile.session_bus,
     );
     let identity = serde_json::to_string(&(
         content.as_str(),
@@ -539,7 +574,6 @@ fn capture_with_execution(
         interpreter,
         access,
         identity,
-        invocation,
         profile,
         start_lease: None,
     })
@@ -625,11 +659,8 @@ impl CapturedScript {
             if !self.same_approval(&current) {
                 return Err("Script contents, interpreter or effective access changed. Review a fresh approval.".to_string());
             }
-            invocation_policy(
-                &current_execution(state, workspace_id)?,
-                &self.invocation,
-                true,
-            )?;
+            // Exact schedule approval covers the reviewed invocation and its
+            // current Ask First rules without granting any other command.
             interpreter_flag(&self.config.interpreter)
         })();
         let flag = match preparation {
@@ -674,18 +705,6 @@ impl CapturedScript {
             ),
         }
     }
-}
-
-fn current_execution(
-    state: &AppState,
-    workspace_id: &str,
-) -> Result<ExecutionCapabilityConfig, String> {
-    let (workspace, roster) = state.resolve_workspace_roster(workspace_id)?;
-    roster
-        .into_iter()
-        .find(|row| row.agent.id == workspace.main_agent_id())
-        .map(|row| row.agent.execution)
-        .ok_or("Workspace Main agent not found.".into())
 }
 
 fn script_result(
@@ -920,7 +939,7 @@ mod tests {
     fn execution() -> ExecutionCapabilityConfig {
         let mut execution = ExecutionCapabilityConfig::default();
         execution.shell.mode = ShellAccessMode::Full;
-        execution.shell.blocked_command_prefixes.clear();
+        execution.sandbox.network_access.mode = NetworkMode::HostNetwork;
         execution
     }
     async fn fixture(script: Option<ScriptConfig>) -> Fixture {
@@ -1168,7 +1187,8 @@ mod tests {
                             .unwrap()
                             .execution
                             .sandbox
-                            .network = SandboxNetworkConfig::Disabled;
+                            .network_access
+                            .mode = NetworkMode::Off;
                     }
                     Ok(())
                 })
@@ -1673,8 +1693,13 @@ mod tests {
         assert_eq!(first.content, "unsaved draft");
         f.state
             .update_workspace_config("ws", |w| {
-                w.main_agent.as_mut().unwrap().execution.sandbox.network =
-                    SandboxNetworkConfig::Disabled;
+                w.main_agent
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .sandbox
+                    .network_access
+                    .mode = NetworkMode::Off;
                 Ok(())
             })
             .unwrap();
@@ -1779,10 +1804,26 @@ mod tests {
         let mut blocked = exec.clone();
         blocked.shell.mode = ShellAccessMode::Off;
         assert!(capture_with_execution(dir.path(), &blocked, &inline("exit 0")).is_err());
-        blocked.shell.mode = ShellAccessMode::Restricted;
-        blocked.shell.blocked_command_prefixes = vec!["sh".into()];
-        assert!(capture_with_execution(dir.path(), &blocked, &inline("exit 0")).is_err());
-        assert!(invocation_policy(&blocked, "/bin/sh -c 'exit 0'", true).is_err());
+        let mut allowlist = exec;
+        allowlist.sandbox.network_access.mode = NetworkMode::Allowlist;
+        let error = capture_with_execution(dir.path(), &allowlist, &inline("exit 0"))
+            .err()
+            .expect("an unsupported mode must fail closed");
+        assert!(error.contains("Allowlist"), "{error}");
+    }
+
+    #[test]
+    fn schedule_scripts_review_matching_ask_first_rules() {
+        let mut exec = execution();
+        exec.shell.mode = ShellAccessMode::Restricted;
+        exec.shell.ask_first_command_prefixes = vec!["git push".into()];
+        assert_eq!(
+            invocation_ask_first_rules(&exec, "git push").unwrap(),
+            ["git push"]
+        );
+        assert!(invocation_ask_first_rules(&exec, "git status")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1806,7 +1847,7 @@ mod tests {
             );
         }
         let mut restricted = exec;
-        restricted.sandbox.network = SandboxNetworkConfig::Disabled;
+        restricted.sandbox.network_access.mode = NetworkMode::Off;
         assert!(!first.same_approval(
             &capture_with_execution(dir.path(), &restricted, &inline("exit 0")).unwrap()
         ));

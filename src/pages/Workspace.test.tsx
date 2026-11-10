@@ -396,6 +396,85 @@ describe('Workspace details poll', () => {
   });
 });
 
+describe('Workspace — who asks', () => {
+  const crew = (over: Partial<WorkspaceAgentResponse>) =>
+    ({ workspaceId: 'a', enabled: true, isDefault: false, agentName: null, agentDescription: null, avatar: null, ...over }) as WorkspaceAgentResponse;
+  const emit = (name: string, payload: unknown) =>
+    act(() => eventHandlers.get(name)?.forEach((handler) => handler({ payload })));
+
+  it("draws the chat's question as its owner's and each request as the agent that raised it", async () => {
+    getWorkspaceDetails.mockImplementation(async (_workspaceId, options) =>
+      detailsFor(options, {
+        assignedAgents: [
+          crew({ id: 'wa-main', agentDefinitionId: 'def-main', displayName: 'Manager', isDefault: true }),
+          crew({ id: 'wa-rust', agentDefinitionId: 'def-rust', displayName: 'Rust Architect' }),
+        ],
+        // Scout left the roster with this task still running.
+        tasks: [
+          {
+            ...FAILED_TASK,
+            assignedToWorkspaceAgentId: 'wa-gone',
+            assignedAgentDefinitionId: 'def-gone',
+            assignedAgentDisplayName: 'Scout',
+            status: 'running',
+          },
+        ],
+      })
+    );
+    loadSessionMessagesPage.mockResolvedValue(messagePage([userMessage('sess-a', 'm-1', 'first question')]));
+    vi.mocked(assistantClient.listPendingAsks).mockResolvedValue([
+      { pendingId: 'q-1', workspaceId: 'a', sessionId: 'sess-a', question: 'Ship it?', options: null, multiSelect: false, extraContext: null, requestedAt: 1n },
+    ]);
+
+    renderWorkspace();
+    expect(await screen.findByText('first question')).toBeInTheDocument();
+    const question = await screen.findByRole('dialog', { name: 'Question from Main' });
+    expect(within(question).getByText('Main')).toBeInTheDocument();
+    expect(question.querySelector('[data-activity]')).not.toBeNull();
+
+    // A sub-agent's task raised these: they name it, not the chat's Main.
+    emit('permissions://request', {
+      requestId: 'perm-1',
+      workspaceId: 'a',
+      agentId: 'wa-rust',
+      agentName: null,
+      command: 'cargo test',
+      rows: [{ text: 'cargo test', rule: 'cargo test' }],
+      persistsToSharedAgent: false,
+      alsoAffectsWorkspaces: [],
+    });
+    emit('path-grants://request', {
+      requestId: 'grant-1',
+      workspaceId: 'a',
+      agentId: 'wa-rust',
+      agentName: null,
+      requestedPath: '/home/u/.config/gh',
+      requestedAccess: 'read_only',
+      reason: 'token',
+    });
+    const approval = await screen.findByRole('article', { name: 'Permission requested by Rust Architect' });
+    expect(approval).toHaveTextContent('Rust Architect wants to run:');
+    expect(approval.querySelector('[data-activity]')).not.toBeNull();
+    const grant = screen.getByRole('article', { name: 'Path grant requested by Rust Architect' });
+    expect(grant).toHaveTextContent('Rust Architect wants to extend its filesystem grants:');
+
+    // An agent removed mid-task is found on its task, as the Fleet finds it.
+    emit('permissions://request', {
+      requestId: 'perm-2',
+      workspaceId: 'a',
+      agentId: 'wa-gone',
+      agentName: null,
+      command: 'ls',
+      rows: [{ text: 'ls', rule: 'ls' }],
+      persistsToSharedAgent: false,
+      alsoAffectsWorkspaces: [],
+    });
+    expect(await screen.findByRole('article', { name: 'Permission requested by Scout' })).toHaveTextContent(
+      'Scout wants to run:'
+    );
+  });
+});
+
 describe('Workspace session hydration', () => {
   it('seeds the queued chips from the details payload on first hydration', async () => {
     getWorkspaceDetails.mockImplementation(async (_workspaceId, options) =>
@@ -1346,6 +1425,61 @@ describe('Workspace file preview', () => {
     expect(panel.querySelector('[data-preview-line="2"]')).toBeNull();
     await userEvent.click(link);
     expect(panel.querySelector('[data-preview-line="2"]')).toBeInTheDocument();
+  });
+});
+
+describe('Workspace composer geometry', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // jsdom has no layout: give the conversation column a 360px pane at x=100
+  // and the card its 420px floor, slid left so its right edge meets the
+  // pane's, as .chatFirstContent lays it out when the pane is that narrow.
+  const rectOf = (left: number, width: number) =>
+    ({ left, right: left + width, width, top: 0, bottom: 500, height: 500, x: left, y: 0 }) as DOMRect;
+
+  it('keeps the published chat width inside a pane narrower than the 420px floor', async () => {
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        disconnect() {}
+      }
+    );
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      if (this.matches(`.${styles.workspaceMain}`)) return rectOf(100, 360);
+      if (this.matches(`.${styles.chatFirstContent}`)) return rectOf(40, 420);
+      return rectOf(0, 0);
+    });
+    renderWorkspace();
+
+    const rootStyle = document.documentElement.style;
+    await waitFor(() => expect(rootStyle.getPropertyValue('--chat-card-width')).toBe('360px'));
+    expect(rootStyle.getPropertyValue('--chat-card-center')).toBe('280px');
+  });
+
+  it('floors the published chat width at 420px when the visible strip is narrower', async () => {
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        disconnect() {}
+      }
+    );
+    // A 700px pane at x=100 with the drawer open beside the card: the card
+    // keeps its 420px and slides left, so only 340px of it is in the pane.
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      if (this.matches(`.${styles.workspaceMain}`)) return rectOf(100, 700);
+      if (this.matches(`.${styles.chatFirstContent}`)) return rectOf(20, 420);
+      return rectOf(0, 0);
+    });
+    renderWorkspace();
+
+    const rootStyle = document.documentElement.style;
+    await waitFor(() => expect(rootStyle.getPropertyValue('--chat-card-width')).toBe('420px'));
+    expect(rootStyle.getPropertyValue('--chat-card-center')).toBe('310px');
   });
 });
 
