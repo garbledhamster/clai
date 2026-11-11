@@ -9,66 +9,67 @@
 
 .forkIntro {
   width: 100%;
-  padding: clamp(20px, 5vw, 36px);
+  padding: clamp(18px, 4vw, 28px);
+  border: 1px solid var(--color-border-medium);
+  border-top: 3px solid var(--color-primary);
   border-radius: var(--radius-md);
-  background: #e8eddf;
-  border-left: 4px solid #67816c;
-  color: #172f26;
+  background: var(--color-bg-elevated);
 }
 
 .title {
   display: inline-block;
   margin: 0 10px 0 0;
-  color: #172f26;
-  font-size: 44px;
+  color: var(--color-text-primary);
+  font-size: 36px;
   font-weight: 800;
-  letter-spacing: -0.07em;
-  line-height: 1;
+  letter-spacing: -0.06em;
+  line-height: 1.1;
 }
 
 .title span {
-  color: #a13d22;
+  color: var(--color-primary);
 }
 
 .version {
   font-size: 12px;
-  color: #395047;
+  color: var(--color-text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
-.tagline {
-  margin: 18px 0 0;
-  color: #172f26;
-  font-family: Georgia, serif;
-  font-size: clamp(23px, 4vw, 33px);
-  line-height: 1.12;
+.subtitle {
+  margin-top: 10px;
+  font-size: 15px;
+  color: var(--color-text-primary);
 }
 
-.subtitle {
-  margin: 10px 0 0;
-  max-width: 47ch;
+.features {
+  margin-top: 12px;
+  list-style: none;
+  color: var(--color-text-secondary);
   font-size: 14px;
-  color: #395047;
+}
+
+.features li + li {
+  margin-top: 4px;
 }
 
 .aboutButton {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-top: 20px;
-  padding: 9px 13px;
-  border: 1px solid #172f26;
+  margin-top: 18px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border-medium);
   border-radius: var(--radius-md);
-  background: #172f26;
-  color: #f6f2e7;
+  background: var(--color-bg-secondary);
+  color: var(--color-text-primary);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
 }
 
 .aboutButton:hover {
-  background: #a13d22;
-  border-color: #a13d22;
+  border-color: var(--color-primary);
 }
 
 .updatePanel {

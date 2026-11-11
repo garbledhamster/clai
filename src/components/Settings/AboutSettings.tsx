@@ -141,11 +141,11 @@ const AboutSettings = () => {
           CLAI<span>+</span>
         </h3>
         {version && <span className={styles.version}>v{version}</span>}
-        <p className={styles.tagline}>I wanted more say in when my agents run.</p>
-        <p className={styles.subtitle}>
-          I built CLAI+ on CLAI so I could pick the hours a workspace can run, check if there’s work
-          before starting the agent, and give it a way to get ready and clean up afterward.
-        </p>
+        <p className={styles.subtitle}>My fork of CLAI for running agent teams on a schedule.</p>
+        <ul className={styles.features}>
+          <li>🗓️ Workspace schedules with weekly time blocks</li>
+          <li>⚙️ Condition, Before, and After scripts</li>
+        </ul>
         <button
           type="button"
           className={styles.aboutButton}

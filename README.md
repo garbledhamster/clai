@@ -1,34 +1,42 @@
 # CLAI+
 
-**I wanted more say in when my agents run.**
+My fork of CLAI for running agent teams on a schedule. I added weekly time
+blocks, a check for work before the agent runs, and scripts to get things
+ready and clean up.
 
-I liked how CLAI lets me give a team of agents its own workspace. Once I
-started setting up recurring work, I got really zoomed in on the schedule.
-I wanted to pick the hours it could run, check whether there was anything to
-do, and give each workspace a way to get ready and clean up afterward.
-That’s how CLAI+ started.
+[About CLAI+ and screenshots](https://garbledhamster.github.io/clai/) ·
+[Scheduler design](https://github.com/garbledhamster/clai/issues/1) ·
+[Upstream CLAI](https://github.com/clairun/clai)
 
-[Read the CLAI+ About page and see what I’ve added](https://garbledhamster.github.io/clai/)
+## 🛠️ What I added to the public fork
 
-[![CLAI+ workspace schedule with a 30-second interval and weekday time blocks](docs/screenshots/weekly-schedule.webp)](https://garbledhamster.github.io/clai/#what-i-added)
+- **🗓️ Workspace schedules.** Set an interval as short as 15 seconds or use
+  cron. Pick the hours each workspace can run on a weekly grid.
+- **⚙️ Condition, Before, and After scripts.** Check if there’s work first,
+  get things ready for the run, and clean up when it’s done. Test scripts
+  in settings and review their exact contents before running them unattended.
+- **▶️ Run controls.** Pause a workspace schedule or use **Run agent now**.
+  A due workspace can check its schedule while another one is busy.
 
-## What I added in the public fork
+Automatic enhanced schedules use the macOS wake monitor and need the app
+running. Other platforms can use the regular scheduler.
 
-- **Pick the hours.** I can set an interval as short as 15 seconds or use
-  cron for set times, then choose the allowed times on a weekly grid.
-- **Check if there’s work first.** A condition script can check for a new
-  file before I spend a model call.
-- **Get ready and clean up.** Before and After scripts can do the setup and
-  cleanup around a run. I can test them, review the exact scripts before
-  letting them run unattended, and see when cleanup needs attention.
+## 🧪 What I’m running in my local build
 
-Automatic enhanced schedules use the macOS wake monitor and need the app to
-be running. The regular scheduler is available on other platforms.
+The run queue shows what’s running and what’s waiting, with app-wide and
+per-workspace limits. I’ve also added tray controls, workspace Todoist
+settings, and a Google file worker with notes tied to parts of the file.
+These additions are still outside the public branch.
 
-I built this on [CLAI](https://github.com/clairun/clai). The public
-changes live on `clai-plus`. You can read the
-[scheduler design](https://github.com/garbledhamster/clai/issues/1) or see
-[how the fork brings in upstream changes](AGENTS.md).
+## 📸 Screenshots
+
+| Weekly time blocks | Schedule scripts | Local run queue |
+| --- | --- | --- |
+| [![Weekly time blocks](docs/screenshots/weekly-schedule.webp)](docs/screenshots/weekly-schedule.webp) | [![Schedule scripts](docs/screenshots/schedule-scripts.webp)](docs/screenshots/schedule-scripts.webp) | [![Local run queue](docs/screenshots/run-queue.webp)](docs/screenshots/run-queue.webp) |
+
+The screenshots use sample workspaces and runs. Public changes live on
+`clai-plus`. See the [upstream sync guide](AGENTS.md) for how the fork
+brings in upstream changes.
 
 ## The CLAI foundation
 

@@ -3,97 +3,93 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Joe Rice’s fork of CLAI, with weekly time blocks, condition checks and scripts around scheduled agent runs.">
-    <meta name="theme-color" content="#f6f2e7">
+    <meta name="description" content="CLAI+ adds weekly time blocks, condition checks, and Before and After scripts to CLAI workspace scheduling.">
+    <meta name="color-scheme" content="light dark">
     <title>CLAI+ · About the fork</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap">
     <link rel="stylesheet" href="about.css">
   </head>
   <body>
-    <header class="wrap masthead">
-      <a class="wordmark" href="./" aria-label="CLAI+ home">CLAI<span>+</span></a>
-      <nav aria-label="About CLAI+">
-        <a href="#what-i-added">What I added</a>
-        <a href="https://github.com/garbledhamster/clai">GitHub ↗</a>
+    <div class="topbar">
+      <nav class="wrap" aria-label="Project">
+        <a class="repo" href="./">garbledhamster / <strong>clai</strong></a>
+        <a href="https://github.com/garbledhamster/clai">View on GitHub ↗</a>
       </nav>
-    </header>
+    </div>
+    <main class="wrap readme">
+      <header class="intro">
+        <h1 id="intro">CLAI<span>+</span></h1>
+        <p>My fork of CLAI for running agent teams on a schedule. I added weekly time blocks, a check for work before the agent runs, and scripts to get things ready and clean up.</p>
+        <nav aria-label="About page">
+          <a href="#what-i-added">Public fork</a>
+          <a href="#local-build">Local build</a>
+          <a href="https://github.com/garbledhamster/clai/issues/1">Scheduler design ↗</a>
+        </nav>
+      </header>
 
-    <main id="main">
-      <section class="wrap hero" aria-labelledby="intro">
-        <div class="intro">
-          <p class="kicker">My fork of CLAI</p>
-          <h1 id="intro">I wanted more say in <em>when my agents run.</em></h1>
-          <p>I liked how CLAI lets me give a team of agents its own workspace. Once I started setting up recurring work, I got really zoomed in on the schedule. I wanted to pick the hours it could run, check whether there was anything to do, and give each workspace a way to get ready and clean up afterward. That’s how CLAI+ started.</p>
-          <a class="button" href="https://github.com/garbledhamster/clai">Explore the fork <span aria-hidden="true">↗</span></a>
-        </div>
-        <figure class="hero-figure">
-          <a class="capture" href="screenshots/weekly-schedule.webp">
-            <img src="screenshots/weekly-schedule.webp" alt="CLAI+ Schedule settings with a 30-second interval and selected weekday time blocks" width="945" height="1365" fetchpriority="high">
-          </a>
-          <figcaption>The schedule for a sample workspace. Click any screenshot to see it full size.</figcaption>
-        </figure>
-      </section>
-
-      <section class="wrap additions" id="what-i-added" aria-labelledby="additions-title">
-        <div class="section-heading">
-          <h2 id="additions-title">What I added</h2>
-          <p>One example is a workspace that checks for a new file. I can have it check during weekday hours and start the agent only once there’s a file to work on.</p>
-        </div>
-        <article class="feature schedule-feature">
+      <section id="what-i-added" aria-labelledby="public-title">
+        <h2 id="public-title"><span aria-hidden="true">🛠️</span> What I added to the public fork</h2>
+        <article class="feature">
           <div>
-            <h3>Pick when it can run</h3>
-            <p>I can use an interval as short as 15 seconds or use cron for set times. The weekly grid lets me pick the quarter-hours when a workspace can run. That’s where I can give one workspace a morning block and give another the rest of the workday.</p>
-          </div>
-          <div>
-            <h3>Give each workspace its own timing</h3>
-            <p>A due workspace can make its own scheduling check while another is busy. I can pause a schedule or ask the main agent to run now. Automatic enhanced schedules use the macOS wake monitor. The app needs to be running, and the regular scheduler is available on other platforms.</p>
-          </div>
-        </article>
-
-        <article class="feature illustrated">
-          <div>
-            <h3>Check first. Then do the work.</h3>
-            <p>I can use a condition script to check whether that file exists before spending a model call. If there’s work to do, a Before script can set things up. An After script can clean up once the run is over.</p>
-            <p>I can test each script in settings and review the exact script before I let it run unattended. If cleanup gets interrupted, I can see what’s pending and decide what to do with it.</p>
+            <h3><span aria-hidden="true">🗓️</span> Workspace schedules</h3>
+            <ul>
+              <li><strong>Intervals and cron.</strong> Set an interval as short as 15 seconds, or use cron for fixed times.</li>
+              <li><strong>Weekly time blocks.</strong> Pick the hours each workspace can run. The grid uses 15-minute blocks and a saved timezone.</li>
+              <li><strong>Run controls.</strong> Pause a workspace schedule or use <strong>Run agent now</strong>. A due workspace can check its own schedule while another one is busy.</li>
+            </ul>
           </div>
           <figure>
-            <a class="capture" href="screenshots/schedule-scripts.webp">
-              <img src="screenshots/schedule-scripts.webp" alt="The Condition, Before and After script controls in CLAI+ workspace settings" width="1560" height="1283" loading="lazy">
+            <a href="screenshots/weekly-schedule.webp">
+              <img src="screenshots/weekly-schedule.webp" alt="CLAI+ workspace schedule with a 30-second interval and selected weekday time blocks" width="945" height="1365">
             </a>
-            <figcaption>Schedule scripts in the public fork, shown with sample values.</figcaption>
+            <figcaption>A sample workspace set to check during weekday hours.</figcaption>
           </figure>
         </article>
-      </section>
-
-      <section class="wrap additions local" aria-labelledby="local-title">
-        <div class="section-heading">
-          <h2 id="local-title">What I’m trying in my own build</h2>
-          <p>These additions are still outside the public branch. I’m showing the Scheduling view with sample workspaces and runs.</p>
-        </div>
-        <article class="feature illustrated">
+        <article class="feature">
           <div>
-            <h3>See what’s running and what’s waiting</h3>
-            <p>Once I had several workspaces on schedules, I wanted one place to see the queue. I added that view along with a limit on how many scheduled runs can work at once and a waiting limit for each workspace.</p>
-            <p>I’ve also worked on tray controls, Todoist settings inside a workspace, and a Google file worker with notes tied to the part of a file I’m reviewing.</p>
+            <h3><span aria-hidden="true">⚙️</span> Condition, Before, and After scripts</h3>
+            <ul>
+              <li><strong>Condition.</strong> Check if there’s work first. For example, look for a new file before starting a model turn.</li>
+              <li><strong>Before and After.</strong> Set up what the workspace needs for the run, then clean up when it’s done.</li>
+              <li><strong>Script approvals.</strong> Test a script in settings and review its exact contents before running it unattended. If cleanup gets interrupted, you can see what’s pending and decide what to do with it.</li>
+            </ul>
           </div>
           <figure>
-            <a class="capture" href="screenshots/run-queue.webp">
+            <a href="screenshots/schedule-scripts.webp">
+              <img src="screenshots/schedule-scripts.webp" alt="Condition, Before, and After script controls in CLAI+ workspace settings" width="1560" height="1283" loading="lazy">
+            </a>
+            <figcaption>The three script controls with sample values.</figcaption>
+          </figure>
+        </article>
+        <p class="note"><strong>Platform support.</strong> Automatic enhanced schedules use the macOS wake monitor and need the app running. Other platforms can use the regular scheduler.</p>
+      </section>
+
+      <section id="local-build" aria-labelledby="local-title">
+        <h2 id="local-title"><span aria-hidden="true">🧪</span> What I’m running in my local build</h2>
+        <p>These additions are still outside the public branch.</p>
+        <article class="feature">
+          <ul>
+            <li><strong>Run queue.</strong> See what’s running and what’s waiting in <strong>Settings → Scheduling</strong>. Set how many scheduled runs can go at once and how many can wait in each workspace.</li>
+            <li><strong>Tray controls.</strong> Keep CLAI+ running in the tray and bring the window back when you need it.</li>
+            <li><strong>Workspace add-ons.</strong> Manage Todoist from workspace settings. The Google file worker supports review notes tied to a specific part of the file.</li>
+          </ul>
+          <figure>
+            <a href="screenshots/run-queue.webp">
               <img src="screenshots/run-queue.webp" alt="CLAI+ Scheduling settings with one running workspace and two waiting workspaces" width="1058" height="690" loading="lazy">
             </a>
-            <figcaption>The local Scheduling view, shown with sample workspaces and runs.</figcaption>
+            <figcaption>The local run queue with sample workspaces. Open a screenshot to see it full size.</figcaption>
           </figure>
         </article>
       </section>
-    </main>
 
-    <footer class="wrap footer">
-      <p>I built CLAI+ on <a href="https://github.com/clairun/clai">CLAI</a>. Thanks to the CLAI contributors for the app I get to build on.</p>
-      <nav aria-label="Project links">
-        <a href="https://github.com/garbledhamster/clai/issues/1">Scheduler design ↗</a>
-        <a href="https://github.com/garbledhamster/clai/blob/clai-plus/LICENSE">MIT license ↗</a>
-      </nav>
-    </footer>
+      <footer>
+        <h2><span aria-hidden="true">🔗</span> Project links</h2>
+        <p>Built on <a href="https://github.com/clairun/clai">CLAI</a>. Thanks to the contributors who made it possible to build on their work.</p>
+        <nav aria-label="Source and license">
+          <a href="https://github.com/garbledhamster/clai/tree/clai-plus">Fork source</a>
+          <a href="https://github.com/garbledhamster/clai/blob/clai-plus/AGENTS.md">Upstream sync guide</a>
+          <a href="https://github.com/garbledhamster/clai/blob/clai-plus/LICENSE">MIT license</a>
+        </nav>
+      </footer>
+    </main>
   </body>
 </html>
