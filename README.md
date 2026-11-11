@@ -1,12 +1,22 @@
 # CLAI+
 
-My fork of CLAI for running agent teams on a schedule. I added weekly time
-blocks, a check for work before the agent runs, and scripts to get things
-ready and clean up.
+My fork of CLAI for running agent teams with MCP tools and workspace
+schedules. I added weekly time blocks, a check for work before the agent
+runs, and scripts to get things ready and clean up.
 
 [About CLAI+ and screenshots](https://garbledhamster.github.io/clai/) ·
 [Scheduler design](https://github.com/garbledhamster/clai/issues/1) ·
 [Upstream CLAI](https://github.com/clairun/clai)
+
+## 🔌 MCP tools and CLAI+ Control MCP
+
+- **Give your agents MCP tools.** Add a local or remote MCP server in
+  **Settings → MCP Servers**, then choose which workspaces and agents can use it.
+- **Check CLAI+ from another app.** I’ve been building **CLAI+ Control MCP**
+  on a separate development branch. With workspace access you grant, a local
+  MCP client like Codex can check a schedule and see what’s running or waiting.
+- **Codex plugin idea.** I’m looking at a local plugin to make the Control MCP
+  connection easier to set up.
 
 ## 🛠️ What I added to the public fork
 

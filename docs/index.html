@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="CLAI+ adds weekly time blocks, condition checks, and Before and After scripts to CLAI workspace scheduling.">
+    <meta name="description" content="CLAI+ brings together agent teams, MCP tools, and workspace schedules with weekly time blocks and script checks.">
     <meta name="color-scheme" content="light dark">
     <title>CLAI+ · About the fork</title>
     <link rel="stylesheet" href="about.css">
@@ -18,13 +18,23 @@
     <main class="wrap readme">
       <header class="intro">
         <h1 id="intro">CLAI<span>+</span></h1>
-        <p>My fork of CLAI for running agent teams on a schedule. I added weekly time blocks, a check for work before the agent runs, and scripts to get things ready and clean up.</p>
+        <p>My fork of CLAI for running agent teams with MCP tools and workspace schedules. I added weekly time blocks, a check for work before the agent runs, and scripts to get things ready and clean up.</p>
         <nav aria-label="About page">
+          <a href="#mcp">MCP tools</a>
           <a href="#what-i-added">Public fork</a>
           <a href="#local-build">Local build</a>
           <a href="https://github.com/garbledhamster/clai/issues/1">Scheduler design ↗</a>
         </nav>
       </header>
+
+      <section id="mcp" aria-labelledby="mcp-title">
+        <h2 id="mcp-title"><span aria-hidden="true">🔌</span> MCP tools and CLAI+ Control MCP</h2>
+        <ul>
+          <li><strong>Give your agents MCP tools.</strong> Add a local or remote MCP server in <strong>Settings → MCP Servers</strong>, then choose which workspaces and agents can use it.</li>
+          <li><strong>Check CLAI+ from another app.</strong> I’ve been building <strong>CLAI+ Control MCP</strong> on a separate development branch. With workspace access you grant, a local MCP client like Codex can check a schedule and see what’s running or waiting.</li>
+          <li><strong>Codex plugin idea.</strong> I’m looking at a local plugin to make the Control MCP connection easier to set up.</li>
+        </ul>
+      </section>
 
       <section id="what-i-added" aria-labelledby="public-title">
         <h2 id="public-title"><span aria-hidden="true">🛠️</span> What I added to the public fork</h2>

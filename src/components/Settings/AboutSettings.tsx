@@ -141,8 +141,11 @@ const AboutSettings = () => {
           CLAI<span>+</span>
         </h3>
         {version && <span className={styles.version}>v{version}</span>}
-        <p className={styles.subtitle}>My fork of CLAI for running agent teams on a schedule.</p>
+        <p className={styles.subtitle}>
+          My fork of CLAI for running agent teams with MCP tools and workspace schedules.
+        </p>
         <ul className={styles.features}>
+          <li>🔌 MCP tools for workspaces and agents</li>
           <li>🗓️ Workspace schedules with weekly time blocks</li>
           <li>⚙️ Condition, Before, and After scripts</li>
         </ul>
