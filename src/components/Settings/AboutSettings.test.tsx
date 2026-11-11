@@ -154,7 +154,7 @@ describe('AboutSettings updates panel', () => {
     respond(unavailableStatus);
     render(<AboutSettings />);
     await waitFor(() => expect(screen.getByText('v26.7.12-dev')).toBeTruthy());
-    expect(screen.getByRole('heading', { name: 'CLAI' }).tagName).toBe('H3');
+    expect(screen.getByRole('heading', { name: 'CLAI+', level: 3 })).toBeInTheDocument();
   });
 
   it('renders no Updates panel at all when the build can neither update nor check', async () => {

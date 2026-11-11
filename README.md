@@ -1,46 +1,36 @@
-<p align="center">
-  <img src="public/icon.svg" alt="CLAI" width="128" height="128">
-</p>
+# CLAI+
 
-<h1 align="center">CLAI+</h1>
+**I wanted more say in when my agents run.**
 
-<p align="center">
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/clairun/clai/releases"><img src="https://img.shields.io/github/v/release/clairun/clai" alt="GitHub release"></a>
-  <a href="https://github.com/clairun/clai/actions/workflows/ci.yml"><img src="https://github.com/clairun/clai/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-</p>
+I liked how CLAI lets me give a team of agents its own workspace. Once I
+started setting up recurring work, I got really zoomed in on the schedule.
+I wanted to pick the hours it could run, check whether there was anything to
+do, and give each workspace a way to get ready and clean up afterward.
+That’s how CLAI+ started.
 
-<p align="center">
-  Control teams of AI agents. Local-first, open source, sandboxed.
-</p>
+[Read the CLAI+ About page and see what I’ve added](https://garbledhamster.github.io/clai/)
 
-<p align="center">
-  <em>One team per workspace — every agent with its own provider, files, tools,
-  and permissions, working in parallel, on your schedule, and reporting to you
-  from one Fleet cockpit.</em>
-</p>
+[![CLAI+ workspace schedule with a 30-second interval and weekday time blocks](docs/screenshots/weekly-schedule.webp)](https://garbledhamster.github.io/clai/#what-i-added)
 
-<p align="center">
-  <a href="https://clai.run/"><img width="100%" alt="CLAI — a main agent delegating a review task to a Code Reviewer agent" src="docs/clai-hero.gif"></a>
-  <br>
-  <a href="https://clai.run/"><strong>Explore CLAI</strong></a>
-</p>
+## What I added in the public fork
 
-## The CLAI+ fork
+- **Pick the hours.** I can set an interval as short as 15 seconds or use
+  cron for set times, then choose the allowed times on a weekly grid.
+- **Check if there’s work first.** A condition script can check for a new
+  file before I spend a model call.
+- **Get ready and clean up.** Before and After scripts can do the setup and
+  cleanup around a run. I can test them, review the exact scripts before
+  letting them run unattended, and see when cleanup needs attention.
 
-CLAI+ is an independent fork of [CLAI](https://github.com/clairun/clai).
-It adds enhanced workspace scheduling with intervals as short as 15 seconds,
-optional condition, before, and after scripts, and weekly time blocks.
-The [public scheduler design](https://github.com/garbledhamster/clai/issues/1)
-describes the controls and execution rules. Automatic enhanced schedules
-currently require the macOS wake monitor. Legacy schedules are available
-on other platforms.
+Automatic enhanced schedules use the macOS wake monitor and need the app to
+be running. The regular scheduler is available on other platforms.
 
-The `clai-plus` branch contains the fork's changes. The `main` branch follows
-upstream CLAI. The [fork maintenance guide](AGENTS.md) shows how to bring
-upstream changes into the fork and verify them before publishing.
+I built this on [CLAI](https://github.com/clairun/clai). The public
+changes live on `clai-plus`. You can read the
+[scheduler design](https://github.com/garbledhamster/clai/issues/1) or see
+[how the fork brings in upstream changes](AGENTS.md).
 
-## What it is
+## The CLAI foundation
 
 CLAI organizes work into **workspaces**. A workspace is an ongoing
 conversation with a **main agent** — a configurable LLM that owns the
@@ -126,9 +116,9 @@ flagged, and selecting a card slides in a live chat preview.
 > config copied from Linux) stops shell commands until you choose Off or Host
 > network.
 
-## Install
+## Install upstream CLAI
 
-Download the latest build for your platform from the
+Download the latest upstream CLAI build for your platform from the
 [Releases page](https://github.com/clairun/clai/releases):
 
 | Platform    | Download |
@@ -203,7 +193,7 @@ Code main agent with an OpenAI-compatible reviewer.
 ## Development
 
 ```bash
-git clone https://github.com/clairun/clai.git
+git clone https://github.com/garbledhamster/clai.git
 cd clai
 npm install
 make dev            # run the desktop app in development
