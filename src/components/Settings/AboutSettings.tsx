@@ -142,7 +142,8 @@ const AboutSettings = () => {
         </h3>
         {version && <span className={styles.version}>v{version}</span>}
         <p className={styles.subtitle}>
-          My fork of CLAI for running agent teams with MCP tools and workspace schedules.
+          CLAI+ is my fork of CLAI. I’m building out the interface using what I’ve learned from
+          working with automation tools in systems administration.
         </p>
         <ul className={styles.features}>
           <li>🔌 MCP tools for workspaces and agents</li>

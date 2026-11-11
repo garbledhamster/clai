@@ -1,8 +1,10 @@
 # CLAI+
 
-My fork of CLAI for running agent teams with MCP tools and workspace
-schedules. I added weekly time blocks, a check for work before the agent
-runs, and scripts to get things ready and clean up.
+CLAI+ is my fork of CLAI. I’m building out the interface using what I’ve
+learned from working with automation tools in systems administration. When
+I set up an automated job, I want to choose when it can run, check whether
+there’s work to do, and decide what happens before and after the run. I’ve
+added those controls to the workspace settings.
 
 [About CLAI+ and screenshots](https://garbledhamster.github.io/clai/) ·
 [Scheduler design](https://github.com/garbledhamster/clai/issues/1) ·
